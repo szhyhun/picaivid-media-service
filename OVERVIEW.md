@@ -502,19 +502,116 @@ MiDaS remains the primary depth signal for planning and validation.
 
 ---
 
-# Development And Production
+# GPU and CPU Task Execution Policy
 
-## Local macOS
+This system separates workloads into CPU and GPU tasks to optimize cost, reliability, and scalability. All GPU resources are treated as ephemeral, on demand, and cost optimized.
 
-- CPU mode
-- LTX 2 optional
-- reduced quality
+## Task Classification
 
-## AWS ECS
+### GPU Tasks
+GPU instances are used only for heavy generation and computer vision workloads:
 
-- GPU instances
-- full LTX 2
-- scalable workers
+- Video diffusion generation (LTX-2, WAN 2.2)
+- Multi-image depth synthesis or 3D reconstruction
+- Large-scale image-to-video generation
+
+### CPU Tasks
+CPU instances are used for lightweight or orchestration tasks:
+
+- Phase 1 photo analysis:
+  - OpenCLIP embeddings
+  - MiDaS or ZoeDepth depth estimation (CPU mode)
+  - Room clustering and hero frame scoring
+- Timeline assembly and sequencing
+- Beat detection / beat grid creation
+- FFmpeg timeline concatenation and simple audio overlay
+- Manual override processing and validation
+- Orchestration and job state updates in Postgres
+
+Local developer machines (including Apple Silicon) are supported for CPU tasks, planning, and debugging. They are not expected to run GPU-intensive video generation.
+
+---
+
+## Spot Instance First Policy
+
+GPU workers must run primarily on AWS EC2 Spot instances.
+
+- On-demand GPU instances may be used only as fallback or emergency capacity.
+- Spot instances can be interrupted with a two-minute notice.
+- Spot instances may occasionally be unavailable in a given Availability Zone.
+- GPU workloads must tolerate interruptions with idempotent, restartable tasks.
+
+---
+
+## Job Chunking and Idempotency
+
+GPU workloads must be chunked into small, restartable units:
+
+- Smallest unit: single video clip render
+- Each clip task must:
+  - Be idempotent
+  - Write outputs to S3 immediately
+  - Update Postgres status
+  - Be safe to retry without duplicate side effects
+
+CPU tasks should also be idempotent but are not typically interrupted.
+
+---
+
+## Spot Interruption Handling
+
+GPU worker containers must:
+
+- Trap SIGTERM
+- Flush logs and mark interrupted clips
+- Upload partial outputs if possible
+- Exit cleanly within two minutes
+
+ECS managed Spot instance draining must be enabled.
+
+---
+
+## Scale From Zero Policy
+
+- GPU capacity should scale from zero when no heavy tasks exist.
+- CPU workers can be persistent or auto-scaled lightly based on queue depth.
+- In development, GPU instances can be manually started and stopped as needed.
+
+---
+
+## Persistent Spot for Development
+
+- A single persistent Spot GPU instance may be used for dev and testing.
+- Stop instance when not actively generating video.
+- Preserve EBS volumes for model caches.
+- Do not rely on a permanently running GPU instance.
+
+---
+
+## GPU Instance Class Policy
+
+- Default GPU instance: g5.xlarge (NVIDIA A10G, 24GB VRAM)
+- Alternative instances must meet minimum VRAM and CUDA support requirements.
+- CPU-only instances are sufficient for all lightweight tasks.
+
+---
+
+## Cost Control Requirements
+
+- Visibility into GPU hours consumed
+- Per-job GPU time tracking
+- Alerts when GPU usage exceeds thresholds
+- System must be designed so full daily workload can run on Spot GPU instances efficiently
+
+---
+
+## Development Expectations
+
+Engineers must be able to:
+
+- Run Phase 1 locally on CPU
+- Simulate GPU outputs for dev and testing
+- Run full GPU generation only on remote GPU workers
 
 ---
 
@@ -525,5 +622,7 @@ MiDaS remains the primary depth signal for planning and validation.
 - Database is the contract
 - ffmpeg is renderer, not editor
 - Phases are inspectable and repeatable
+- GPU is ephemeral and Spot first
+- Local dev works on CPU only
 
 This document defines required behavior for implementation.
