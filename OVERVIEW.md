@@ -275,35 +275,62 @@ Timeline is stored in Postgres and is editable by UI. ffmpeg is only a renderer.
 
 ---
 
-# Database As Source Of Truth
+# Database Ownership Policy
+
+## Rails Database (Read-Only for Python)
+
+Python media service reads from Rails tables but never writes to them.
+
+### Rails-Owned Tables (source data)
+
+- users
+- projects
+- photos (original uploads, manual metadata)
+- templates
+- music_tracks
+
+Python reads Rails photos table to get:
+- s3_object_key (photo location in S3)
+- room_type (manual override if set)
+- metadata (manual annotations)
+- position, filename, dimensions
+
+## Python Database (Media Service Owns)
+
+All derived and pipeline data is stored in Python's own tables.
+
+### Python-Owned Tables (derived data)
 
 ## jobs
 
 - id
-- listing_id
+- project_id (references Rails project UUID)
 - status
 - current_phase
 - template_type
 - target_length
 - music_uri
-- bpm
-- beat_offset
+- bpm (detected in Phase 3)
+- beat_offset (detected in Phase 3)
 - enable_beat_sync
 
-## photos
+## job_photos
 
 - id
 - job_id
-- s3_uri
-- room_label
-- room_override
+- rails_photo_id (references Rails photo UUID)
+- s3_uri (copied from Rails for convenience)
+- room_label (AI-detected)
+- room_override (copied from Rails)
 - exclude
-- manual_metadata jsonb
+- embedding jsonb (computed by OpenCLIP)
 - sharpness
 - exposure_score
 - composition_score
 - base_score
 - final_score
+- depth_variance
+- depth_layers
 
 ## room_clusters
 
