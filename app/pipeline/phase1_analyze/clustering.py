@@ -122,15 +122,22 @@ def _compute_cluster_metrics(cluster: RoomCluster, photos: List[JobPhoto]) -> No
         cluster.depth_variance = float(np.mean(depth_variances))
 
     # Determine confidence tier based on depth
+    # Thresholds tuned for real estate photos:
+    # - Indoor rooms typically have 0.03-0.06 variance
+    # - Outdoor/aerial typically have 0.06-0.12 variance
     if cluster.depth_variance is not None:
-        if cluster.depth_variance > 0.1:
+        if cluster.depth_variance > 0.06:
             cluster.confidence_tier = "high"
-        elif cluster.depth_variance > 0.05:
+        elif cluster.depth_variance > 0.035:
             cluster.confidence_tier = "medium"
         else:
             cluster.confidence_tier = "low"
     else:
         cluster.confidence_tier = "low"
 
-    # Check SFM eligibility (needs multiple photos with good overlap)
-    cluster.sfm_eligible = len(photos) >= 3 and cluster.confidence_tier == "high"
+    # Check SFM eligibility
+    # Requirements:
+    # - 3+ photos (need multiple views for any 3D effect)
+    # - At least medium confidence (some depth variation)
+    # Even with medium tier, we can do partial reveals and parallax effects
+    cluster.sfm_eligible = len(photos) >= 3 and cluster.confidence_tier in ("high", "medium")

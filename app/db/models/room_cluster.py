@@ -19,8 +19,8 @@ class RoomCluster(Base):
     overlap_score = Column(Float)
     depth_variance = Column(Float)
 
-    # Hero photo selection
-    hero_photo_id = Column(Integer, ForeignKey("photos.id"), nullable=True)
+    # Hero photo selection (references job_photos table, not Rails photos)
+    hero_photo_id = Column(Integer, ForeignKey("job_photos.id"), nullable=True)
 
     # Motion recommendations
     recommended_motion = Column(String(50))
@@ -29,8 +29,8 @@ class RoomCluster(Base):
 
     # Relationships
     job = relationship("Job", back_populates="room_clusters")
-    photos = relationship("Photo", back_populates="room_cluster", foreign_keys="Photo.room_cluster_id")
-    hero_photo = relationship("Photo", foreign_keys=[hero_photo_id], post_update=True)
+    photos = relationship("JobPhoto", back_populates="room_cluster", foreign_keys="JobPhoto.room_cluster_id")
+    hero_photo = relationship("JobPhoto", foreign_keys=[hero_photo_id], post_update=True)
     analysis_results = relationship("AnalysisResult", back_populates="room_cluster", cascade="all, delete-orphan")
     clips = relationship("Clip", back_populates="room_cluster")
 

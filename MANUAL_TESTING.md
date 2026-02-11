@@ -5,8 +5,8 @@ This guide walks through setting up and testing the Phase 1 pipeline locally on 
 ## Prerequisites
 
 - Python 3.11+ (installed via `brew install python@3.11`)
-- PostgreSQL 14+
-- Docker (for MinIO and LocalStack)
+- Docker (for PostgreSQL, MinIO, and LocalStack)
+- AWS CLI (`brew install awscli`)
 
 ## Step 1: Start Infrastructure
 
@@ -23,17 +23,28 @@ docker-compose ps
 
 Expected output:
 ```
-NAME                  STATUS
-picaivid-postgres     Up
-picaivid-minio        Up (healthy)
-picaivid-localstack   Up (healthy)
+NAME                        STATUS
+picaivid-rails-postgres-1   Up
+picaivid-rails-minio-1      Up (healthy)
+picaivid-rails-localstack-1 Up (healthy)
 ```
 
 ## Step 2: Verify LocalStack SQS
 
 ```bash
-# Check SQS queue was created
-aws --endpoint-url=http://localhost:4566 sqs list-queues
+# Check if queue was created (note: --region is required)
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs list-queues
+```
+
+If no queues are listed, create the queue manually:
+```bash
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs create-queue --queue-name picaivid-jobs
+```
+
+Verify:
+```bash
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs list-queues
+# Should show: http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/picaivid-jobs
 ```
 
 ## Step 3: Set Up Python Environment
@@ -41,27 +52,32 @@ aws --endpoint-url=http://localhost:4566 sqs list-queues
 ```bash
 cd picaivid-media-service
 
-# Activate virtual environment (already created)
+# Activate virtual environment
 source venv/bin/activate
 
-# Install dependencies
+# Install dependencies (first time only)
 pip install -r requirements.txt
 ```
 
 ## Step 4: Run Database Migrations
 
-```bash
-# Generate initial migration
-alembic revision --autogenerate -m "Create Phase 1 tables"
+**Important:** Make sure you've activated the virtual environment first!
 
-# Apply migration
+```bash
+# Activate venv if not already active
+source venv/bin/activate
+
+# Apply migrations
 alembic upgrade head
 ```
 
 Verify tables were created:
 ```bash
-psql -h localhost -U postgres -d picaivid_development -c "\dt"
+# Using Docker's postgres container
+docker exec -it picaivid-rails-postgres-1 psql -U postgres -d picaivid_development -c "\dt"
 ```
+
+Expected tables: `jobs`, `job_photos`, `room_clusters`, `analysis_results`, `clips`, `timelines`, `timeline_clips`
 
 ## Step 5: Set Up Rails
 
@@ -145,15 +161,15 @@ curl -X POST http://localhost:8000/internal/jobs \
 
 ```bash
 # Check job_photos
-psql -h localhost -U postgres -d picaivid_development -c \
+docker exec -it picaivid-rails-postgres-1 psql -U postgres -d picaivid_development -c \
   "SELECT id, room_label, final_score, depth_variance FROM job_photos WHERE job_id = 1"
 
 # Check room_clusters
-psql -h localhost -U postgres -d picaivid_development -c \
+docker exec -it picaivid-rails-postgres-1 psql -U postgres -d picaivid_development -c \
   "SELECT id, room_type, confidence_tier, recommended_motion FROM room_clusters WHERE job_id = 1"
 
 # Check analysis_results
-psql -h localhost -U postgres -d picaivid_development -c \
+docker exec -it picaivid-rails-postgres-1 psql -U postgres -d picaivid_development -c \
   "SELECT id, tier, recommended_motion, model_recommendation FROM analysis_results WHERE job_id = 1"
 ```
 
@@ -161,11 +177,13 @@ psql -h localhost -U postgres -d picaivid_development -c \
 
 ```bash
 # Send message to SQS
-aws --endpoint-url=http://localhost:4566 sqs send-message \
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs send-message \
   --queue-url http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/picaivid-jobs \
   --message-body '{"action":"run","project_id":"YOUR_PROJECT_UUID"}'
 
 # Start worker
+cd picaivid-media-service
+source venv/bin/activate
 python -m app.worker
 ```
 
@@ -180,27 +198,49 @@ VideoGenerationJob.perform_now(project.id)
 ## Troubleshooting
 
 ### ML Models Not Loading
+
 First run downloads models (~2GB):
 ```bash
 ls -la ml_models/
 ```
 
 ### Database Connection Issues
+
 ```bash
-docker-compose ps postgres
-psql -h localhost -U postgres -d picaivid_development -c "SELECT 1"
+# Check Docker postgres is running
+docker-compose ps
+
+# Test connection via Docker
+docker exec -it picaivid-rails-postgres-1 psql -U postgres -d picaivid_development -c "SELECT 1"
 ```
 
 ### S3/MinIO Issues
+
 ```bash
 curl http://localhost:9000/minio/health/live
 mc ls local/picaivid-dev
 ```
 
 ### SQS Issues
+
 ```bash
+# Check LocalStack health
 curl http://localhost:4566/_localstack/health
-aws --endpoint-url=http://localhost:4566 sqs list-queues
+
+# List queues (region required)
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs list-queues
+
+# Create queue if missing
+aws --endpoint-url=http://localhost:4566 --region us-east-1 sqs create-queue --queue-name picaivid-jobs
+```
+
+### Alembic Migration Issues
+
+Make sure virtual environment is activated:
+```bash
+cd picaivid-media-service
+source venv/bin/activate
+alembic upgrade head
 ```
 
 ## What Phase 1 Does

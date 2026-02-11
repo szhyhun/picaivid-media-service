@@ -59,9 +59,13 @@ def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult
     duration = max(2.0, MOTION_DURATIONS.get(recommended, 3.0))
 
     # Determine model recommendation
-    if tier == "high" and cluster.sfm_eligible:
-        model_recommendation = "LTX-2 multi-view"
-    elif tier == "medium":
+    # SFM-eligible clusters get more advanced motion capabilities
+    if cluster.sfm_eligible:
+        if tier == "high":
+            model_recommendation = "LTX-2 multi-view"  # Full 3D reconstruction
+        else:
+            model_recommendation = "LTX-2 parallax"    # Partial 3D / parallax reveals
+    elif tier in ("medium", "high"):
         model_recommendation = "LTX-2 interpolation"
     else:
         model_recommendation = "LTX-2 single image"

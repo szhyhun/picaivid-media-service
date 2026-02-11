@@ -51,7 +51,7 @@ class JobPhoto(Base):
 
     # Relationships
     job = relationship("Job", back_populates="job_photos")
-    room_cluster = relationship("RoomCluster", back_populates="photos")
+    room_cluster = relationship("RoomCluster", back_populates="photos", foreign_keys=[room_cluster_id])
 
     def __repr__(self) -> str:
         return f"<JobPhoto id={self.id} rails_id={self.rails_photo_id} room={self.room_label}>"

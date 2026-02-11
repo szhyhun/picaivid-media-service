@@ -119,8 +119,9 @@ class Phase1Analyzer:
         """
         job_photos = []
         for rp in rails_photos:
-            # Construct S3 URI from object key
-            s3_uri = f"s3://{rp.s3_object_key}" if not rp.s3_object_key.startswith("s3://") else rp.s3_object_key
+            # Use the s3_object_key directly (not as s3:// URI)
+            # The S3 client handles bucket internally
+            s3_uri = rp.s3_object_key
 
             job_photo = JobPhoto(
                 job_id=job.id,
@@ -152,9 +153,9 @@ class Phase1Analyzer:
                 image = s3_client.download_image(photo.s3_uri)
                 embedding = openclip_model.get_embedding(image)
                 photo.embedding = embedding.tolist()
-                logger.debug(f"Embedding computed for photo {i+1}/{len(photos)}")
+                logger.info(f"Embedding computed for photo {i+1}/{len(photos)}")
             except Exception as e:
-                logger.warning(f"Failed to compute embedding for photo {photo.id}: {e}")
+                logger.error(f"FAILED to compute embedding for photo {photo.id}: {e}", exc_info=True)
                 photo.embedding = None
 
     def _classify_rooms(self, photos: List[JobPhoto]) -> None:
@@ -174,9 +175,9 @@ class Phase1Analyzer:
                 image = s3_client.download_image(photo.s3_uri)
                 room_type, confidence = openclip_model.classify_room(image)
                 photo.room_label = room_type
-                logger.debug(f"Photo {photo.id}: {room_type} ({confidence:.2f})")
+                logger.info(f"Photo {photo.id}: {room_type} ({confidence:.2f})")
             except Exception as e:
-                logger.warning(f"Failed to classify room for photo {photo.id}: {e}")
+                logger.error(f"FAILED to classify room for photo {photo.id}: {e}", exc_info=True)
                 photo.room_label = "unknown"
 
     def _analyze_depth(self, photos: List[JobPhoto]) -> None:
@@ -192,8 +193,8 @@ class Phase1Analyzer:
                 depth_metrics = midas_model.analyze_depth(image)
                 photo.depth_variance = depth_metrics["variance"]
                 photo.depth_layers = depth_metrics["depth_layers"]
-                logger.debug(f"Depth analyzed for photo {i+1}/{len(photos)}: var={photo.depth_variance:.3f}")
+                logger.info(f"Depth analyzed for photo {i+1}/{len(photos)}: var={photo.depth_variance:.3f}, layers={photo.depth_layers}")
             except Exception as e:
-                logger.warning(f"Failed to analyze depth for photo {photo.id}: {e}")
+                logger.error(f"FAILED to analyze depth for photo {photo.id}: {e}", exc_info=True)
                 photo.depth_variance = 0.0
                 photo.depth_layers = 1
