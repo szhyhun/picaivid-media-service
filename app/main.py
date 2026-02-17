@@ -8,10 +8,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.session import get_db
-from app.db.models import Job, Clip, JobPhoto, RoomCluster, AnalysisResult
+from app.db.models import Job, Clip, JobPhoto, RoomCluster, AnalysisResult, PhotoSimilarity
 from app.schemas.job import JobMessage, JobStatusResponse
 from app.schemas.clip import (
-    ClipResponse, ClipListResponse, SourcePhotoInfo, ClusterInfo, AnalysisInfo
+    ClipResponse, ClipListResponse, SourcePhotoInfo, ClusterInfo, AnalysisInfo,
+    ClusterDebugResponse, ClusterListDebugResponse, PhotoDebugInfo, PhotoSimilarityInfo,
 )
 from app.pipeline.orchestrator import PipelineOrchestrator
 
@@ -262,4 +263,139 @@ async def get_project_clips(
         job_status=job.status,
         clips=clip_responses,
         total_clips=len(clip_responses),
+    )
+
+
+@app.get("/api/projects/{project_id}/clusters/debug", response_model=ClusterListDebugResponse)
+async def get_project_clusters_debug(
+    project_id: str,
+    db: Session = Depends(get_db),
+):
+    """Get debug info for all clusters in a project.
+
+    Shows why photos were grouped together:
+    - DINOv2 semantic similarity scores
+    - Geometric verification results (matches, inliers)
+    - Whether connection was from temporal window or semantic top-k
+    - Position in cluster (endpoint vs middle)
+    """
+    from app.services.storage.s3_client import s3_client
+
+    # Find the most recent job for this project
+    job = (
+        db.query(Job)
+        .filter(Job.project_id == project_id)
+        .order_by(Job.created_at.desc())
+        .first()
+    )
+
+    if not job:
+        return ClusterListDebugResponse(
+            project_id=project_id,
+            job_id=None,
+            clusters=[],
+            total_clusters=0,
+        )
+
+    # Get all clips (each clip represents a cluster)
+    clips = db.query(Clip).filter(Clip.job_id == job.id).all()
+
+    # Get all photos for this job
+    job_photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).all()
+    photo_map = {p.id: p for p in job_photos}
+
+    # Get all similarity records for this job
+    similarities = db.query(PhotoSimilarity).filter(PhotoSimilarity.job_id == job.id).all()
+
+    # Build similarity lookup: (photo_a, photo_b) -> similarity record
+    sim_lookup = {}
+    for sim in similarities:
+        key = (min(sim.photo_a_id, sim.photo_b_id), max(sim.photo_a_id, sim.photo_b_id))
+        sim_lookup[key] = sim
+
+    # Get clusters info
+    clusters = db.query(RoomCluster).filter(RoomCluster.job_id == job.id).all()
+    cluster_map = {c.id: c for c in clusters}
+
+    cluster_responses = []
+
+    for clip in clips:
+        if not clip.source_photo_ids:
+            continue
+
+        photo_ids = clip.source_photo_ids
+        cluster = cluster_map.get(clip.room_cluster_id) if clip.room_cluster_id else None
+
+        # Build photo debug info
+        photos_debug = []
+        all_similarities = []
+
+        for idx, photo_id in enumerate(photo_ids):
+            photo = photo_map.get(photo_id)
+            if not photo:
+                continue
+
+            # Generate thumbnail URL
+            thumb_url = None
+            if photo.s3_uri:
+                photo_key = photo.s3_uri[5:].split("/", 1)[1] if photo.s3_uri.startswith("s3://") else photo.s3_uri
+                thumb_url = s3_client.generate_presigned_url(photo_key, expires_in=3600)
+
+            # Get similarities to other photos in this cluster
+            photo_sims = []
+            for other_id in photo_ids:
+                if other_id == photo_id:
+                    continue
+                key = (min(photo_id, other_id), max(photo_id, other_id))
+                sim = sim_lookup.get(key)
+                if sim:
+                    photo_sims.append(PhotoSimilarityInfo(
+                        photo_a_id=sim.photo_a_id,
+                        photo_b_id=sim.photo_b_id,
+                        pair_source=sim.pair_source,
+                        dinov2_similarity=sim.dinov2_similarity,
+                        geometric_matches=sim.geometric_matches,
+                        geometric_inliers=sim.geometric_inliers,
+                        geometric_score=sim.geometric_score,
+                        is_connected=bool(sim.is_connected),
+                    ))
+                    all_similarities.append(sim)
+
+            photos_debug.append(PhotoDebugInfo(
+                id=photo.id,
+                rails_photo_id=photo.rails_photo_id,
+                thumbnail_url=thumb_url,
+                room_label=photo.room_label,
+                position_in_cluster=idx,
+                is_endpoint=(idx == 0 or idx == len(photo_ids) - 1),
+                similarities=photo_sims,
+            ))
+
+        # Compute summary stats
+        avg_dinov2 = None
+        avg_geo = None
+        if all_similarities:
+            dinov2_scores = [s.dinov2_similarity for s in all_similarities if s.dinov2_similarity is not None]
+            geo_scores = [s.geometric_score for s in all_similarities if s.geometric_score is not None]
+            if dinov2_scores:
+                avg_dinov2 = sum(dinov2_scores) / len(dinov2_scores)
+            if geo_scores:
+                avg_geo = sum(geo_scores) / len(geo_scores)
+
+        cluster_responses.append(ClusterDebugResponse(
+            cluster_id=clip.room_cluster_id or clip.id,
+            room_type=cluster.room_type if cluster else None,
+            photo_ids=photo_ids,
+            photos=photos_debug,
+            total_photos=len(photo_ids),
+            avg_dinov2_similarity=avg_dinov2,
+            avg_geometric_score=avg_geo,
+            has_direction_info=any(s.geometric_inliers and s.geometric_inliers >= 3 for s in all_similarities),
+        ))
+
+    return ClusterListDebugResponse(
+        project_id=project_id,
+        job_id=job.id,
+        clusters=cluster_responses,
+        total_clusters=len(cluster_responses),
     )

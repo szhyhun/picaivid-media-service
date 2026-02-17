@@ -62,8 +62,9 @@ def cluster_photos_by_room(
     Returns:
         List of created RoomCluster instances
     """
-    # Filter out excluded photos
-    active_photos = [p for p in photos if not p.exclude]
+    # Filter out excluded photos and SORT BY POSITION
+    # Position order is critical for temporal window matching (adjacent photos = same room)
+    active_photos = sorted([p for p in photos if not p.exclude], key=lambda p: p.position or 0)
     logger.info(f"Clustering {len(active_photos)} photos for job {job.id}")
 
     if not active_photos:
@@ -86,9 +87,10 @@ def _cluster_with_learned_matching(
     """Cluster using optimized DINOv2 + LightGlue pipeline."""
     logger.info("Using optimized DINOv2 + LightGlue pipeline")
 
-    # Download all images
+    # Download all images and collect room labels
     images = []
     photo_ids = []
+    room_labels = []  # Room labels for cross-room mismatch check
     photo_map = {}  # id -> JobPhoto
 
     for photo in photos:
@@ -97,6 +99,7 @@ def _cluster_with_learned_matching(
             img = img.resize((512, 384), Image.Resampling.LANCZOS)
             images.append(img)
             photo_ids.append(photo.id)
+            room_labels.append(photo.room_override or photo.room_label or "unknown")
             photo_map[photo.id] = photo
         except Exception as e:
             logger.warning(f"Failed to download photo {photo.id}: {e}")
@@ -105,8 +108,12 @@ def _cluster_with_learned_matching(
         # Not enough images for clustering
         return _create_single_cluster(db, job, photos)
 
-    # Run optimized clustering
-    cluster_id_lists = cluster_photos_optimized(images, photo_ids, s3_client)
+    # Run optimized clustering (pass db_session and job_id to save similarity records)
+    cluster_id_lists = cluster_photos_optimized(
+        images, photo_ids, s3_client,
+        db_session=db, job_id=job.id,
+        room_labels=room_labels,
+    )
 
     # Create RoomCluster records
     clusters = []

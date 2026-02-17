@@ -27,18 +27,76 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # EXPECTED CLUSTERS (from user analysis)
 # ============================================================================
-# Photos that SHOULD be in the same cluster
+
+# -----------------------------------------------------------------------------
+# TEST SET 1: Original listing (photo IDs 569-705)
+# -----------------------------------------------------------------------------
 EXPECTED_SAME_CLUSTER = [
     [569, 570],           # Front yard - good pair
     [581, 582],           # Dining room - same cluster
     [595, 596, 597],      # Living/dining room transition - same cluster
     [601, 602],           # Bathroom - same cluster
     [605, 606],           # Bedroom - same cluster
+    [699, 700, 701, 702], # pan_left sequence - room A
+    [703, 704, 705],      # different room B (should NOT merge with 699-702)
 ]
 
-# Photos that should be in DIFFERENT clusters
 EXPECTED_DIFFERENT_CLUSTERS = [
     ([569, 570], [572, 573]),  # 572, 573 should be separate from 569, 570
+    ([699, 700, 701, 702], [703, 704, 705]),  # Different rooms despite being adjacent in upload
+]
+
+# -----------------------------------------------------------------------------
+# TEST SET 2: Listing with photo IDs 861-912
+# Goal: Max 3 photos per cluster, remove duplicates, proper ordering
+# NOTE: Photos 861, 906, 907, 910, 911 not in DB - removed from tests
+# NOTE: Max cluster size is 3, so some photos may be removed during dedup
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET2 = [
+    # Living room photos 883-889 form one connected component due to overlap
+    # After dedup (max 3), some photos will be removed - test remaining pairs
+    [887, 889],           # Living room - these have geometric overlap and should stay together
+    [890, 891],           # First bedroom
+    [897, 898],           # Second bedroom (DIFFERENT from 890-891)
+    # [901, 903] - basement photos have 0 geometric inliers, so they're separate (correct)
+]
+
+EXPECTED_DIFFERENT_CLUSTERS_SET2 = [
+    ([890, 891], [897, 898]),           # Two different bedrooms
+    ([908], [912]),                     # Two different patios
+    ([901], [903]),                     # Basement photos - no geometric overlap, should be separate
+]
+
+# Expected ordering: endpoint (edge photo) should be first or last
+# The order should create a smooth transition (camera movement in one direction)
+EXPECTED_ORDER_SET2 = [
+    {"photos": [887, 889], "expected_start": 887, "note": "887 should be endpoint"},
+    {"photos": [890, 891], "expected_start": 890, "note": "890 should be endpoint (first bedroom)"},
+]
+
+# Sequence tests: verify that photos are ordered for smooth transitions
+# These test that the order within a cluster makes sense for video generation
+EXPECTED_SEQUENCES_SET2 = [
+    # Each test: list of photo IDs that should appear in order (or reverse order)
+    # The test passes if they appear consecutively in that order within the same cluster
+    {"photos": [887, 889], "note": "Living room photos should be consecutive"},
+    {"photos": [890, 891], "note": "First bedroom photos should be consecutive"},
+]
+
+# -----------------------------------------------------------------------------
+# TEST SET 3: Listing with photo IDs 805-815
+# NOTE: Photo 806 not in DB - removed from tests
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET3 = [
+    [805, 814],           # Front of house photos
+]
+
+EXPECTED_DIFFERENT_CLUSTERS_SET3 = [
+    ([805, 814], [815]),  # 815 is back of house, should be separate
+]
+
+EXPECTED_ORDER_SET3 = [
+    # No ordering tests - only 2 photos in cluster
 ]
 
 
@@ -100,40 +158,102 @@ def check_different_clusters(group1: list, group2: list, clusters: list) -> tupl
         return True, f"Group1 in {g1_clusters}, Group2 in {g2_clusters}"
 
 
-def main():
-    engine = create_engine(settings.DATABASE_URL)
-    Session = sessionmaker(bind=engine)
-    db = Session()
+def check_order(expected_photos: list, expected_start: int, clusters: list) -> tuple:
+    """Check if cluster starts (or ends) with expected endpoint photo.
 
-    job = db.query(Job).order_by(Job.id.desc()).first()
-    if not job:
-        print("No jobs found")
-        return
+    Returns (success, info)
+    """
+    for cluster in clusters:
+        if expected_start in cluster:
+            # Check if expected_start is at position 0 or -1 (either end is OK)
+            if cluster[0] == expected_start:
+                return True, f"Starts with {expected_start}: {cluster}"
+            elif cluster[-1] == expected_start:
+                return True, f"Ends with {expected_start}: {cluster}"
+            else:
+                pos = cluster.index(expected_start)
+                return False, f"{expected_start} at position {pos}, not endpoint: {cluster}"
 
-    print(f"\n{'='*70}")
-    print(f"Testing clustering on Job {job.id}")
-    print(f"{'='*70}")
+    return False, f"{expected_start} not found in any cluster"
 
-    # Collect all photo IDs we need to test
-    all_test_ids = set()
-    for group in EXPECTED_SAME_CLUSTER:
-        all_test_ids.update(group)
-    for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS:
-        all_test_ids.update(g1)
-        all_test_ids.update(g2)
 
-    print(f"\nTest photo IDs: {sorted(all_test_ids)}")
+def check_sequence(expected_sequence: list, clusters: list) -> tuple:
+    """Check if photos appear consecutively in order (or reverse order) within a cluster.
 
-    # Load only the photos we need
+    This validates that photos are ordered for smooth transitions.
+
+    Returns (success, info)
+    """
+    # Find which cluster contains all the expected photos
+    for cluster in clusters:
+        if all(pid in cluster for pid in expected_sequence):
+            # Found the cluster - check if photos are consecutive
+            positions = [cluster.index(pid) for pid in expected_sequence]
+
+            # Check if positions are consecutive (ascending or descending)
+            is_ascending = all(positions[i] + 1 == positions[i+1] for i in range(len(positions)-1))
+            is_descending = all(positions[i] - 1 == positions[i+1] for i in range(len(positions)-1))
+
+            if is_ascending:
+                return True, f"Consecutive (forward): {[cluster[p] for p in positions]}"
+            elif is_descending:
+                return True, f"Consecutive (reverse): {[cluster[p] for p in positions]}"
+            else:
+                # Not consecutive - show actual positions
+                actual_order = [(pid, cluster.index(pid)) for pid in expected_sequence]
+                return False, f"Not consecutive: {actual_order} in cluster {cluster}"
+
+    # Photos are in different clusters
+    photo_clusters = {}
+    for pid in expected_sequence:
+        for cidx, cluster in enumerate(clusters):
+            if pid in cluster:
+                photo_clusters[pid] = cidx
+                break
+        else:
+            photo_clusters[pid] = None
+
+    return False, f"Photos in different clusters: {photo_clusters}"
+
+
+def run_test_set(db, s3_client, test_ids, same_cluster_tests, different_cluster_tests, order_tests=None, sequence_tests=None, set_name=""):
+    """Run a single test set and return results."""
+
+    # Find job with most matching photos
+    jobs = db.query(Job).order_by(Job.id.desc()).limit(30).all()
+    best_job = None
+    best_match_count = 0
+
+    for j in jobs:
+        match_count = db.query(JobPhoto.id).filter(
+            JobPhoto.job_id == j.id,
+            JobPhoto.id.in_(test_ids)
+        ).count()
+        if match_count > best_match_count:
+            best_match_count = match_count
+            best_job = j
+
+    if best_job is None or best_match_count < 2:
+        print(f"\n  Skipping {set_name}: No matching photos found")
+        return None
+
+    job = best_job
+
+    # Load photos that exist in this job
     photos = db.query(JobPhoto).filter(
         JobPhoto.job_id == job.id,
-        JobPhoto.id.in_(all_test_ids)
+        JobPhoto.id.in_(test_ids)
     ).order_by(JobPhoto.id).all()
 
-    print(f"Found {len(photos)} photos")
+    found_ids = {p.id for p in photos}
+    missing_from_job = sorted(set(test_ids) - found_ids)
+
+    print(f"\n  Job {job.id}: {len(found_ids)}/{len(test_ids)} expected photos in DB")
+    print(f"  Photo IDs in job: {sorted(found_ids)}")
+    if missing_from_job:
+        print(f"  ⚠ Photos NOT in this job: {missing_from_job}")
 
     # Download images
-    s3_client = S3Client()
     images = []
     photo_ids = []
     photo_map = {}
@@ -145,68 +265,211 @@ def main():
             images.append(img)
             photo_ids.append(photo.id)
             photo_map[photo.id] = photo
-            print(f"  Downloaded {photo.id}: {photo.room_label}")
         except Exception as e:
             logger.warning(f"Failed to download photo {photo.id}: {e}")
 
-    print(f"\nDownloaded {len(images)} images")
-    print()
+    print(f"  Downloaded {len(images)} images")
 
     # Run clustering
-    print("="*70)
-    print("RUNNING CLUSTERING...")
-    print("="*70)
-
+    print("\n  Running clustering...")
     cluster_lists = cluster_photos_optimized(images, photo_ids, s3_client, db_session=db, job_id=job.id)
 
-    print()
-    print("="*70)
-    print("CLUSTERING RESULTS:")
-    print("="*70)
-
+    # Show clusters
+    print("\n  CLUSTERS:")
     for i, cluster in enumerate(cluster_lists):
-        labels = []
-        for pid in cluster:
-            photo = photo_map.get(pid)
-            if photo:
-                labels.append(f"{pid}({photo.room_label})")
-            else:
-                labels.append(str(pid))
-        print(f"  Cluster {i}: {', '.join(labels)}")
+        labels = [f"{pid}({photo_map[pid].room_label})" if pid in photo_map else str(pid) for pid in cluster]
+        print(f"    {i}: {' -> '.join(labels)}")
 
-    print()
-    print("="*70)
-    print("VALIDATION:")
-    print("="*70)
-
-    # Check EXPECTED_SAME_CLUSTER
-    print("\n1. Photos that SHOULD be in same cluster:")
+    # Run validations
     all_passed = True
-    for group in EXPECTED_SAME_CLUSTER:
-        success, info = check_same_cluster(group, cluster_lists)
-        status = "✓ PASS" if success else "✗ FAIL"
-        print(f"   {status}: {group}")
-        print(f"          {info}")
+
+    # Build photo->cluster lookup for debug output
+    photo_to_cluster = {}
+    for cluster_idx, cluster in enumerate(cluster_lists):
+        for pid in cluster:
+            photo_to_cluster[pid] = (cluster_idx, cluster)
+
+    print("\n  SAME CLUSTER TESTS:")
+    for group in same_cluster_tests:
+        existing = [p for p in group if p in photo_ids]
+        if len(existing) < 2:
+            continue  # Skip if not enough photos available
+        success, info = check_same_cluster(existing, cluster_lists)
+        status = "✓" if success else "✗"
+        print(f"    {status} {existing}: {info}")
         if not success:
             all_passed = False
+            # Show where each photo actually ended up
+            for pid in existing:
+                if pid in photo_to_cluster:
+                    cidx, c = photo_to_cluster[pid]
+                    print(f"       └─ {pid} is in cluster {cidx}: {c}")
+                else:
+                    print(f"       └─ {pid} NOT IN ANY CLUSTER")
 
-    # Check EXPECTED_DIFFERENT_CLUSTERS
-    print("\n2. Photos that should be in DIFFERENT clusters:")
-    for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS:
-        success, info = check_different_clusters(g1, g2, cluster_lists)
-        status = "✓ PASS" if success else "✗ FAIL"
-        print(f"   {status}: {g1} vs {g2}")
-        print(f"          {info}")
+    print("\n  DIFFERENT CLUSTER TESTS:")
+    for g1, g2 in different_cluster_tests:
+        g1_exist = [p for p in g1 if p in photo_ids]
+        g2_exist = [p for p in g2 if p in photo_ids]
+        if not g1_exist or not g2_exist:
+            continue  # Skip if missing photos
+        success, info = check_different_clusters(g1_exist, g2_exist, cluster_lists)
+        status = "✓" if success else "✗"
+        print(f"    {status} {g1_exist} vs {g2_exist}: {info}")
         if not success:
             all_passed = False
+            # Show the shared cluster contents
+            g1_cidx = set(photo_to_cluster.get(pid, (-1, None))[0] for pid in g1_exist)
+            g2_cidx = set(photo_to_cluster.get(pid, (-1, None))[0] for pid in g2_exist)
+            shared = g1_cidx & g2_cidx - {-1}
+            for cidx in shared:
+                print(f"       └─ Shared cluster {cidx}: {cluster_lists[cidx]}")
 
-    print()
+    if order_tests:
+        print("\n  ORDERING TESTS:")
+        for test in order_tests:
+            if test["expected_start"] not in photo_ids:
+                continue
+            success, info = check_order(test["photos"], test["expected_start"], cluster_lists)
+            status = "✓" if success else "✗"
+            print(f"    {status} {test['note']}: {info}")
+            if not success:
+                all_passed = False
+                # Show the actual cluster containing this photo
+                expected_start = test["expected_start"]
+                if expected_start in photo_to_cluster:
+                    cidx, cluster = photo_to_cluster[expected_start]
+                    pos = cluster.index(expected_start) if expected_start in cluster else -1
+                    print(f"       └─ {expected_start} at position {pos} in: {cluster}")
+
+    if sequence_tests:
+        print("\n  SEQUENCE TESTS (consecutive photo ordering):")
+        for test in sequence_tests:
+            # Check if all expected photos are in the test set
+            if not all(pid in photo_ids for pid in test["photos"]):
+                continue
+            success, info = check_sequence(test["photos"], cluster_lists)
+            status = "✓" if success else "✗"
+            print(f"    {status} {test['note']}: {info}")
+            if not success:
+                all_passed = False
+
+    return all_passed
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Test clustering against expected photo groupings')
+    parser.add_argument('--job-id', type=int, help='Job ID to test (default: auto-detect)')
+    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', 'all'], default='all',
+                       help='Test set: 1=original, 2=861-912, 3=805-815, all=run all')
+    parser.add_argument('--list-jobs', action='store_true', help='List available jobs with photo counts')
+    args = parser.parse_args()
+
+    engine = create_engine(settings.DATABASE_URL)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    s3_client = S3Client()
+
+    if args.list_jobs:
+        jobs = db.query(Job).order_by(Job.id.desc()).limit(15).all()
+        print("\nRecent jobs:")
+        for j in jobs:
+            photo_count = db.query(JobPhoto).filter(JobPhoto.job_id == j.id).count()
+            photo_range = db.query(JobPhoto.id).filter(JobPhoto.job_id == j.id).order_by(JobPhoto.id).all()
+            if photo_range:
+                min_id, max_id = photo_range[0][0], photo_range[-1][0]
+                print(f"  Job {j.id}: {photo_count} photos (IDs {min_id}-{max_id})")
+        db.close()
+        return
+
     print("="*70)
-    if all_passed:
-        print("ALL TESTS PASSED!")
+    print("CLUSTERING TEST SUITE")
+    print("="*70)
+
+    results = []
+
+    # Test Set 1: Original (569-705)
+    if args.test_set in ['1', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 1: Original listing (569-705)")
+        print("="*70)
+
+        test_ids = set()
+        for group in EXPECTED_SAME_CLUSTER:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER,
+                             EXPECTED_DIFFERENT_CLUSTERS,
+                             order_tests=None,
+                             sequence_tests=None,
+                             set_name="Set 1")
+        if result is not None:
+            results.append(("Set 1: Original", result))
+
+    # Test Set 2: Listing 861-912
+    if args.test_set in ['2', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 2: Listing 861-912")
+        print("="*70)
+
+        test_ids = set()
+        for group in EXPECTED_SAME_CLUSTER_SET2:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS_SET2:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER_SET2,
+                             EXPECTED_DIFFERENT_CLUSTERS_SET2,
+                             order_tests=EXPECTED_ORDER_SET2,
+                             sequence_tests=EXPECTED_SEQUENCES_SET2,
+                             set_name="Set 2")
+        if result is not None:
+            results.append(("Set 2: 861-912", result))
+
+    # Test Set 3: Listing 805-815
+    if args.test_set in ['3', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 3: Listing 805-815")
+        print("="*70)
+
+        test_ids = set()
+        for group in EXPECTED_SAME_CLUSTER_SET3:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS_SET3:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER_SET3,
+                             EXPECTED_DIFFERENT_CLUSTERS_SET3,
+                             order_tests=EXPECTED_ORDER_SET3,
+                             sequence_tests=None,
+                             set_name="Set 3")
+        if result is not None:
+            results.append(("Set 3: 805-815", result))
+
+    # Summary
+    print("\n" + "="*70)
+    print("SUMMARY")
+    print("="*70)
+
+    for name, passed in results:
+        status = "✓ PASS" if passed else "✗ FAIL"
+        print(f"  {status}: {name}")
+
+    if results and all(r[1] for r in results):
+        print("\nALL TESTS PASSED!")
+    elif results:
+        print("\nSOME TESTS FAILED - tuning needed")
     else:
-        print("SOME TESTS FAILED - tuning needed")
-    print("="*70)
+        print("\nNo tests ran - check photo IDs")
 
     db.close()
 

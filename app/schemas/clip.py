@@ -68,3 +68,49 @@ class ClipListResponse(BaseModel):
     job_status: Optional[str] = None
     clips: List[ClipResponse]
     total_clips: int
+
+
+# Debug schemas for photo similarity and clustering analysis
+class PhotoSimilarityInfo(BaseModel):
+    """Similarity info between two photos."""
+    photo_a_id: int
+    photo_b_id: int
+    pair_source: Optional[str] = None  # dinov2_topk, temporal_window, both
+    dinov2_similarity: Optional[float] = None
+    geometric_matches: Optional[int] = None
+    geometric_inliers: Optional[int] = None
+    geometric_score: Optional[float] = None
+    is_connected: bool = False
+
+
+class PhotoDebugInfo(BaseModel):
+    """Debug info for a single photo in a cluster."""
+    id: int
+    rails_photo_id: str
+    thumbnail_url: Optional[str] = None
+    room_label: Optional[str] = None
+    position_in_cluster: int  # 0-indexed position
+    is_endpoint: bool = False  # True if first or last in cluster
+    # Similarity to neighbors
+    similarities: List[PhotoSimilarityInfo] = []
+
+
+class ClusterDebugResponse(BaseModel):
+    """Debug info for a cluster - shows why photos were grouped."""
+    cluster_id: int
+    room_type: Optional[str] = None
+    photo_ids: List[int]  # Ordered list
+    photos: List[PhotoDebugInfo]
+    total_photos: int
+    # Summary stats
+    avg_dinov2_similarity: Optional[float] = None
+    avg_geometric_score: Optional[float] = None
+    has_direction_info: bool = False
+
+
+class ClusterListDebugResponse(BaseModel):
+    """List of clusters with debug info."""
+    project_id: str
+    job_id: Optional[int] = None
+    clusters: List[ClusterDebugResponse]
+    total_clusters: int
