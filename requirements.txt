@@ -20,6 +20,16 @@ opencv-python-headless>=4.8.0
 # Phase 1: Analysis Models
 open-clip-torch>=2.24.0
 timm>=0.9.12
+transformers>=4.36.0
+
+# Learned Feature Matching (replaces ORB)
+kornia>=0.7.0
+kornia-rs>=0.1.0
+
+# Phase 2: Video Generation (GPU only, but imported everywhere)
+diffusers>=0.32.0
+accelerate>=0.30.0
+imageio[ffmpeg]>=2.34.0
 
 # AWS (S3 and SQS)
 boto3>=1.34.0

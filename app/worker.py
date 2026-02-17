@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # Phases each worker type handles
 CPU_PHASES = [1, 3, 4]  # Analyze, Timeline, Assembly
 GPU_PHASES = [2]         # Render clips
+DEV_PHASES = [1, 2]  # Phase 1+2 for development (Phase 3/4 not implemented yet)
 
 
 def process_message(message: dict) -> None:
@@ -29,7 +30,15 @@ def process_message(message: dict) -> None:
 
     # Parse message
     job_message = JobMessage(**message)
-    allowed_phases = GPU_PHASES if settings.WORKER_TYPE == "gpu" else CPU_PHASES
+
+    # In development, run all phases (Phase 2 uses mock mode on CPU)
+    # In production, GPU workers handle Phase 2
+    if settings.ENVIRONMENT == "development":
+        allowed_phases = DEV_PHASES
+    elif settings.WORKER_TYPE == "gpu":
+        allowed_phases = GPU_PHASES
+    else:
+        allowed_phases = CPU_PHASES
 
     with get_db_context() as db:
         orchestrator = PipelineOrchestrator(db)

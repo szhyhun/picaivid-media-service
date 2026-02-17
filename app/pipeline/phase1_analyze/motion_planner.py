@@ -1,6 +1,15 @@
-"""Motion planning for room clusters based on depth analysis."""
+"""Motion planning for room clusters based on depth analysis.
+
+LTX-2 Prompting Strategy:
+- Always describe camera motion explicitly
+- Always describe speed (slow, subtle, cinematic)
+- Always constrain geometry in prompts
+- Always add negative constraints to prevent warping
+- Keep clips 2-4 seconds
+- Use CFG scale 3-6
+"""
 import logging
-from typing import List
+from typing import List, Dict, Any, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -33,14 +42,106 @@ MOTION_DURATIONS = {
     "multi_view": 5.5,
 }
 
+# LTX-2 default parameters by tier
+LTX2_PARAMS = {
+    "low": {"cfg_scale": 4.0, "inference_steps": 30},
+    "medium": {"cfg_scale": 4.5, "inference_steps": 40},
+    "high": {"cfg_scale": 5.0, "inference_steps": 50},
+}
+
+# Motion descriptions for prompt generation
+MOTION_DESCRIPTIONS = {
+    "static": "static camera with subtle micro-movement",
+    "micro_push_in": "slow smooth cinematic push-in camera movement",
+    "micro_push_out": "slow smooth cinematic push-out camera movement",
+    "subtle_pan": "slow smooth pan from left to right",
+    "push_in": "slow forward dolly motion",
+    "push_out": "slow backward dolly motion",
+    "pan_left": "smooth lateral pan to the left",
+    "pan_right": "smooth lateral pan to the right",
+    "reveal": "slow reveal transition",
+    "dolly_in": "cinematic dolly-in camera movement",
+    "dolly_out": "cinematic dolly-out camera movement",
+    "orbit": "cinematic slow orbit camera movement",
+    "parallax": "subtle parallax effect with natural depth separation",
+    "multi_view": "cinematic multi-view synthesis with true perspective",
+}
+
+# Base prompt templates by tier
+# Note: {view_count_phrase} is dynamically generated based on image_count
+PROMPT_TEMPLATES = {
+    "low": """Professional real estate interior video.
+{motion_description}.
+Stable tripod motion.
+Natural lighting.
+Maintain structural consistency.
+Preserve wall alignment.
+No object movement.
+No distortion.
+No warping.
+No morphing.
+No flicker.
+Photorealistic.""",
+
+    "medium": """Smooth cinematic transition {view_count_phrase} of the same room.
+{motion_description}.
+Maintain consistent room geometry.
+Preserve window and door placement.
+Preserve object positions.
+Stable lighting.
+No morphing.
+No warping.
+No texture melting.
+No bending walls.
+Photorealistic interior.""",
+
+    "high": """Cinematic {motion_description} inside room.
+{view_count_phrase}.
+Subtle parallax effect.
+Natural depth separation.
+Maintain structural realism.
+No hallucinated objects.
+No geometry distortion.
+Stable lighting.
+Preserve original layout.
+Photorealistic.""",
+}
+
+# Room-specific prompt modifiers
+ROOM_MODIFIERS = {
+    "hallway": """Slow forward camera movement down hallway.
+Maintain depth perspective.
+No structural distortion.
+Stable alignment.""",
+
+    "kitchen": """Slow reveal behind counter.
+Preserve appliance positions.
+Stable countertop geometry.""",
+
+    "exterior": """Slow approach toward entrance.
+Maintain facade geometry.
+Preserve landscaping positions.
+Natural outdoor lighting.""",
+
+    "drone": """Slow aerial pullback.
+Maintain roof geometry.
+Stable horizon line.
+No ground warping.""",
+}
+
+# SEVA minimal prompts (geometry-driven, not prompt-driven)
+SEVA_PROMPT = """Realistic indoor room video.
+Natural lighting.
+Photorealistic."""
+
 
 def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult:
     """Plan motion strategy for a room cluster.
 
     Based on OVERVIEW.md:
-    - Low confidence: micro push/pan only
-    - Medium confidence: interpolation and reveals
-    - High confidence: multi-view synthesis
+    - Low confidence: micro push/pan only (LTX-2 single image)
+    - Medium confidence: interpolation and reveals (LTX-2 interpolation)
+    - High confidence: multi-view synthesis (LTX-2 parallax/multi-view or SEVA)
 
     Args:
         db: Database session
@@ -55,8 +156,8 @@ def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult
     # Select recommended motion based on room type and tier
     recommended = _select_recommended_motion(cluster, allowed_motions)
 
-    # Determine duration (minimum 2 seconds)
-    duration = max(2.0, MOTION_DURATIONS.get(recommended, 3.0))
+    # Determine duration (minimum 2 seconds, max 4 seconds for cost control)
+    duration = min(4.0, max(2.0, MOTION_DURATIONS.get(recommended, 3.0)))
 
     # Determine model recommendation
     # SFM-eligible clusters get more advanced motion capabilities
@@ -68,9 +169,15 @@ def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult
     elif tier in ("medium", "high"):
         model_recommendation = "LTX-2 interpolation"
     else:
-        model_recommendation = "LTX-2 single image"
+        model_recommendation = "LTX-2 single"
 
-    # Create analysis result
+    # Generate LTX-2 prompt template
+    prompt_template = _generate_prompt_template(cluster, tier, recommended)
+
+    # Get LTX-2 parameters
+    ltx2_params = LTX2_PARAMS.get(tier, LTX2_PARAMS["low"])
+
+    # Create analysis result with LTX-2 prompt and parameters
     result = AnalysisResult(
         job_id=cluster.job_id,
         room_cluster_id=cluster.id,
@@ -79,6 +186,9 @@ def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult
         recommended_duration=duration,
         tier=tier,
         model_recommendation=model_recommendation,
+        prompt_template=prompt_template,
+        cfg_scale=ltx2_params["cfg_scale"],
+        inference_steps=ltx2_params["inference_steps"],
         debug_metrics={
             "depth_variance": cluster.depth_variance,
             "image_count": cluster.image_count,
@@ -100,10 +210,101 @@ def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult
 
     logger.info(
         f"Planned motion for cluster {cluster.id}: "
-        f"{recommended} ({tier} tier, {duration}s)"
+        f"{recommended} ({tier} tier, {duration}s, {model_recommendation})"
     )
 
     return result
+
+
+def _generate_view_count_phrase(image_count: int) -> str:
+    """Generate natural language phrase for number of views.
+
+    Args:
+        image_count: Number of images in cluster
+
+    Returns:
+        Human-readable phrase like "between two views" or "across four viewpoints"
+    """
+    count_words = {
+        1: "from a single view",
+        2: "between two views",
+        3: "across three viewpoints",
+        4: "across four viewpoints",
+    }
+
+    if image_count in count_words:
+        return count_words[image_count]
+    else:
+        return f"across {image_count} viewpoints"
+
+
+def _generate_prompt_template(cluster: RoomCluster, tier: str, motion: str) -> str:
+    """Generate LTX-2 prompt template for a cluster.
+
+    Args:
+        cluster: RoomCluster
+        tier: Confidence tier (low, medium, high)
+        motion: Selected motion type
+
+    Returns:
+        LTX-2 prompt template string
+    """
+    room_type = (cluster.room_type or "").lower()
+
+    # Check if SEVA should be used (high confidence + SFM eligible)
+    if cluster.sfm_eligible and tier == "high":
+        return SEVA_PROMPT
+
+    # Get motion description
+    motion_desc = MOTION_DESCRIPTIONS.get(motion, "slow cinematic camera movement")
+
+    # Generate view count phrase based on actual image count
+    view_phrase = _generate_view_count_phrase(cluster.image_count or 1)
+
+    # Get base template
+    template = PROMPT_TEMPLATES.get(tier, PROMPT_TEMPLATES["low"])
+
+    # Format with motion description and view count
+    prompt = template.format(
+        motion_description=motion_desc,
+        view_count_phrase=view_phrase,
+    )
+
+    # Add room-specific modifier if applicable
+    for room_key, modifier in ROOM_MODIFIERS.items():
+        if room_key in room_type:
+            prompt = f"{prompt}\n\n{modifier}"
+            break
+
+    return prompt
+
+
+def get_prompt_for_motion(
+    cluster: RoomCluster,
+    motion: str,
+    tier: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Get the complete prompt and parameters for video generation.
+
+    This is called by Phase 2 (render) to get the actual prompt to use.
+
+    Args:
+        cluster: RoomCluster
+        motion: Motion type to generate
+        tier: Confidence tier
+
+    Returns:
+        Tuple of (prompt_string, params_dict)
+    """
+    prompt = _generate_prompt_template(cluster, tier, motion)
+    params = LTX2_PARAMS.get(tier, LTX2_PARAMS["low"]).copy()
+
+    # Add common parameters
+    params["duration"] = min(4.0, max(2.0, MOTION_DURATIONS.get(motion, 3.0)))
+    params["fps"] = 24
+    params["resolution"] = "720p"  # Generate at 720p, upscale later
+
+    return prompt, params
 
 
 def _select_recommended_motion(cluster: RoomCluster, allowed_motions: List[str]) -> str:

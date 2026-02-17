@@ -6,7 +6,9 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Job
 from app.pipeline.phase1_analyze.analyzer import Phase1Analyzer
+from app.pipeline.phase2_render.renderer import Phase2Renderer
 from app.schemas.job import JobMessage
+from app.services.rails_webhook import notify_render_complete, notify_render_failed
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +86,15 @@ class PipelineOrchestrator:
         while current <= 4:
             if current not in allowed_phases:
                 logger.info(f"Phase {current} not in allowed phases, stopping")
+                # If we just finished Phase 2, notify Rails
+                if current == 3 and 2 in allowed_phases:
+                    notify_render_complete(job.project_id)
                 break
 
             success = self._run_phase(job, current)
             if not success:
                 logger.error(f"Phase {current} failed for job {job_id}")
+                notify_render_failed(job.project_id, job.error_message or "Unknown error")
                 break
 
             current += 1
@@ -98,6 +104,7 @@ class PipelineOrchestrator:
                 logger.info(f"Job {job_id} complete")
                 job.status = "complete"
                 self.db.commit()
+                notify_render_complete(job.project_id)
                 break
 
     def _run_phase(self, job: Job, phase: int) -> bool:
@@ -117,11 +124,9 @@ class PipelineOrchestrator:
             return analyzer.run(job.id)
 
         elif phase == 2:
-            # Phase 2: Render clips (GPU only)
-            logger.info("Phase 2 (render) requires GPU worker")
-            job.status = "waiting_for_gpu"
-            self.db.commit()
-            return False  # Stop here, GPU worker will pick up
+            # Phase 2: Render clips (GPU preferred, but mock mode works on CPU)
+            renderer = Phase2Renderer(self.db)
+            return renderer.run(job.id)
 
         elif phase == 3:
             # Phase 3: Timeline (not implemented yet)

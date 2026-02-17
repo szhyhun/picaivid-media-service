@@ -1,0 +1,97 @@
+# GPU Dockerfile for Phase 2 video rendering with LTX-2
+#
+# Build: docker build -f Dockerfile.gpu -t picaivid-media:gpu .
+# Run:   docker run --gpus all -e WORKER_TYPE=gpu picaivid-media:gpu
+#
+# Note: LTX-2 model is ~15GB, this build takes time and produces a large image.
+
+# ============================================
+# Build stage for model download
+# ============================================
+FROM nvidia/cuda:12.1-devel-ubuntu22.04 as model-downloader
+
+WORKDIR /app
+
+# Install Python and pip
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies for model download
+RUN pip3 install --no-cache-dir \
+    torch>=2.1.0 \
+    transformers>=4.36.0 \
+    diffusers>=0.32.0 \
+    accelerate>=0.30.0 \
+    open-clip-torch>=2.24.0 \
+    huggingface_hub
+
+# Copy download script
+COPY scripts/download_models.py scripts/
+
+# Download Phase 1 models (MiDaS, OpenCLIP)
+RUN python3 scripts/download_models.py --cache-dir /models
+
+# Download LTX-2 model (~15GB)
+# This is the slowest step - will be cached in Docker layer
+RUN python3 -c "from diffusers import LTX2ImageToVideoPipeline; \
+    import torch; \
+    pipe = LTX2ImageToVideoPipeline.from_pretrained( \
+        'Lightricks/LTX-2', \
+        torch_dtype=torch.bfloat16, \
+        cache_dir='/models/huggingface' \
+    ); \
+    print('LTX-2 downloaded successfully')"
+
+# ============================================
+# Production GPU image
+# ============================================
+FROM nvidia/cuda:12.1-runtime-ubuntu22.04 as production
+
+WORKDIR /app
+
+# Install Python, system dependencies, and ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3-pip \
+    ffmpeg \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3.11 /usr/bin/python
+
+# Copy requirements and install
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Copy pre-downloaded models from builder stage
+COPY --from=model-downloader /models /app/ml_models
+
+# Copy application code
+COPY app/ app/
+COPY alembic/ alembic/
+COPY alembic.ini .
+COPY scripts/ scripts/
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV MODEL_CACHE_DIR=/app/ml_models
+ENV HF_HOME=/app/ml_models/huggingface
+ENV TRANSFORMERS_CACHE=/app/ml_models/huggingface
+ENV HF_HUB_OFFLINE=1
+ENV WORKER_TYPE=gpu
+
+# Don't expose port - this is a worker, not a web server
+# The worker polls SQS for jobs
+
+# Health check - verify CUDA is available
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" || exit 1
+
+# Run worker
+CMD ["python3", "-m", "app.worker"]

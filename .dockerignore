@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Local ML models (will be downloaded in Docker)
+ml_models/
+
+# Tests
+test_*.py
+tests/
+pytest.ini
+
+# Documentation
+*.md
+!README.md
+
+# Misc
+.DS_Store
+*.log

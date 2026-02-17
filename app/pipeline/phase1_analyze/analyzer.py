@@ -86,8 +86,10 @@ class Phase1Analyzer:
             compute_photo_scores(job_photos)
             self.db.commit()
 
-            # Step 7: Cluster photos by room
-            clusters = cluster_photos_by_room(self.db, job, job_photos)
+            # Step 7: Cluster photos by room (with visual overlap detection)
+            clusters = cluster_photos_by_room(
+                self.db, job, job_photos, s3_client=s3_client
+            )
 
             # Step 8: Plan motion for each cluster
             for cluster in clusters:

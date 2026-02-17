@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     SQS_ACCESS_KEY_ID: str = "localstack"
     SQS_SECRET_ACCESS_KEY: str = "localstack"
 
+    # Rails webhook URL for status updates
+    RAILS_WEBHOOK_URL: str | None = "http://localhost:3000"
+
     # Worker Type
     WORKER_TYPE: str = "cpu"
 

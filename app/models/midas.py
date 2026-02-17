@@ -1,56 +1,122 @@
-"""MiDaS model for depth estimation."""
+"""MiDaS/DPT model for depth estimation using Hugging Face Transformers.
+
+Uses Intel/dpt-large from Hugging Face Hub - more reliable than torch.hub.
+Model is downloaded once and cached in ./ml_models/huggingface/
+
+For production:
+- Models are pre-baked into Docker image during build
+- Set HF_HUB_OFFLINE=1 to use only cached models
+- See scripts/download_models.py for pre-download during build
+"""
 import logging
-from typing import Tuple
+import os
+from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
+from transformers import DPTForDepthEstimation, DPTImageProcessor
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Set HuggingFace cache directory
+HF_CACHE_DIR = Path(settings.MODEL_CACHE_DIR) / "huggingface"
+HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR)
+
+# Model identifier on Hugging Face Hub
+MODEL_ID = "Intel/dpt-large"
+
+# Check if running in offline mode (production with pre-baked models)
+OFFLINE_MODE = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
+
 
 class MiDaSModel:
-    """MiDaS depth estimation model wrapper."""
+    """DPT depth estimation model wrapper (MiDaS architecture via HuggingFace).
 
-    def __init__(self):
-        self._model = None
-        self._transform = None
-        self._device = None
+    Uses Intel/dpt-large from Hugging Face Hub.
+    Model is loaded once on first use and cached for subsequent calls.
+    """
+
+    _instance = None
+    _model = None
+    _processor = None
+    _device = None
+    _loaded = False
+
+    def __new__(cls):
+        """Singleton pattern - ensure only one model instance exists."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def _ensure_loaded(self) -> None:
         """Lazy-load the model on first use."""
-        if self._model is not None:
+        if MiDaSModel._loaded:
             return
 
-        logger.info("Loading MiDaS model: DPT_Large")
+        logger.info(f"Loading depth model: {MODEL_ID}")
+        if OFFLINE_MODE:
+            logger.info("Running in offline mode (using pre-cached models)")
 
         # Determine device
         if torch.backends.mps.is_available():
-            self._device = torch.device("mps")
+            MiDaSModel._device = torch.device("mps")
             logger.info("Using MPS (Apple Silicon) for depth estimation")
         elif torch.cuda.is_available():
-            self._device = torch.device("cuda")
+            MiDaSModel._device = torch.device("cuda")
             logger.info("Using CUDA for depth estimation")
         else:
-            self._device = torch.device("cpu")
+            MiDaSModel._device = torch.device("cpu")
             logger.info("Using CPU for depth estimation")
 
-        # Load MiDaS from torch hub
-        self._model = torch.hub.load(
-            "intel-isl/MiDaS",
-            "DPT_Large",
-            trust_repo=True,
-        )
-        self._model = self._model.to(self._device)
-        self._model.eval()
+        try:
+            # In production (OFFLINE_MODE), use only local cached models
+            # In development, allow downloading if not cached
+            MiDaSModel._processor = DPTImageProcessor.from_pretrained(
+                MODEL_ID,
+                cache_dir=str(HF_CACHE_DIR),
+                local_files_only=OFFLINE_MODE,
+            )
+            MiDaSModel._model = DPTForDepthEstimation.from_pretrained(
+                MODEL_ID,
+                cache_dir=str(HF_CACHE_DIR),
+                local_files_only=OFFLINE_MODE,
+            )
+            MiDaSModel._model = MiDaSModel._model.to(MiDaSModel._device)
+            MiDaSModel._model.eval()
+            MiDaSModel._loaded = True
 
-        # Load transform
-        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
-        self._transform = midas_transforms.dpt_transform
-
-        logger.info("MiDaS model loaded successfully")
+            logger.info(f"Depth model loaded successfully from {MODEL_ID}")
+        except Exception as e:
+            logger.error(f"Failed to load depth model: {e}")
+            if not OFFLINE_MODE:
+                # Try loading from local cache only as fallback
+                try:
+                    logger.info("Attempting to load from local cache...")
+                    MiDaSModel._processor = DPTImageProcessor.from_pretrained(
+                        MODEL_ID,
+                        cache_dir=str(HF_CACHE_DIR),
+                        local_files_only=True,
+                    )
+                    MiDaSModel._model = DPTForDepthEstimation.from_pretrained(
+                        MODEL_ID,
+                        cache_dir=str(HF_CACHE_DIR),
+                        local_files_only=True,
+                    )
+                    MiDaSModel._model = MiDaSModel._model.to(MiDaSModel._device)
+                    MiDaSModel._model.eval()
+                    MiDaSModel._loaded = True
+                    logger.info("Depth model loaded from local cache")
+                except Exception as cache_error:
+                    logger.error(f"Failed to load from cache: {cache_error}")
+                    raise
+            else:
+                logger.error("Models not found in cache. Run 'python scripts/download_models.py' first.")
+                raise
 
     def estimate_depth(self, image: Image.Image) -> np.ndarray:
         """Estimate depth map from image.
@@ -67,21 +133,22 @@ class MiDaSModel:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Convert to numpy
-        img_np = np.array(image)
-
-        # Transform for model
-        input_batch = self._transform(img_np).to(self._device)
+        # Process image
+        inputs = MiDaSModel._processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(MiDaSModel._device) for k, v in inputs.items()}
 
         # Estimate depth
         with torch.no_grad():
-            prediction = self._model(input_batch)
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=img_np.shape[:2],
-                mode="bicubic",
-                align_corners=False,
-            ).squeeze()
+            outputs = MiDaSModel._model(**inputs)
+            predicted_depth = outputs.predicted_depth
+
+        # Interpolate to original size
+        prediction = torch.nn.functional.interpolate(
+            predicted_depth.unsqueeze(1),
+            size=image.size[::-1],  # PIL size is (width, height), need (height, width)
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
 
         depth_map = prediction.cpu().numpy()
         return depth_map

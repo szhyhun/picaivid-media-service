@@ -95,6 +95,30 @@ class S3Client:
         except Exception:
             return False
 
+    def generate_presigned_url(self, key: str, expires_in: int = 3600) -> Optional[str]:
+        """Generate a pre-signed URL for accessing a private S3 object.
+
+        Args:
+            key: S3 object key
+            expires_in: URL expiration time in seconds (default 1 hour)
+
+        Returns:
+            Pre-signed URL or None if generation fails
+        """
+        try:
+            url = self.client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': settings.S3_BUCKET,
+                    'Key': key,
+                },
+                ExpiresIn=expires_in,
+            )
+            return url
+        except Exception as e:
+            logger.error(f"Failed to generate presigned URL for {key}: {e}")
+            return None
+
     def _parse_key(self, s3_uri: str) -> str:
         """Parse S3 URI to extract key."""
         if s3_uri.startswith("s3://"):

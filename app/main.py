@@ -8,8 +8,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.session import get_db
-from app.db.models import Job
+from app.db.models import Job, Clip, JobPhoto, RoomCluster, AnalysisResult
 from app.schemas.job import JobMessage, JobStatusResponse
+from app.schemas.clip import (
+    ClipResponse, ClipListResponse, SourcePhotoInfo, ClusterInfo, AnalysisInfo
+)
 from app.pipeline.orchestrator import PipelineOrchestrator
 
 # Setup logging
@@ -67,9 +70,10 @@ async def create_job(
     orchestrator = PipelineOrchestrator(db)
     job = orchestrator.create_job_from_message(message)
 
-    # For development: run Phase 1 synchronously
+    # For development: run Phase 1 and Phase 2 synchronously
     if settings.ENVIRONMENT == "development":
-        orchestrator.execute(job.id, allowed_phases=[1])
+        orchestrator.execute(job.id, allowed_phases=[1, 2])
+        db.refresh(job)  # Get updated status after processing
 
     return JobStatusResponse(
         job_id=job.id,
@@ -123,4 +127,139 @@ async def run_phase(
         status=job.status,
         current_phase=job.current_phase,
         error_message=job.error_message,
+    )
+
+
+@app.get("/api/projects/{project_id}/clips", response_model=ClipListResponse)
+async def get_project_clips(
+    project_id: str,
+    db: Session = Depends(get_db),
+):
+    """Get all clips for a project.
+
+    Returns clips with pre-signed URLs for video playback.
+    This endpoint is called by the frontend to display generated videos.
+    """
+    from app.services.storage.s3_client import s3_client
+
+    # Find the most recent job for this project
+    job = (
+        db.query(Job)
+        .filter(Job.project_id == project_id)
+        .order_by(Job.created_at.desc())
+        .first()
+    )
+
+    if not job:
+        return ClipListResponse(
+            project_id=project_id,
+            job_id=None,
+            job_status=None,
+            clips=[],
+            total_clips=0,
+        )
+
+    # Get all clips for this job with related data
+    clips = db.query(Clip).filter(Clip.job_id == job.id).all()
+
+    # Build a map of job_photo_id -> JobPhoto for quick lookup
+    job_photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).all()
+    photo_map = {p.id: p for p in job_photos}
+
+    # Build a map of room_cluster_id -> (RoomCluster, AnalysisResult)
+    clusters = db.query(RoomCluster).filter(RoomCluster.job_id == job.id).all()
+    cluster_map = {c.id: c for c in clusters}
+
+    analysis_results = db.query(AnalysisResult).filter(AnalysisResult.job_id == job.id).all()
+    analysis_map = {a.room_cluster_id: a for a in analysis_results if a.room_cluster_id}
+
+    # Generate pre-signed URLs for each clip
+    clip_responses = []
+
+    for clip in clips:
+        video_url = None
+        if clip.s3_uri:
+            # Extract key from s3://bucket/key format
+            if clip.s3_uri.startswith("s3://"):
+                parts = clip.s3_uri[5:].split("/", 1)
+                if len(parts) == 2:
+                    key = parts[1]
+                    video_url = s3_client.generate_presigned_url(key, expires_in=3600)
+
+        # Get source photos info
+        source_photos = []
+        if clip.source_photo_ids:
+            for photo_id in clip.source_photo_ids:
+                photo = photo_map.get(photo_id)
+                if photo:
+                    # Generate thumbnail URL for source photo
+                    thumb_url = None
+                    if photo.s3_uri:
+                        photo_key = photo.s3_uri[5:].split("/", 1)[1] if photo.s3_uri.startswith("s3://") else photo.s3_uri
+                        thumb_url = s3_client.generate_presigned_url(photo_key, expires_in=3600)
+
+                    source_photos.append(SourcePhotoInfo(
+                        id=photo.id,
+                        rails_photo_id=photo.rails_photo_id,
+                        s3_uri=photo.s3_uri,
+                        thumbnail_url=thumb_url,
+                        room_label=photo.room_label,
+                        final_score=photo.final_score,
+                        depth_variance=photo.depth_variance,
+                        sharpness=photo.sharpness,
+                    ))
+
+        # Get cluster info
+        cluster_info = None
+        if clip.room_cluster_id and clip.room_cluster_id in cluster_map:
+            cluster = cluster_map[clip.room_cluster_id]
+            cluster_info = ClusterInfo(
+                id=cluster.id,
+                room_type=cluster.room_type,
+                confidence_tier=cluster.confidence_tier,
+                image_count=cluster.image_count or 0,
+                overlap_score=cluster.overlap_score,
+                depth_variance=cluster.depth_variance,
+                recommended_motion=cluster.recommended_motion,
+            )
+
+        # Get analysis info
+        analysis_info = None
+        if clip.room_cluster_id and clip.room_cluster_id in analysis_map:
+            analysis = analysis_map[clip.room_cluster_id]
+            analysis_info = AnalysisInfo(
+                tier=analysis.tier,
+                recommended_motion=analysis.recommended_motion,
+                model_recommendation=analysis.model_recommendation,
+                cfg_scale=analysis.cfg_scale,
+                inference_steps=analysis.inference_steps,
+                debug_metrics=analysis.debug_metrics,
+            )
+
+        clip_responses.append(
+            ClipResponse(
+                id=clip.id,
+                job_id=clip.job_id,
+                room_cluster_id=clip.room_cluster_id,
+                source_photo_ids=clip.source_photo_ids,
+                motion_type=clip.motion_type,
+                model_used=clip.model_used,
+                is_3d=clip.is_3d or False,
+                duration=clip.duration,
+                prompt_used=clip.prompt_used,
+                s3_uri=clip.s3_uri,
+                video_url=video_url,
+                status=clip.status,
+                source_photos=source_photos if source_photos else None,
+                cluster_info=cluster_info,
+                analysis_info=analysis_info,
+            )
+        )
+
+    return ClipListResponse(
+        project_id=project_id,
+        job_id=job.id,
+        job_status=job.status,
+        clips=clip_responses,
+        total_clips=len(clip_responses),
     )
