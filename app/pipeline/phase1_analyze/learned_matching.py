@@ -208,6 +208,12 @@ OVERLAP_THRESHOLD = 0.15          # Minimum score to connect photos
 # For ADJACENT photos (temporal_dist=1), trust geometry even if room labels differ
 # (ML room labels are often wrong, but adjacent photos are usually same room)
 MIN_INLIERS_CROSS_ROOM = 30       # Require 30+ inliers for non-adjacent cross-room pairs
+MIN_INLIERS_CROSS_ROOM_ADJACENT = 15  # Lower threshold for adjacent photos (ML often mislabels)
+
+# Position gap thresholds - photos far apart in sequence need stronger evidence
+# (prevents clustering photos from different physical locations with same room label)
+POSITION_GAP_THRESHOLD = 3         # If gap >= 3, require higher inlier count
+MIN_INLIERS_FAR_APART = 25         # Require 25+ inliers for non-adjacent same-room photos
 
 
 def rooms_are_different(room1: str, room2: str) -> bool:
@@ -1082,8 +1088,12 @@ def cluster_photos_graph_based(
         num_inliers = None
         geo_score = None
 
-        # Cross-room adjacent pairs need geometric verification with higher threshold
-        min_inliers_required = MIN_INLIERS_CROSS_ROOM if is_cross_room else MIN_INLIERS_FOR_OVERLAP
+        # Cross-room pairs need geometric verification with higher threshold
+        # But for ADJACENT cross-room (temporal_dist=1), use lower threshold since ML often mislabels
+        if is_cross_room:
+            min_inliers_required = MIN_INLIERS_CROSS_ROOM_ADJACENT if temporal_dist == 1 else MIN_INLIERS_CROSS_ROOM
+        else:
+            min_inliers_required = MIN_INLIERS_FOR_OVERLAP
 
         # Very high semantic similarity - trust it for clustering (but NOT for cross-room)
         if sem_sim >= TEMPORAL_SEMANTIC_THRESHOLD and not is_cross_room:
@@ -1205,12 +1215,22 @@ def cluster_photos_graph_based(
             })
             continue
 
+        # Photos far apart in sequence need stronger evidence to be connected
+        # (prevents clustering photos from different physical locations with same room label)
+        position_gap = abs(j - i)
+        if position_gap >= POSITION_GAP_THRESHOLD:
+            min_inliers = MIN_INLIERS_FAR_APART
+            gap_note = f", gap={position_gap} -> need {min_inliers} inliers"
+        else:
+            min_inliers = MIN_INLIERS_FOR_OVERLAP
+            gap_note = ""
+
         logger.info(f"  [{idx+1}/{len(geometric_pairs)}] Checking {photo_ids[i]} <-> {photo_ids[j]} "
-                   f"(DINOv2 similarity={sem_sim:.3f})...")
+                   f"(DINOv2 similarity={sem_sim:.3f}{gap_note})...")
 
         num_matches, num_inliers, score, direction = match_image_pair(images[i], images[j])
 
-        is_matched = num_inliers >= MIN_INLIERS_FOR_OVERLAP
+        is_matched = num_inliers >= min_inliers
         if is_matched:
             adjacency[i, j] = max(adjacency[i, j], score)  # Keep higher score
             adjacency[j, i] = max(adjacency[j, i], score)
@@ -1219,7 +1239,7 @@ def cluster_photos_graph_based(
             dir_str = f"dir=({direction[0]:.2f},{direction[1]:.2f})" if direction != (0.0, 0.0) else "dir=unknown"
             logger.info(f"    ✓ MATCHED: {num_matches} matches, {num_inliers} inliers, score={score:.3f}, {dir_str}")
         else:
-            logger.info(f"    ✗ No match: {num_matches} matches, {num_inliers} inliers < {MIN_INLIERS_FOR_OVERLAP}")
+            logger.info(f"    ✗ No match: {num_matches} matches, {num_inliers} inliers < {min_inliers}")
 
         # Track for database storage
         similarity_records.append({
