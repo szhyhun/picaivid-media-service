@@ -18,6 +18,7 @@ class RoomCluster(Base):
     image_count = Column(Integer, default=0)
     overlap_score = Column(Float)
     depth_variance = Column(Float)
+    sequence_order = Column(Integer, nullable=True)
 
     # Hero photo selection (references job_photos table, not Rails photos)
     hero_photo_id = Column(Integer, ForeignKey("job_photos.id"), nullable=True)

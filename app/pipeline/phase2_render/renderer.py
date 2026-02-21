@@ -109,9 +109,12 @@ class Phase2Renderer:
 
         except Exception as e:
             logger.error(f"Phase 2 failed for job {job_id}: {e}")
-            job.status = "failed"
-            job.error_message = str(e)[:1000]
-            self.db.commit()
+            self.db.rollback()
+            failed_job = self.db.query(Job).filter(Job.id == job_id).first()
+            if failed_job:
+                failed_job.status = "failed"
+                failed_job.error_message = str(e)[:1000]
+                self.db.commit()
             raise
 
     def _get_clusters_with_analysis(
@@ -132,6 +135,7 @@ class Phase2Renderer:
                 AnalysisResult.room_cluster_id == RoomCluster.id,
             )
             .filter(RoomCluster.job_id == job_id)
+            .order_by(RoomCluster.sequence_order.asc().nulls_last(), RoomCluster.id.asc())
             .all()
         )
 

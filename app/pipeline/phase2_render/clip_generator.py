@@ -51,7 +51,7 @@ def generate_clip_for_cluster(
         photos = (
             db.query(JobPhoto)
             .filter(JobPhoto.room_cluster_id == cluster.id)
-            .order_by(JobPhoto.id)
+            .order_by(JobPhoto.cluster_order.asc().nulls_last(), JobPhoto.id.asc())
             .all()
         )
 

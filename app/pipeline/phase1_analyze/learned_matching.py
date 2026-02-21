@@ -79,9 +79,11 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
     model, transform = _load_dinov2()
 
     if model is None:
-        # Fallback: return random embeddings (for testing without model)
-        logger.warning("DINOv2 not available, using random embeddings")
-        return np.random.randn(len(images), 768).astype(np.float32)
+        # Random embeddings make clustering non-deterministic and unreliable.
+        raise RuntimeError(
+            "DINOv2 model is unavailable. Refusing random embedding fallback "
+            "because it causes inconsistent clustering."
+        )
 
     device = next(model.parameters()).device
     embeddings = []
@@ -259,7 +261,19 @@ def rooms_are_different(room1: str, room2: str) -> bool:
 TEMPORAL_WINDOW = 2               # Check photos within ±2 positions
 TEMPORAL_SEMANTIC_THRESHOLD = 0.88  # High confidence same room (balanced - not too strict)
 TEMPORAL_GEOMETRIC_THRESHOLD = 0.60  # Lower threshold if we also verify geometrically
-NEIGHBOR_TRUST_THRESHOLD = 0.65   # Trust immediate neighbors (lowered from 0.68 to catch edge cases like 0.676)
+NEIGHBOR_TRUST_THRESHOLD = 0.63   # Trust immediate neighbors with strong semantic support
+HIGH_CONFIDENCE_NEIGHBOR_TRUST = 0.83  # Very strong adjacent semantic support (can pass without extra context)
+NEIGHBOR_SUPPORT_THRESHOLD = 0.70  # Support from nearby photos for semantic-only adjacent fallback
+SAME_LABEL_NEIGHBOR_TRUST = 0.70  # Adjacent pairs with same room label can pass with moderate semantic
+AMBIGUOUS_SAME_LABEL_TRUST = 0.84  # Stricter threshold for ambiguous repeated rooms
+DIST2_TRUST_THRESHOLD = 0.75      # Conservative trust threshold for temporal distance=2 pairs
+SAME_LABEL_DIST2_TRUST = 0.70     # Dist-2 same-label fallback to reduce over-splitting
+AMBIGUOUS_DIST2_TRUST = 0.82      # Keep stricter dist-2 fallback for ambiguous rooms
+CROSS_ROOM_RECOVERY_THRESHOLD = 0.72  # Adjacent cross-room fallback for known room-family confusions
+SERVICE_ROOM_RECOVERY_THRESHOLD = 0.66  # Slightly lower for bathroom<->laundry confusions
+CROSS_ROOM_RECOVERY_TOPK = 2       # Require mutual top-K semantic affinity for cross-room fallback
+EXTERIOR_LONG_GAP_SEMANTIC_TRUST = 0.78  # Recover long-gap exterior pairs when geometry fails
+EXTERIOR_LONG_GAP_MIN = 5          # Minimum sequence gap for long-gap exterior semantic recovery
 
 # ORB pre-filter thresholds (for performance - ORB is ~10x faster than LoFTR)
 ORB_QUICK_REJECT_INLIERS = 2      # If ORB finds ≤2 inliers, skip LoFTR (definitely no overlap)
@@ -272,11 +286,12 @@ MIN_SEMANTIC_FOR_GEOMETRIC = 0.15  # Skip geometric check if semantic < 15%
 # Cluster ordering thresholds
 MIN_TRANSITION_SCORE = 0.20  # Minimum overlap score to keep photo in ordered chain
 DIRECTION_CONSISTENCY_THRESHOLD = 0.5  # Cos similarity for direction vectors to be "consistent"
+SEMANTIC_BRIDGE_SUPPORT_THRESHOLD = 0.70  # Remove weak semantic-only bridges if cross-support is low
 
 # Deduplication thresholds
 # Only consecutive photos with very high similarity are considered "same angle" duplicates
 # Different angles of the same room typically have 0.85-0.92 similarity
-DUPLICATE_SIMILARITY_THRESHOLD = 0.94  # Raised from 0.92 - only truly same-angle shots
+DUPLICATE_SIMILARITY_THRESHOLD = 0.97  # Conservative dedup to avoid dropping transition-valuable near-duplicates
 
 
 def compute_direction_vector(
@@ -330,6 +345,64 @@ def directions_consistent(dir1: Tuple[float, float], dir2: Tuple[float, float]) 
 
     cos_sim = dir1[0] * dir2[0] + dir1[1] * dir2[1]
     return cos_sim > DIRECTION_CONSISTENCY_THRESHOLD
+
+
+def has_local_semantic_support(i: int, j: int, similarity: np.ndarray) -> bool:
+    """Check whether an adjacent pair has local sequence context support.
+
+    Semantic-only fallback is safer when at least one nearby photo also has
+    reasonably high similarity with one of the pair endpoints.
+    """
+    n = similarity.shape[0]
+    neighbor_indices = {i - 1, i + 1, j - 1, j + 1}
+    support_scores = []
+    for k in neighbor_indices:
+        if k < 0 or k >= n or k == i or k == j:
+            continue
+        support_scores.append(max(float(similarity[i, k]), float(similarity[j, k])))
+
+    return bool(support_scores) and max(support_scores) >= NEIGHBOR_SUPPORT_THRESHOLD
+
+
+def normalize_room_label(room: str | None) -> str:
+    return (room or "").strip().lower().replace("_", " ")
+
+
+def room_family(room: str | None) -> str:
+    room_norm = normalize_room_label(room)
+    if not room_norm or room_norm == "unknown":
+        return "unknown"
+
+    if any(token in room_norm for token in ("living", "dining", "kitchen", "entrance", "foyer", "hallway")):
+        return "social"
+    if any(token in room_norm for token in ("bathroom", "laundry", "powder")):
+        return "service"
+    if any(token in room_norm for token in ("front yard", "exterior front", "driveway", "curb", "porch")):
+        return "front_exterior"
+    if any(token in room_norm for token in ("patio", "deck", "backyard", "garden", "pool", "exterior")):
+        return "exterior"
+    return room_norm
+
+
+def rooms_allow_adjacent_semantic_bridge(room1: str | None, room2: str | None) -> bool:
+    fam1 = room_family(room1)
+    fam2 = room_family(room2)
+    if fam1 == "unknown" or fam2 == "unknown":
+        return False
+    if fam1 != fam2:
+        return False
+    return fam1 in {"social", "service", "front_exterior"}
+
+
+def is_exterior_like(room: str | None) -> bool:
+    return room_family(room) in {"front_exterior", "exterior"}
+
+
+def is_mutual_top_semantic_neighbor(i: int, j: int, similarity: np.ndarray, top_k: int = 2) -> bool:
+    """Require mutual top semantic affinity to avoid weak cross-room fallbacks."""
+    sorted_i = [idx for idx in np.argsort(-similarity[i]) if idx != i][:top_k]
+    sorted_j = [idx for idx in np.argsort(-similarity[j]) if idx != j][:top_k]
+    return (j in sorted_i) and (i in sorted_j)
 
 
 def order_cluster_for_transitions(
@@ -463,7 +536,7 @@ def order_cluster_for_transitions(
             if current_direction != (0.0, 0.0) and pair_dir != (0.0, 0.0):
                 if not directions_consistent(current_direction, pair_dir):
                     # Direction reversal - penalize score
-                    score *= 0.3
+                    score *= 0.5
                     logger.debug(f"Direction reversal penalty: {photo_ids[current_idx]}->{photo_ids[candidate_idx]}")
 
             if score > best_score:
@@ -490,6 +563,41 @@ def order_cluster_for_transitions(
                     ordered_local.insert(0, best_next)
                     remaining.remove(best_next)
                     continue
+
+            # Fallback: insert by strongest connection to ANY point in the chain.
+            # This prevents unnecessary singleton isolation in connected components
+            # when endpoint extension gets stuck.
+            insert_candidate = None
+            insert_anchor = None
+            insert_score = -1.0
+            for candidate_local in remaining:
+                candidate_idx = cluster_indices[candidate_local]
+                for anchor_local in ordered_local:
+                    anchor_idx = cluster_indices[anchor_local]
+                    score = float(adjacency[anchor_idx, candidate_idx])
+                    if score > insert_score:
+                        insert_score = score
+                        insert_candidate = candidate_local
+                        insert_anchor = anchor_local
+
+            relaxed_threshold = min_score * 0.8
+            if (
+                insert_candidate is not None
+                and insert_anchor is not None
+                and insert_score >= relaxed_threshold
+            ):
+                anchor_pos = ordered_local.index(insert_anchor)
+                if anchor_pos <= len(ordered_local) // 2:
+                    ordered_local.insert(0, insert_candidate)
+                else:
+                    ordered_local.append(insert_candidate)
+                remaining.remove(insert_candidate)
+                logger.debug(
+                    "Inserted non-endpoint candidate %s with relaxed score %.3f",
+                    photo_ids[cluster_indices[insert_candidate]],
+                    insert_score,
+                )
+                continue
 
             # Still no good connection - these are isolated photos
             # Don't drop them - they'll be handled as separate mini-clusters
@@ -521,7 +629,7 @@ def deduplicate_and_split_cluster(
     embeddings: np.ndarray,
     adjacency: np.ndarray,
     max_size: int = 3,
-) -> List[List[int]]:
+) -> Tuple[List[List[int]], Dict[int, int]]:
     """Remove duplicates and split large clusters into smaller ones.
 
     Photos are ALREADY ORDERED for optimal transitions. This function:
@@ -540,19 +648,23 @@ def deduplicate_and_split_cluster(
         max_size: Maximum photos per cluster
 
     Returns:
-        List of photo ID lists (one or more clusters, each with max_size or fewer photos)
+        Tuple:
+        - List of photo ID lists (one or more clusters, each with max_size or fewer photos)
+        - duplicate_of map: duplicate_photo_id -> canonical_photo_id
     """
-    if len(cluster_photo_ids) <= max_size:
-        return [cluster_photo_ids]
+    if not cluster_photo_ids:
+        return [], {}
 
     # Map photo IDs to matrix indices
     pid_to_idx = {pid: i for i, pid in enumerate(photo_ids)}
     cluster_indices = [pid_to_idx[pid] for pid in cluster_photo_ids if pid in pid_to_idx]
 
-    if len(cluster_indices) <= max_size:
-        return [cluster_photo_ids]
+    if not cluster_indices:
+        return [cluster_photo_ids], {}
 
     n = len(cluster_indices)
+    if n == 1:
+        return [cluster_photo_ids], {}
 
     # Compute semantic similarity within cluster
     cluster_embeddings = embeddings[cluster_indices]
@@ -575,6 +687,7 @@ def deduplicate_and_split_cluster(
 
     # Find CONSECUTIVE duplicates only
     to_remove = set()
+    duplicate_of: Dict[int, int] = {}
     for i in range(n - 1):
         if i in to_remove:
             continue
@@ -585,24 +698,34 @@ def deduplicate_and_split_cluster(
         if sem_sim[i, j] >= DUPLICATE_SIMILARITY_THRESHOLD:
             if transition_scores[i] >= transition_scores[j]:
                 to_remove.add(j)
-                logger.debug(f"Removing consecutive dup {cluster_photo_ids[j]}")
+                duplicate_of[cluster_photo_ids[j]] = cluster_photo_ids[i]
+                logger.debug(f"Marking consecutive duplicate {cluster_photo_ids[j]} -> {cluster_photo_ids[i]}")
             else:
                 to_remove.add(i)
-                logger.debug(f"Removing consecutive dup {cluster_photo_ids[i]}")
+                duplicate_of[cluster_photo_ids[i]] = cluster_photo_ids[j]
+                logger.debug(f"Marking consecutive duplicate {cluster_photo_ids[i]} -> {cluster_photo_ids[j]}")
 
-    # Keep non-duplicates, preserving order
+    # Keep canonical photos in order, split if needed.
     remaining_indices = [i for i in range(n) if i not in to_remove]
     remaining = [cluster_photo_ids[i] for i in remaining_indices]
+    duplicate_clusters = [[cluster_photo_ids[i]] for i in range(n) if i in to_remove]
 
     if len(remaining) <= max_size:
         if len(remaining) < len(cluster_photo_ids):
-            logger.info(f"Deduplicated: {len(cluster_photo_ids)} -> {len(remaining)}")
-        return [remaining]
+            logger.info(
+                "Deduplicated: %s -> %s canonical (+%s duplicate singleton clusters)",
+                len(cluster_photo_ids),
+                len(remaining),
+                len(duplicate_clusters),
+            )
+        if not remaining:
+            return duplicate_clusters, duplicate_of
+        return [remaining] + duplicate_clusters, duplicate_of
 
-    # Too many photos - SPLIT into multiple clusters instead of dropping
-    # Split at natural break points (weakest transitions)
+    # Too many photos - SPLIT into multiple clusters instead of dropping.
+    # Use constrained partitioning to GUARANTEE each cluster size <= max_size.
     m = len(remaining)
-    num_clusters = (m + max_size - 1) // max_size  # Ceiling division
+    num_clusters = (m + max_size - 1) // max_size  # Minimum required clusters
 
     # Find transition strengths between consecutive photos
     remaining_cluster_indices = [pid_to_idx[pid] for pid in remaining]
@@ -611,31 +734,80 @@ def deduplicate_and_split_cluster(
         idx_i = remaining_cluster_indices[i]
         idx_j = remaining_cluster_indices[i + 1]
         strength = adjacency[idx_i, idx_j]
-        transition_strengths.append((i, strength))
+        transition_strengths.append(float(strength))
 
-    # Sort by strength (ascending) to find weakest transitions = best split points
-    transition_strengths.sort(key=lambda x: x[1])
+    # Dynamic programming with exact cluster count (minimum needed), while
+    # enforcing each segment length <= max_size and preferring weak boundaries.
+    inf = float("inf")
+    dp = [[inf] * (m + 1) for _ in range(num_clusters + 1)]
+    prev = [[None] * (m + 1) for _ in range(num_clusters + 1)]
+    dp[0][0] = 0.0
 
-    # Pick (num_clusters - 1) weakest transitions as split points
-    split_indices = sorted([t[0] for t in transition_strengths[:num_clusters - 1]])
+    for c in range(1, num_clusters + 1):
+        min_pos = c  # at least one photo per cluster
+        max_pos = min(m, c * max_size)
+        for pos in range(min_pos, max_pos + 1):
+            for seg_len in range(1, max_size + 1):
+                start = pos - seg_len
+                if start < (c - 1):
+                    continue
+                prev_cost = dp[c - 1][start]
+                if prev_cost == inf:
+                    continue
 
-    # Build clusters from split points
+                # Cost of adding boundary before this segment.
+                boundary_cost = 0.0 if start == 0 else transition_strengths[start - 1]
+                cand = prev_cost + boundary_cost
+                if cand < dp[c][pos]:
+                    dp[c][pos] = cand
+                    prev[c][pos] = start
+
+    # Reconstruct optimal partition; fallback to fixed chunking if unreachable.
     result_clusters = []
-    start = 0
-    for split_idx in split_indices:
-        end = split_idx + 1
-        if end > start:
+    if dp[num_clusters][m] != inf:
+        boundaries = []
+        c = num_clusters
+        pos = m
+        while c > 0:
+            start = prev[c][pos]
+            if start is None:
+                boundaries = []
+                break
+            boundaries.append((start, pos))
+            pos = start
+            c -= 1
+
+        boundaries.reverse()
+        for start, end in boundaries:
             result_clusters.append(remaining[start:end])
-        start = end
-    # Last cluster
-    if start < m:
-        result_clusters.append(remaining[start:])
+
+    if not result_clusters:
+        # Deterministic hard fallback: contiguous chunks, each <= max_size.
+        for i in range(0, m, max_size):
+            result_clusters.append(remaining[i:i + max_size])
+
+    # Safety invariant: never return oversize clusters.
+    oversized = [cluster for cluster in result_clusters if len(cluster) > max_size]
+    if oversized:
+        logger.warning(
+            "Oversized clusters after split (%s). Applying hard chunk fallback.",
+            [len(c) for c in oversized],
+        )
+        result_clusters = []
+        for i in range(0, m, max_size):
+            result_clusters.append(remaining[i:i + max_size])
 
     # Log the split
     sizes = [len(c) for c in result_clusters]
-    logger.info(f"Split cluster: {len(cluster_photo_ids)} photos -> {len(result_clusters)} clusters (sizes: {sizes})")
+    logger.info(
+        "Split cluster: %s photos -> %s canonical clusters (sizes: %s) + %s duplicate singleton clusters",
+        len(cluster_photo_ids),
+        len(result_clusters),
+        sizes,
+        len(duplicate_clusters),
+    )
 
-    return result_clusters
+    return result_clusters + duplicate_clusters, duplicate_of
 
 
 # LightGlue/LoFTR model singleton
@@ -652,15 +824,19 @@ def _load_matcher():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Try LoFTR first (best for indoor scenes)
+    # Try LoFTR first (indoor checkpoint performs better for real-estate scenes).
     try:
         from kornia.feature import LoFTR
-        _matcher = LoFTR(pretrained="outdoor")
-        _matcher = _matcher.to(device)
-        _matcher.eval()
-        _matcher_type = "loftr"
-        logger.info(f"Loaded LoFTR matcher on {device}")
-        return _matcher, _matcher_type
+        for checkpoint in ("indoor_new", "outdoor"):
+            try:
+                _matcher = LoFTR(pretrained=checkpoint)
+                _matcher = _matcher.to(device)
+                _matcher.eval()
+                _matcher_type = "loftr"
+                logger.info(f"Loaded LoFTR matcher ({checkpoint}) on {device}")
+                return _matcher, _matcher_type
+            except Exception as ckpt_err:
+                logger.debug(f"LoFTR checkpoint '{checkpoint}' unavailable: {ckpt_err}")
     except Exception as e:
         logger.debug(f"LoFTR not available: {e}")
 
@@ -674,11 +850,11 @@ def _load_matcher():
 def match_image_pair(
     img1: Image.Image,
     img2: Image.Image,
-    use_orb_prefilter: bool = True,
+    use_orb_prefilter: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float]]:
     """Match two images using learned features with ORB pre-filtering.
 
-    Performance optimization: ORB is ~10x faster than LoFTR.
+    Performance optimization (optional): ORB is ~10x faster than LoFTR.
     - If ORB shows ≤2 inliers → definitely no overlap, skip LoFTR
     - If ORB shows ≥15 inliers → definitely overlap, use ORB result
     - Otherwise → run LoFTR for accurate matching
@@ -698,7 +874,8 @@ def match_image_pair(
     if matcher_type != "loftr" or matcher is None:
         return _match_orb(img1, img2)
 
-    # ORB pre-filter: quick check to avoid expensive LoFTR calls
+    # ORB pre-filter is disabled by default for consistency.
+    # It can produce unstable errors and false positives on repetitive textures.
     if use_orb_prefilter:
         orb_matches, orb_inliers, orb_score, orb_direction = _match_orb(img1, img2)
 
@@ -845,7 +1022,8 @@ def _match_orb(
             0.999
         )
     except cv2.error as e:
-        logger.warning(f"findFundamentalMat failed in ORB: {e}")
+        # ORB is only a fallback path; avoid noisy warnings for known degenerate cases.
+        logger.debug(f"findFundamentalMat failed in ORB: {e}")
         return num_matches, 0, 0.0, (0.0, 0.0)
 
     if mask is None:
@@ -964,6 +1142,76 @@ def split_cluster_by_overlap(
 # GRAPH-BASED CLUSTERING: DINOv2 proposes edges, geometry verifies
 # ============================================================================
 
+
+def _connected_nodes(edge_mask: np.ndarray, start_idx: int) -> set:
+    """Return connected node indices from start_idx using DFS over boolean edge mask."""
+    stack = [start_idx]
+    visited = set()
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        neighbors = np.where(edge_mask[node])[0]
+        for nbr in neighbors:
+            if nbr not in visited:
+                stack.append(int(nbr))
+    return visited
+
+
+def prune_weak_semantic_bridges(
+    adjacency: np.ndarray,
+    similarity: np.ndarray,
+    edge_has_geometry: np.ndarray,
+    photo_ids: List[int],
+) -> None:
+    """Prune semantic-only bridge edges that connect weakly related subgraphs.
+
+    This reduces false merges caused by transitive chaining of weak temporal
+    semantic edges (A-B and B-C) when A-C semantic support is weak.
+    """
+    n = adjacency.shape[0]
+    edge_mask = adjacency > OVERLAP_THRESHOLD
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not edge_mask[i, j]:
+                continue
+            if edge_has_geometry[i, j]:
+                continue
+
+            component = _connected_nodes(edge_mask, i)
+            if j not in component or len(component) < 3:
+                continue
+
+            # Temporarily remove candidate bridge and check whether it truly
+            # splits the component.
+            edge_mask[i, j] = False
+            edge_mask[j, i] = False
+
+            comp_i = _connected_nodes(edge_mask, i)
+            if j in comp_i:
+                edge_mask[i, j] = True
+                edge_mask[j, i] = True
+                continue
+            comp_j = _connected_nodes(edge_mask, j)
+
+            max_cross_sem = max(similarity[a, b] for a in comp_i for b in comp_j)
+            if max_cross_sem < SEMANTIC_BRIDGE_SUPPORT_THRESHOLD:
+                adjacency[i, j] = 0.0
+                adjacency[j, i] = 0.0
+                logger.info(
+                    "Pruned semantic bridge %s <-> %s (max cross semantic=%.3f < %.2f)",
+                    photo_ids[i],
+                    photo_ids[j],
+                    max_cross_sem,
+                    SEMANTIC_BRIDGE_SUPPORT_THRESHOLD,
+                )
+                # keep edge removed in edge_mask
+            else:
+                edge_mask[i, j] = True
+                edge_mask[j, i] = True
+
 def cluster_photos_graph_based(
     images: List[Image.Image],
     photo_ids: List[int],
@@ -972,7 +1220,8 @@ def cluster_photos_graph_based(
     db_session=None,
     job_id: int = None,
     room_labels: List[str] = None,
-) -> List[List[int]]:
+    return_metadata: bool = False,
+) -> List[List[int]] | Tuple[List[List[int]], Dict[str, Dict[int, int]]]:
     """Graph-based clustering: semantic proposals + geometric verification.
 
     This is a cleaner architecture than semantic-first clustering:
@@ -993,7 +1242,7 @@ def cluster_photos_graph_based(
         room_labels: Optional list of room labels for each photo (used to penalize cross-room connections)
 
     Returns:
-        List of photo ID lists (final clusters)
+        Final clusters, or (clusters, metadata) when return_metadata=True.
     """
     from sklearn.preprocessing import normalize
     from scipy.sparse import csr_matrix
@@ -1006,7 +1255,10 @@ def cluster_photos_graph_based(
     similarity_records = []  # Will store dicts for batch insert
 
     if n <= 1:
-        return [photo_ids] if photo_ids else []
+        clusters = [photo_ids] if photo_ids else []
+        if return_metadata:
+            return clusters, {"duplicate_of_map": {}}
+        return clusters
 
     # -------------------------------------------------------------------------
     # Stage 1: Compute DINOv2 embeddings and build candidate graph
@@ -1047,6 +1299,7 @@ def cluster_photos_graph_based(
     # -------------------------------------------------------------------------
     logger.info("Stage 2a: Checking temporal pairs...")
     adjacency = np.zeros((n, n))
+    edge_has_geometry = np.zeros((n, n), dtype=bool)
     directions = {}  # (i, j) -> (dx, dy) direction vectors for ordering
     temporal_matched = 0
     temporal_semantic_only = 0
@@ -1075,6 +1328,8 @@ def cluster_photos_graph_based(
                 "geometric_matches": None,
                 "geometric_inliers": None,
                 "geometric_score": None,
+                "direction_dx": None,
+                "direction_dy": None,
                 "is_connected": 0,
             })
             continue
@@ -1087,6 +1342,7 @@ def cluster_photos_graph_based(
         num_matches = None
         num_inliers = None
         geo_score = None
+        direction = (0.0, 0.0)
 
         # Cross-room pairs need geometric verification with higher threshold
         # But for ADJACENT cross-room (temporal_dist=1), use lower threshold since ML often mislabels
@@ -1112,6 +1368,10 @@ def cluster_photos_graph_based(
             else:
                 logger.info(f"    ✓ MATCHED (semantic >= {TEMPORAL_SEMANTIC_THRESHOLD}, no direction - {num_inliers} inliers)")
 
+            if num_inliers is not None and num_inliers >= MIN_INLIERS_FOR_OVERLAP:
+                edge_has_geometry[i, j] = True
+                edge_has_geometry[j, i] = True
+
         # Moderate semantic OR cross-room - require geometric verification
         elif sem_sim >= TEMPORAL_GEOMETRIC_THRESHOLD or is_cross_room:
             logger.info(f"    Verifying geometrically (need {min_inliers_required} inliers)...")
@@ -1120,6 +1380,8 @@ def cluster_photos_graph_based(
             if num_inliers >= min_inliers_required:
                 adjacency[i, j] = geo_score
                 adjacency[j, i] = geo_score
+                edge_has_geometry[i, j] = True
+                edge_has_geometry[j, i] = True
                 directions[(i, j)] = direction
                 temporal_matched += 1
                 temporal_geometric += 1
@@ -1127,20 +1389,148 @@ def cluster_photos_graph_based(
                 dir_str = f"dir=({direction[0]:.2f},{direction[1]:.2f})" if direction != (0.0, 0.0) else "dir=unknown"
                 logger.info(f"    ✓ MATCHED (geometric: {num_inliers} inliers >= {min_inliers_required}, score={geo_score:.3f}, {dir_str})")
             # Fallback: Immediate neighbors with good semantic similarity - trust even without geometric
-            # BUT: Never use this fallback for cross-room pairs (ML labels might be wrong but geometry is truth)
             elif temporal_dist == 1 and sem_sim >= NEIGHBOR_TRUST_THRESHOLD and not is_cross_room:
-                adjacency[i, j] = sem_sim
-                adjacency[j, i] = sem_sim
-                temporal_matched += 1
-                temporal_semantic_only += 1
-                is_matched = True
-
-                if num_inliers >= MIN_INLIERS_FOR_DIRECTION and direction != (0.0, 0.0):
-                    directions[(i, j)] = direction
-                    dir_str = f"dir=({direction[0]:.2f},{direction[1]:.2f})"
-                    logger.info(f"    ✓ MATCHED (neighbor trust: semantic {sem_sim:.3f}, {dir_str} from {num_inliers} inliers)")
+                room_i_norm = normalize_room_label(room_i)
+                room_j_norm = normalize_room_label(room_j)
+                same_room_label = (
+                    room_i_norm != ""
+                    and room_i_norm != "unknown"
+                    and room_i_norm == room_j_norm
+                )
+                ambiguous_rooms = {"bathroom"}
+                same_label_threshold = (
+                    AMBIGUOUS_SAME_LABEL_TRUST
+                    if room_i_norm in ambiguous_rooms
+                    else SAME_LABEL_NEIGHBOR_TRUST
+                )
+                same_label_trust = same_room_label and sem_sim >= same_label_threshold
+                local_support = has_local_semantic_support(i, j, similarity)
+                allow_semantic_neighbor = (
+                    sem_sim >= HIGH_CONFIDENCE_NEIGHBOR_TRUST
+                    or local_support
+                    or same_label_trust
+                )
+                if not allow_semantic_neighbor:
+                    logger.info(
+                        "    ✗ No neighbor semantic trust (sem=%.3f, support=%s, same_label=%s)",
+                        sem_sim,
+                        "yes" if local_support else "no",
+                        "yes" if same_label_trust else "no",
+                    )
                 else:
-                    logger.info(f"    ✓ MATCHED (neighbor trust: semantic {sem_sim:.3f}, no direction)")
+                    adjacency[i, j] = sem_sim
+                    adjacency[j, i] = sem_sim
+                    temporal_matched += 1
+                    temporal_semantic_only += 1
+                    is_matched = True
+
+                    if num_inliers >= MIN_INLIERS_FOR_DIRECTION and direction != (0.0, 0.0):
+                        directions[(i, j)] = direction
+                        dir_str = f"dir=({direction[0]:.2f},{direction[1]:.2f})"
+                        logger.info(
+                            "    ✓ MATCHED (neighbor trust: semantic %.3f, support=%s, same_label=%s, %s from %s inliers)",
+                            sem_sim,
+                            "yes" if local_support else "no",
+                            "yes" if same_label_trust else ("high-confidence" if sem_sim >= HIGH_CONFIDENCE_NEIGHBOR_TRUST else "no"),
+                            dir_str,
+                            num_inliers,
+                        )
+                    else:
+                        logger.info(
+                            "    ✓ MATCHED (neighbor trust: semantic %.3f, support=%s, same_label=%s, no direction)",
+                            sem_sim,
+                            "yes" if local_support else "no",
+                            "yes" if same_label_trust else ("high-confidence" if sem_sim >= HIGH_CONFIDENCE_NEIGHBOR_TRUST else "no"),
+                        )
+            # Cross-room adjacent fallback (strict): recover known classifier confusions only
+            # (e.g., living<->entrance, bathroom<->laundry) when pair is mutually top-semantic.
+            elif temporal_dist == 1 and is_cross_room:
+                compatible_families = rooms_allow_adjacent_semantic_bridge(room_i, room_j)
+                local_support = has_local_semantic_support(i, j, similarity)
+                mutual_top = is_mutual_top_semantic_neighbor(i, j, similarity, top_k=CROSS_ROOM_RECOVERY_TOPK)
+                recovery_threshold = (
+                    SERVICE_ROOM_RECOVERY_THRESHOLD
+                    if room_family(room_i) == "service" and room_family(room_j) == "service"
+                    else CROSS_ROOM_RECOVERY_THRESHOLD
+                )
+                if (
+                    compatible_families
+                    and sem_sim >= recovery_threshold
+                    and (mutual_top or local_support)
+                ):
+                    adjacency[i, j] = sem_sim
+                    adjacency[j, i] = sem_sim
+                    temporal_matched += 1
+                    temporal_semantic_only += 1
+                    is_matched = True
+                    logger.info(
+                        "    ✓ MATCHED (cross-room recovery: sem=%.3f >= %.2f, mutual_top=%s, support=%s, %s/%s)",
+                        sem_sim,
+                        recovery_threshold,
+                        "yes" if mutual_top else "no",
+                        "yes" if local_support else "no",
+                        room_i,
+                        room_j,
+                    )
+                else:
+                    logger.info(
+                        "    ✗ Cross-room recovery rejected (sem=%.3f, threshold=%.2f, mutual_top=%s, support=%s, compatible=%s)",
+                        sem_sim,
+                        recovery_threshold,
+                        "yes" if mutual_top else "no",
+                        "yes" if local_support else "no",
+                        "yes" if compatible_families else "no",
+                    )
+            # Fallback for distance-2 temporal neighbors:
+            # allow very high semantic matches when geometry fails.
+            elif temporal_dist == 2 and not is_cross_room:
+                room_i_norm = normalize_room_label(room_i)
+                room_j_norm = normalize_room_label(room_j)
+                same_room_label = (
+                    room_i_norm != ""
+                    and room_i_norm != "unknown"
+                    and room_i_norm == room_j_norm
+                )
+
+                dist2_threshold = DIST2_TRUST_THRESHOLD
+                if same_room_label:
+                    if room_i_norm in {"bathroom"}:
+                        dist2_threshold = AMBIGUOUS_DIST2_TRUST
+                    else:
+                        dist2_threshold = SAME_LABEL_DIST2_TRUST
+
+                if sem_sim >= dist2_threshold:
+                    adjacency[i, j] = sem_sim
+                    adjacency[j, i] = sem_sim
+                    temporal_matched += 1
+                    temporal_semantic_only += 1
+                    is_matched = True
+
+                    if num_inliers >= MIN_INLIERS_FOR_DIRECTION and direction != (0.0, 0.0):
+                        directions[(i, j)] = direction
+                        logger.info(
+                            "    ✓ MATCHED (dist2 trust: semantic %.3f >= %.2f, "
+                            "same_label=%s, dir=(%.2f,%.2f) from %s inliers)",
+                            sem_sim,
+                            dist2_threshold,
+                            "yes" if same_room_label else "no",
+                            direction[0],
+                            direction[1],
+                            num_inliers,
+                        )
+                    else:
+                        logger.info(
+                            "    ✓ MATCHED (dist2 trust: semantic %.3f >= %.2f, same_label=%s, no direction)",
+                            sem_sim,
+                            dist2_threshold,
+                            "yes" if same_room_label else "no",
+                        )
+                else:
+                    logger.info(
+                        "    ✗ Dist2 semantic below trust threshold (%.3f < %.2f)",
+                        sem_sim,
+                        dist2_threshold,
+                    )
             else:
                 cross_note = " [cross-room]" if is_cross_room else ""
                 logger.info(f"    ✗ No geometric match ({num_inliers} inliers < {min_inliers_required}){cross_note}")
@@ -1157,6 +1547,8 @@ def cluster_photos_graph_based(
             "geometric_matches": num_matches,
             "geometric_inliers": num_inliers,
             "geometric_score": float(geo_score) if geo_score else None,
+            "direction_dx": float(direction[0]) if direction != (0.0, 0.0) else None,
+            "direction_dy": float(direction[1]) if direction != (0.0, 0.0) else None,
             "is_connected": 1 if is_matched else 0,
         })
 
@@ -1173,6 +1565,7 @@ def cluster_photos_graph_based(
 
     skipped_low_semantic = 0
     skipped_cross_room = 0
+    semantic_recovered = 0
     for idx, (i, j) in enumerate(sorted(geometric_pairs)):
         sem_sim = similarity[i, j]
 
@@ -1193,6 +1586,8 @@ def cluster_photos_graph_based(
                 "geometric_matches": None,
                 "geometric_inliers": None,
                 "geometric_score": None,
+                "direction_dx": None,
+                "direction_dy": None,
                 "is_connected": 0,
             })
             continue
@@ -1211,6 +1606,8 @@ def cluster_photos_graph_based(
                 "geometric_matches": None,
                 "geometric_inliers": None,
                 "geometric_score": None,
+                "direction_dx": None,
+                "direction_dy": None,
                 "is_connected": 0,
             })
             continue
@@ -1231,32 +1628,72 @@ def cluster_photos_graph_based(
         num_matches, num_inliers, score, direction = match_image_pair(images[i], images[j])
 
         is_matched = num_inliers >= min_inliers
+        pair_source = "dinov2_topk"
         if is_matched:
             adjacency[i, j] = max(adjacency[i, j], score)  # Keep higher score
             adjacency[j, i] = max(adjacency[j, i], score)
+            edge_has_geometry[i, j] = True
+            edge_has_geometry[j, i] = True
             directions[(i, j)] = direction  # Store direction for ordering
             geometric_matched += 1
             dir_str = f"dir=({direction[0]:.2f},{direction[1]:.2f})" if direction != (0.0, 0.0) else "dir=unknown"
             logger.info(f"    ✓ MATCHED: {num_matches} matches, {num_inliers} inliers, score={score:.3f}, {dir_str}")
         else:
-            logger.info(f"    ✗ No match: {num_matches} matches, {num_inliers} inliers < {min_inliers}")
+            same_room_label = (
+                normalize_room_label(room_i) != ""
+                and normalize_room_label(room_i) != "unknown"
+                and normalize_room_label(room_i) == normalize_room_label(room_j)
+            )
+            exterior_pair = is_exterior_like(room_i) and is_exterior_like(room_j)
+            if (
+                same_room_label
+                and exterior_pair
+                and position_gap >= EXTERIOR_LONG_GAP_MIN
+                and sem_sim >= EXTERIOR_LONG_GAP_SEMANTIC_TRUST
+            ):
+                adjacency[i, j] = max(adjacency[i, j], sem_sim)
+                adjacency[j, i] = max(adjacency[j, i], sem_sim)
+                geometric_matched += 1
+                semantic_recovered += 1
+                is_matched = True
+                pair_source = "dinov2_topk_semantic_recovery"
+                logger.info(
+                    "    ✓ MATCHED (exterior long-gap semantic recovery: sem=%.3f, gap=%s, rooms=%s/%s)",
+                    sem_sim,
+                    position_gap,
+                    room_i,
+                    room_j,
+                )
+            else:
+                logger.info(f"    ✗ No match: {num_matches} matches, {num_inliers} inliers < {min_inliers}")
 
         # Track for database storage
         similarity_records.append({
             "photo_a_id": photo_ids[min(i, j)],
             "photo_b_id": photo_ids[max(i, j)],
-            "pair_source": "dinov2_topk",
+            "pair_source": pair_source,
             "dinov2_similarity": float(sem_sim),
             "geometric_matches": num_matches,
             "geometric_inliers": num_inliers,
             "geometric_score": float(score) if score else None,
+            "direction_dx": float(direction[0]) if direction != (0.0, 0.0) else None,
+            "direction_dy": float(direction[1]) if direction != (0.0, 0.0) else None,
             "is_connected": 1 if is_matched else 0,
         })
 
-    logger.info(f"Stage 2b: {geometric_matched}/{len(geometric_pairs)} geometric pairs matched "
-               f"({skipped_cross_room} cross-room, {skipped_low_semantic} low-semantic)")
+    logger.info(
+        "Stage 2b: %s/%s non-temporal pairs matched (%s cross-room, %s low-semantic, %s semantic recoveries)",
+        geometric_matched,
+        len(geometric_pairs),
+        skipped_cross_room,
+        skipped_low_semantic,
+        semantic_recovered,
+    )
     logger.info(f"Total edges: {temporal_matched + geometric_matched} "
                f"(temporal={temporal_matched}, geometric={geometric_matched})")
+
+    # Prune weak semantic-only bridge edges that can cause transitive false merges.
+    prune_weak_semantic_bridges(adjacency, similarity, edge_has_geometry, photo_ids)
 
     # -------------------------------------------------------------------------
     # Stage 3: Connected components = final clusters
@@ -1307,10 +1744,10 @@ def cluster_photos_graph_based(
     logger.info(f"Stage 5: Deduplicating and splitting clusters (max {max_cluster_size} photos each)...")
 
     final_clusters = []
+    duplicate_of_map: Dict[int, int] = {}
     for cluster in ordered_clusters:
-        # deduplicate_and_split_cluster returns List[List[int]]
-        # It removes duplicates and splits if still too large
-        split_clusters = deduplicate_and_split_cluster(
+        # Deduplicate without dropping content: duplicates become singleton clusters.
+        split_clusters, cluster_duplicate_map = deduplicate_and_split_cluster(
             cluster,
             photo_ids,
             embeddings,
@@ -1318,47 +1755,106 @@ def cluster_photos_graph_based(
             max_size=max_cluster_size,
         )
         final_clusters.extend(split_clusters)
+        duplicate_of_map.update(cluster_duplicate_map)
 
     logger.info(
         f"Final result: {n} photos -> {len(final_clusters)} clusters "
         f"(sizes: {[len(c) for c in final_clusters]})"
     )
+    if duplicate_of_map:
+        logger.info("Marked %s photos as duplicates (kept as singleton clusters)", len(duplicate_of_map))
 
     # Save similarity records to database if session provided
     if db_session is not None and job_id is not None and similarity_records:
-        from app.db.models import PhotoSimilarity
+        from sqlalchemy import text
 
-        # Delete existing records for these photo pairs (allows re-running)
-        photo_pair_ids = [(r["photo_a_id"], r["photo_b_id"]) for r in similarity_records]
-        existing = db_session.query(PhotoSimilarity).filter(
-            PhotoSimilarity.job_id == job_id
-        ).all()
-        deleted_count = 0
-        for sim in existing:
-            if (sim.photo_a_id, sim.photo_b_id) in photo_pair_ids:
-                db_session.delete(sim)
-                deleted_count += 1
-        if deleted_count > 0:
-            db_session.flush()
-            logger.info(f"Deleted {deleted_count} existing similarity records")
+        # Backward-compatible schema detection:
+        # some environments may not yet have direction_dx/direction_dy migrated.
+        supports_direction = False
+        try:
+            col_rows = db_session.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'photo_similarities'
+                      AND table_schema = current_schema()
+                    """
+                )
+            ).fetchall()
+            available_cols = {str(row[0]) for row in col_rows}
+            supports_direction = {
+                "direction_dx",
+                "direction_dy",
+            }.issubset(available_cols)
+        except Exception as schema_err:
+            logger.warning("Could not inspect photo_similarities schema: %s", schema_err)
 
         logger.info(f"Saving {len(similarity_records)} similarity records to database...")
-        for record in similarity_records:
-            sim = PhotoSimilarity(
-                job_id=job_id,
-                photo_a_id=record["photo_a_id"],
-                photo_b_id=record["photo_b_id"],
-                pair_source=record["pair_source"],
-                dinov2_similarity=record["dinov2_similarity"],
-                geometric_matches=record["geometric_matches"],
-                geometric_inliers=record["geometric_inliers"],
-                geometric_score=record["geometric_score"],
-                is_connected=record["is_connected"],
-            )
-            db_session.add(sim)
-        db_session.commit()
-        logger.info(f"Saved {len(similarity_records)} similarity records")
 
+        # Re-running clustering for a job should replace previous similarity rows.
+        db_session.execute(
+            text("DELETE FROM photo_similarities WHERE job_id = :job_id"),
+            {"job_id": job_id},
+        )
+
+        if supports_direction:
+            insert_sql = text(
+                """
+                INSERT INTO photo_similarities (
+                    job_id, photo_a_id, photo_b_id, pair_source,
+                    dinov2_similarity, geometric_matches, geometric_inliers,
+                    geometric_score, direction_dx, direction_dy, is_connected
+                ) VALUES (
+                    :job_id, :photo_a_id, :photo_b_id, :pair_source,
+                    :dinov2_similarity, :geometric_matches, :geometric_inliers,
+                    :geometric_score, :direction_dx, :direction_dy, :is_connected
+                )
+                """
+            )
+        else:
+            insert_sql = text(
+                """
+                INSERT INTO photo_similarities (
+                    job_id, photo_a_id, photo_b_id, pair_source,
+                    dinov2_similarity, geometric_matches, geometric_inliers,
+                    geometric_score, is_connected
+                ) VALUES (
+                    :job_id, :photo_a_id, :photo_b_id, :pair_source,
+                    :dinov2_similarity, :geometric_matches, :geometric_inliers,
+                    :geometric_score, :is_connected
+                )
+                """
+            )
+
+        records_for_insert = []
+        for record in similarity_records:
+            payload = {
+                "job_id": job_id,
+                "photo_a_id": record["photo_a_id"],
+                "photo_b_id": record["photo_b_id"],
+                "pair_source": record["pair_source"],
+                "dinov2_similarity": record["dinov2_similarity"],
+                "geometric_matches": record["geometric_matches"],
+                "geometric_inliers": record["geometric_inliers"],
+                "geometric_score": record["geometric_score"],
+                "is_connected": record["is_connected"],
+            }
+            if supports_direction:
+                payload["direction_dx"] = record.get("direction_dx")
+                payload["direction_dy"] = record.get("direction_dy")
+            records_for_insert.append(payload)
+
+        db_session.execute(insert_sql, records_for_insert)
+        db_session.commit()
+        logger.info(
+            "Saved %s similarity records (direction columns: %s)",
+            len(similarity_records),
+            "enabled" if supports_direction else "not available",
+        )
+
+    if return_metadata:
+        return final_clusters, {"duplicate_of_map": duplicate_of_map}
     return final_clusters
 
 
@@ -1373,7 +1869,8 @@ def cluster_photos_optimized(
     db_session=None,
     job_id: int = None,
     room_labels: List[str] = None,
-) -> List[List[int]]:
+    return_metadata: bool = False,
+) -> List[List[int]] | Tuple[List[List[int]], Dict[str, Dict[int, int]]]:
     """Run optimized graph-based clustering pipeline.
 
     Uses the "propose + verify" pattern:
@@ -1395,14 +1892,29 @@ def cluster_photos_optimized(
         room_labels: Optional list of room labels for each photo (used to penalize cross-room connections)
 
     Returns:
-        List of photo ID lists (final clusters)
+        Final clusters, or (clusters, metadata) when return_metadata=True.
     """
+    n = len(images)
+    # Adaptive semantic neighborhood size:
+    # - small jobs: keep checks tight
+    # - medium jobs: balanced recall/compute
+    # - large jobs: broader proposal set
+    if n <= 80:
+        candidate_k = 4
+    elif n <= 140:
+        candidate_k = 5
+    else:
+        candidate_k = 6
+
+    logger.info("Adaptive candidate k=%s for %s photos", candidate_k, n)
+
     return cluster_photos_graph_based(
         images,
         photo_ids,
-        k=4,  # Check top-4 semantically similar images per photo
+        k=candidate_k,
         max_cluster_size=3,  # Limit to 3 best photos per cluster
         db_session=db_session,
         job_id=job_id,
         room_labels=room_labels,
+        return_metadata=return_metadata,
     )

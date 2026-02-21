@@ -1,8 +1,11 @@
 """FastAPI application for Picaivid Media Service."""
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -161,7 +164,13 @@ async def get_project_clips(
         )
 
     # Get all clips for this job with related data
-    clips = db.query(Clip).filter(Clip.job_id == job.id).all()
+    clips = (
+        db.query(Clip)
+        .outerjoin(RoomCluster, Clip.room_cluster_id == RoomCluster.id)
+        .filter(Clip.job_id == job.id)
+        .order_by(RoomCluster.sequence_order.asc().nulls_last(), Clip.id.asc())
+        .all()
+    )
 
     # Build a map of job_photo_id -> JobPhoto for quick lookup
     job_photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).all()
@@ -202,12 +211,15 @@ async def get_project_clips(
                     source_photos.append(SourcePhotoInfo(
                         id=photo.id,
                         rails_photo_id=photo.rails_photo_id,
+                        filename=photo.filename,
                         s3_uri=photo.s3_uri,
                         thumbnail_url=thumb_url,
                         room_label=photo.room_label,
                         final_score=photo.final_score,
                         depth_variance=photo.depth_variance,
                         sharpness=photo.sharpness,
+                        is_duplicate=bool(photo.is_duplicate),
+                        duplicate_of_photo_id=photo.duplicate_of_photo_id,
                     ))
 
         # Get cluster info
@@ -222,6 +234,7 @@ async def get_project_clips(
                 overlap_score=cluster.overlap_score,
                 depth_variance=cluster.depth_variance,
                 recommended_motion=cluster.recommended_motion,
+                sequence_order=cluster.sequence_order,
             )
 
         # Get analysis info
@@ -298,14 +311,51 @@ async def get_project_clusters_debug(
         )
 
     # Get all clips (each clip represents a cluster)
-    clips = db.query(Clip).filter(Clip.job_id == job.id).all()
+    clips = (
+        db.query(Clip)
+        .outerjoin(RoomCluster, Clip.room_cluster_id == RoomCluster.id)
+        .filter(Clip.job_id == job.id)
+        .order_by(RoomCluster.sequence_order.asc().nulls_last(), Clip.id.asc())
+        .all()
+    )
 
     # Get all photos for this job
     job_photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).all()
     photo_map = {p.id: p for p in job_photos}
+    photo_filename_map = {p.id: (p.filename or f"photo-{p.id}") for p in job_photos}
 
-    # Get all similarity records for this job
-    similarities = db.query(PhotoSimilarity).filter(PhotoSimilarity.job_id == job.id).all()
+    # Get all similarity records for this job.
+    # Fallback to legacy schema query when direction columns are not migrated yet.
+    try:
+        similarities = db.query(PhotoSimilarity).filter(PhotoSimilarity.job_id == job.id).all()
+    except ProgrammingError:
+        db.rollback()
+        legacy_rows = db.execute(
+            text(
+                """
+                SELECT photo_a_id, photo_b_id, pair_source, dinov2_similarity,
+                       geometric_matches, geometric_inliers, geometric_score, is_connected
+                FROM photo_similarities
+                WHERE job_id = :job_id
+                """
+            ),
+            {"job_id": job.id},
+        ).fetchall()
+        similarities = [
+            SimpleNamespace(
+                photo_a_id=int(r.photo_a_id),
+                photo_b_id=int(r.photo_b_id),
+                pair_source=r.pair_source,
+                dinov2_similarity=r.dinov2_similarity,
+                geometric_matches=r.geometric_matches,
+                geometric_inliers=r.geometric_inliers,
+                geometric_score=r.geometric_score,
+                direction_dx=None,
+                direction_dy=None,
+                is_connected=int(r.is_connected or 0),
+            )
+            for r in legacy_rows
+        ]
 
     # Build similarity lookup: (photo_a, photo_b) -> similarity record
     sim_lookup = {}
@@ -352,11 +402,15 @@ async def get_project_clusters_debug(
                     photo_sims.append(PhotoSimilarityInfo(
                         photo_a_id=sim.photo_a_id,
                         photo_b_id=sim.photo_b_id,
+                        photo_a_filename=photo_filename_map.get(sim.photo_a_id),
+                        photo_b_filename=photo_filename_map.get(sim.photo_b_id),
                         pair_source=sim.pair_source,
                         dinov2_similarity=sim.dinov2_similarity,
                         geometric_matches=sim.geometric_matches,
                         geometric_inliers=sim.geometric_inliers,
                         geometric_score=sim.geometric_score,
+                        direction_dx=sim.direction_dx,
+                        direction_dy=sim.direction_dy,
                         is_connected=bool(sim.is_connected),
                     ))
                     all_similarities.append(sim)
@@ -364,10 +418,14 @@ async def get_project_clusters_debug(
             photos_debug.append(PhotoDebugInfo(
                 id=photo.id,
                 rails_photo_id=photo.rails_photo_id,
+                filename=photo.filename,
                 thumbnail_url=thumb_url,
                 room_label=photo.room_label,
                 position_in_cluster=idx,
                 is_endpoint=(idx == 0 or idx == len(photo_ids) - 1),
+                is_duplicate=bool(photo.is_duplicate),
+                duplicate_of_photo_id=photo.duplicate_of_photo_id,
+                duplicate_of_filename=photo_filename_map.get(photo.duplicate_of_photo_id),
                 similarities=photo_sims,
             ))
 
@@ -386,8 +444,10 @@ async def get_project_clusters_debug(
             cluster_id=clip.room_cluster_id or clip.id,
             room_type=cluster.room_type if cluster else None,
             photo_ids=photo_ids,
+            photo_filenames=[photo_filename_map.get(photo_id, f"photo-{photo_id}") for photo_id in photo_ids],
             photos=photos_debug,
             total_photos=len(photo_ids),
+            sequence_order=cluster.sequence_order if cluster else None,
             avg_dinov2_similarity=avg_dinov2,
             avg_geometric_score=avg_geo,
             has_direction_info=any(s.geometric_inliers and s.geometric_inliers >= 3 for s in all_similarities),

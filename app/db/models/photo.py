@@ -28,9 +28,12 @@ class JobPhoto(Base):
     room_label = Column(String(100))  # AI-detected room type
     room_override = Column(String(100))  # Copied from Rails (manual override)
     room_cluster_id = Column(Integer, ForeignKey("room_clusters.id"), nullable=True)
+    cluster_order = Column(Integer, nullable=True)  # Position within ordered cluster sequence
 
     # Flags
     exclude = Column(Boolean, default=False)
+    is_duplicate = Column(Boolean, default=False)
+    duplicate_of_photo_id = Column(Integer, ForeignKey("job_photos.id"), nullable=True)
 
     # Manual metadata copied from Rails
     manual_metadata = Column(JSONB, default={})

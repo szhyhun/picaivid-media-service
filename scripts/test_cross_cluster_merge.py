@@ -99,6 +99,47 @@ EXPECTED_ORDER_SET3 = [
     # No ordering tests - only 2 photos in cluster
 ]
 
+# -----------------------------------------------------------------------------
+# TEST SET 4: Listing with photo IDs 1633-1677 (user-reported inconsistencies)
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET4 = [
+    [1659, 1661],                 # Same room with potential transition
+    [1649, 1650, 1651],           # Known good kitchen cluster
+    [1648, 1652, 1653],           # User reports these should also group together
+    [1633, 1634, 1677],           # Front-yard sequence should stay together
+]
+
+EXPECTED_DIFFERENT_CLUSTERS_SET4 = [
+    ([1649, 1650, 1651], [1673, 1675]),  # Kitchen vs basement
+    ([1673], [1675]),                    # User confirmed this pair should stay separated
+]
+
+# -----------------------------------------------------------------------------
+# TEST SET 5: Listing with photo IDs 1600-1606 (user-reported merge mistakes)
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET5 = [
+    [1604, 1605],                 # 1604 should group with 1605
+]
+
+EXPECTED_DIFFERENT_CLUSTERS_SET5 = [
+    ([1600], [1606]),             # Different bathrooms despite visual similarity
+    ([1603], [1604, 1605]),       # 1603 should not be in 1604/1605 cluster
+]
+
+# -----------------------------------------------------------------------------
+# TEST SET 6: Listing with photo IDs 1929-1988 (latest regression report)
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET6 = [
+    [1929, 1988],                 # Exterior front pair with strong transition potential
+    [1938, 1939],                 # Living/entrance adjacency should stay together
+    [1960, 1961],                 # Bathroom/laundry confusion should be recovered
+]
+
+EXPECTED_DIFFERENT_CLUSTERS_SET6 = [
+    ([1929, 1988], [1930]),       # Roof/aerial should not hijack front-exterior cluster
+    ([1938, 1939], [1960, 1961]), # Different interior zones
+]
+
 
 def check_same_cluster(photo_ids: list, clusters: list) -> tuple:
     """Check if all photo_ids are in the same cluster.
@@ -272,7 +313,18 @@ def run_test_set(db, s3_client, test_ids, same_cluster_tests, different_cluster_
 
     # Run clustering
     print("\n  Running clustering...")
-    cluster_lists = cluster_photos_optimized(images, photo_ids, s3_client, db_session=db, job_id=job.id)
+    room_labels = [
+        photo_map[pid].room_override or photo_map[pid].room_label or "unknown"
+        for pid in photo_ids
+    ]
+    cluster_lists = cluster_photos_optimized(
+        images,
+        photo_ids,
+        s3_client,
+        db_session=db,
+        job_id=job.id,
+        room_labels=room_labels,
+    )
 
     # Show clusters
     print("\n  CLUSTERS:")
@@ -361,8 +413,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Test clustering against expected photo groupings')
     parser.add_argument('--job-id', type=int, help='Job ID to test (default: auto-detect)')
-    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', 'all'], default='all',
-                       help='Test set: 1=original, 2=861-912, 3=805-815, all=run all')
+    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', '4', '5', '6', 'all'], default='all',
+                       help='Test set: 1=original, 2=861-912, 3=805-815, 4=1633-1677, 5=1600-1606, 6=1929-1988, all=run all')
     parser.add_argument('--list-jobs', action='store_true', help='List available jobs with photo counts')
     args = parser.parse_args()
 
@@ -454,6 +506,72 @@ def main():
                              set_name="Set 3")
         if result is not None:
             results.append(("Set 3: 805-815", result))
+
+    # Test Set 4: Listing 1633-1677 (user inconsistencies)
+    if args.test_set in ['4', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 4: Listing 1633-1677 (user inconsistencies)")
+        print("="*70)
+
+        test_ids = set()
+        for group in EXPECTED_SAME_CLUSTER_SET4:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS_SET4:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER_SET4,
+                             EXPECTED_DIFFERENT_CLUSTERS_SET4,
+                             order_tests=None,
+                             sequence_tests=None,
+                             set_name="Set 4")
+        if result is not None:
+            results.append(("Set 4: 1633-1677", result))
+
+    # Test Set 5: Listing 1600-1606 (user inconsistencies)
+    if args.test_set in ['5', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 5: Listing 1600-1606 (user inconsistencies)")
+        print("="*70)
+
+        test_ids = set()
+        for group in EXPECTED_SAME_CLUSTER_SET5:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS_SET5:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER_SET5,
+                             EXPECTED_DIFFERENT_CLUSTERS_SET5,
+                             order_tests=None,
+                             sequence_tests=None,
+                             set_name="Set 5")
+        if result is not None:
+            results.append(("Set 5: 1600-1606", result))
+
+    # Test Set 6: Listing 1929-1988 (latest user regressions)
+    if args.test_set in ['6', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 6: Listing 1929-1988 (latest regressions)")
+        print("="*70)
+
+        test_ids = set()
+        for group in EXPECTED_SAME_CLUSTER_SET6:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS_SET6:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER_SET6,
+                             EXPECTED_DIFFERENT_CLUSTERS_SET6,
+                             order_tests=None,
+                             sequence_tests=None,
+                             set_name="Set 6")
+        if result is not None:
+            results.append(("Set 6: 1929-1988", result))
 
     # Summary
     print("\n" + "="*70)

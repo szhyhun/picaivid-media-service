@@ -253,3 +253,161 @@ alembic upgrade head
 6. Computes quality scores
 7. Clusters photos by room
 8. Plans motion strategy per cluster
+
+---
+
+## Cluster Debugging
+
+### Query Clusters and Photos for a Job
+
+```bash
+source venv/bin/activate
+python - <<'EOF'
+from app.db.session import SessionLocal
+from app.db.models import Job, JobPhoto, PhotoSimilarity, Clip
+
+db = SessionLocal()
+job = db.query(Job).order_by(Job.created_at.desc()).first()
+print(f"Latest Job: {job.id}, status={job.status}")
+
+# Show all clips (clusters) with their photos
+clips = db.query(Clip).filter(Clip.job_id == job.id).all()
+for clip in clips:
+    print(f"  Clip {clip.id}: photos={clip.source_photo_ids}")
+
+# Show all photos with room labels
+photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).order_by(JobPhoto.position).all()
+for p in photos:
+    print(f"  Photo {p.id}: pos={p.position}, room={p.room_label}, score={p.final_score:.2f}")
+db.close()
+EOF
+```
+
+### Inspect Similarity Between Specific Photos
+
+```bash
+python - <<'EOF'
+from app.db.session import SessionLocal
+from app.db.models import PhotoSimilarity
+
+db = SessionLocal()
+PHOTO_IDS = [1426, 1427, 1428]  # Replace with your photo IDs
+
+for i in PHOTO_IDS:
+    for j in PHOTO_IDS:
+        if i >= j:
+            continue
+        sim = db.query(PhotoSimilarity).filter(
+            PhotoSimilarity.photo_a_id == i,
+            PhotoSimilarity.photo_b_id == j
+        ).first()
+        if sim:
+            print(f"{i} <-> {j}: dinov2={sim.dinov2_similarity:.3f}, "
+                  f"inliers={sim.geometric_inliers}, source={sim.pair_source}, "
+                  f"connected={sim.is_connected}")
+        else:
+            print(f"{i} <-> {j}: NOT COMPUTED")
+db.close()
+EOF
+```
+
+### Debug Why Photos Are/Aren't Clustered Together
+
+```bash
+python - <<'EOF'
+from app.db.session import SessionLocal
+from app.db.models import Job, JobPhoto, PhotoSimilarity, Clip
+
+db = SessionLocal()
+job = db.query(Job).order_by(Job.created_at.desc()).first()
+
+# Find which clip each photo ended up in
+PROBLEM_PHOTOS = [1415, 1416, 1417, 1418]  # Replace with your photo IDs
+
+for pid in PROBLEM_PHOTOS:
+    photo = db.query(JobPhoto).filter(JobPhoto.id == pid).first()
+    print(f"Photo {pid}: room={photo.room_label}, position={photo.position}")
+
+clips = db.query(Clip).filter(Clip.job_id == job.id).all()
+for clip in clips:
+    if clip.source_photo_ids and any(p in PROBLEM_PHOTOS for p in clip.source_photo_ids):
+        print(f"  -> Clip {clip.id}: {clip.source_photo_ids}")
+db.close()
+EOF
+```
+
+### Run Clustering Tests
+
+```bash
+cd /path/to/picaivid-media-service
+source venv/bin/activate
+
+# Run all test sets
+python scripts/test_cross_cluster_merge.py --test-set all
+
+# Run a specific test set
+python scripts/test_cross_cluster_merge.py --test-set 1
+python scripts/test_cross_cluster_merge.py --test-set 2
+python scripts/test_cross_cluster_merge.py --test-set 3
+
+# List available jobs in DB (to see which photo IDs exist)
+python scripts/test_cross_cluster_merge.py --list-jobs
+```
+
+### Analyze Photo Pair Matching (Threshold Tuning)
+
+```bash
+python scripts/analyze_photo_pairs.py
+```
+
+Computes DINOv2 + geometric similarity for pairs and compares to current thresholds.
+
+---
+
+## Worker Management
+
+### Start the SQS Worker
+
+```bash
+cd picaivid-media-service
+source venv/bin/activate
+python -m app.worker
+```
+
+### Restart Worker (After Code Changes)
+
+The worker does **not** auto-reload. After modifying clustering code, you must restart:
+
+```bash
+# Find and kill the old worker
+kill $(pgrep -f "app.worker")
+
+# Start fresh
+source venv/bin/activate
+python -m app.worker
+```
+
+### API Server (Auto-Reloads)
+
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+The API server uses `--reload` so it auto-restarts on Python file changes.
+
+---
+
+## Key Clustering Constants (learned_matching.py)
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `MIN_INLIERS_FOR_OVERLAP` | 15 | Min geometric inliers to connect two photos |
+| `MIN_INLIERS_CROSS_ROOM` | 30 | Min inliers for non-adjacent cross-room pairs |
+| `MIN_INLIERS_CROSS_ROOM_ADJACENT` | 15 | Min inliers for adjacent cross-room pairs (ML labels often wrong) |
+| `MIN_INLIERS_FAR_APART` | 25 | Min inliers when position gap ≥ 3 (prevents same-room-label false matches) |
+| `POSITION_GAP_THRESHOLD` | 3 | Position gap above which to require stronger evidence |
+| `TEMPORAL_WINDOW` | 2 | Check photos within ±2 positions as potential same-cluster |
+| `TEMPORAL_SEMANTIC_THRESHOLD` | 0.88 | Trust semantic similarity alone if ≥ 0.88 (no geometric needed) |
+| `NEIGHBOR_TRUST_THRESHOLD` | 0.65 | Trust immediate neighbor even without full geometric verification |
+| `DUPLICATE_SIMILARITY_THRESHOLD` | 0.94 | Mark as duplicate if consecutive photos are ≥ 94% similar |
+| `MAX_CLUSTER_SIZE` | 3 | Maximum photos per cluster |

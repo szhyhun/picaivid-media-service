@@ -31,6 +31,8 @@ class PhotoSimilarity(Base):
     geometric_matches = Column(Integer)  # Total feature matches
     geometric_inliers = Column(Integer)  # Matches passing RANSAC
     geometric_score = Column(Float)  # Overlap score (0.0 to 1.0)
+    direction_dx = Column(Float)  # Content shift X from photo_a -> photo_b (normalized)
+    direction_dy = Column(Float)  # Content shift Y from photo_a -> photo_b (normalized)
 
     # Whether this pair was used in final clustering
     is_connected = Column(Integer, default=0)  # 0=no, 1=yes

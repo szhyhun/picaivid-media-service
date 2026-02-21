@@ -1,5 +1,6 @@
 """Phase 1 Analyzer - Main coordinator for photo analysis and planning."""
 import logging
+import json
 from typing import List
 
 from sqlalchemy.orm import Session
@@ -104,9 +105,14 @@ class Phase1Analyzer:
 
         except Exception as e:
             logger.error(f"Phase 1 failed for job {job_id}: {e}", exc_info=True)
-            job.status = "failed"
-            job.error_message = str(e)[:1000]
-            self.db.commit()
+            # SQLAlchemy transaction may be invalid after DB exceptions.
+            # Roll back first, then persist failure state in a clean transaction.
+            self.db.rollback()
+            failed_job = self.db.query(Job).filter(Job.id == job_id).first()
+            if failed_job:
+                failed_job.status = "failed"
+                failed_job.error_message = str(e)[:1000]
+                self.db.commit()
             raise
 
     def _create_job_photos(self, job: Job, rails_photos: List[RailsPhoto]) -> List[JobPhoto]:
@@ -176,6 +182,16 @@ class Phase1Analyzer:
             try:
                 image = s3_client.download_image(photo.s3_uri)
                 room_type, confidence = openclip_model.classify_room(image)
+
+                # Lightweight metadata guardrail for a common confusion:
+                # laundry rooms can be misclassified as kitchens.
+                if (
+                    room_type in {"kitchen", "bathroom", "unknown"}
+                    and _looks_like_laundry(photo)
+                ):
+                    room_type = "laundry room"
+                    logger.info(f"Photo {photo.id}: remapped to laundry room via metadata hint")
+
                 photo.room_label = room_type
                 logger.info(f"Photo {photo.id}: {room_type} ({confidence:.2f})")
             except Exception as e:
@@ -200,3 +216,22 @@ class Phase1Analyzer:
                 logger.error(f"FAILED to analyze depth for photo {photo.id}: {e}", exc_info=True)
                 photo.depth_variance = 0.0
                 photo.depth_layers = 1
+
+
+def _looks_like_laundry(photo: JobPhoto) -> bool:
+    """Infer laundry room from filename/metadata hints."""
+    hints = []
+    if photo.filename:
+        hints.append(photo.filename)
+    if photo.manual_metadata:
+        try:
+            hints.append(json.dumps(photo.manual_metadata))
+        except Exception:
+            hints.append(str(photo.manual_metadata))
+
+    corpus = " ".join(hints).lower()
+    if not corpus:
+        return False
+
+    laundry_tokens = ("laundry", "washer", "dryer", "washing machine")
+    return any(token in corpus for token in laundry_tokens)

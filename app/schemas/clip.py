@@ -7,12 +7,15 @@ class SourcePhotoInfo(BaseModel):
     """Info about a source photo used in a clip."""
     id: int
     rails_photo_id: str
+    filename: Optional[str] = None
     s3_uri: Optional[str] = None
     thumbnail_url: Optional[str] = None
     room_label: Optional[str] = None
     final_score: Optional[float] = None
     depth_variance: Optional[float] = None
     sharpness: Optional[float] = None
+    is_duplicate: bool = False
+    duplicate_of_photo_id: Optional[int] = None
 
 
 class ClusterInfo(BaseModel):
@@ -24,6 +27,7 @@ class ClusterInfo(BaseModel):
     overlap_score: Optional[float] = None
     depth_variance: Optional[float] = None
     recommended_motion: Optional[str] = None
+    sequence_order: Optional[int] = None
 
 
 class AnalysisInfo(BaseModel):
@@ -75,11 +79,15 @@ class PhotoSimilarityInfo(BaseModel):
     """Similarity info between two photos."""
     photo_a_id: int
     photo_b_id: int
+    photo_a_filename: Optional[str] = None
+    photo_b_filename: Optional[str] = None
     pair_source: Optional[str] = None  # dinov2_topk, temporal_window, both
     dinov2_similarity: Optional[float] = None
     geometric_matches: Optional[int] = None
     geometric_inliers: Optional[int] = None
     geometric_score: Optional[float] = None
+    direction_dx: Optional[float] = None
+    direction_dy: Optional[float] = None
     is_connected: bool = False
 
 
@@ -87,10 +95,14 @@ class PhotoDebugInfo(BaseModel):
     """Debug info for a single photo in a cluster."""
     id: int
     rails_photo_id: str
+    filename: Optional[str] = None
     thumbnail_url: Optional[str] = None
     room_label: Optional[str] = None
     position_in_cluster: int  # 0-indexed position
     is_endpoint: bool = False  # True if first or last in cluster
+    is_duplicate: bool = False
+    duplicate_of_photo_id: Optional[int] = None
+    duplicate_of_filename: Optional[str] = None
     # Similarity to neighbors
     similarities: List[PhotoSimilarityInfo] = []
 
@@ -100,8 +112,10 @@ class ClusterDebugResponse(BaseModel):
     cluster_id: int
     room_type: Optional[str] = None
     photo_ids: List[int]  # Ordered list
+    photo_filenames: List[str] = []  # Ordered list aligned with photo_ids
     photos: List[PhotoDebugInfo]
     total_photos: int
+    sequence_order: Optional[int] = None
     # Summary stats
     avg_dinov2_similarity: Optional[float] = None
     avg_geometric_score: Optional[float] = None

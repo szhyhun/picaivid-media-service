@@ -15,6 +15,7 @@ ROOM_TYPES = [
     "living room",
     "bedroom",
     "kitchen",
+    "laundry room",
     "bathroom",
     "dining room",
     "office",
@@ -32,6 +33,14 @@ ROOM_TYPES = [
     "aerial view",
     "drone shot",
 ]
+
+ROOM_PROMPTS = {
+    "laundry room": [
+        "a photo of a laundry room",
+        "a photo of a utility room with washer and dryer",
+        "a photo of a washer and dryer in a laundry area",
+    ],
+}
 
 
 class OpenCLIPModel:
@@ -82,12 +91,20 @@ class OpenCLIPModel:
 
     def _precompute_text_features(self) -> None:
         """Pre-compute text embeddings for room types."""
-        prompts = [f"a photo of a {room}" for room in ROOM_TYPES]
-        text_tokens = self._tokenizer(prompts).to(self._device)
-
         with torch.no_grad():
-            self._text_features = self._model.encode_text(text_tokens)
-            self._text_features = self._text_features / self._text_features.norm(dim=-1, keepdim=True)
+            room_features = []
+            for room in ROOM_TYPES:
+                prompts = ROOM_PROMPTS.get(room, [f"a photo of a {room}"])
+                text_tokens = self._tokenizer(prompts).to(self._device)
+                text_features = self._model.encode_text(text_tokens)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+                # Use centroid of prompts for a more robust room concept vector.
+                room_feature = text_features.mean(dim=0, keepdim=True)
+                room_feature = room_feature / room_feature.norm(dim=-1, keepdim=True)
+                room_features.append(room_feature)
+
+            self._text_features = torch.cat(room_features, dim=0)
 
     def get_embedding(self, image: Image.Image) -> np.ndarray:
         """Get embedding vector for an image.

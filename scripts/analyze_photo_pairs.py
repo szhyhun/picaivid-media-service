@@ -117,7 +117,7 @@ def main():
         sim = (embedding_map[a] @ embedding_map[b].T).item()
 
         # Geometric match
-        num_matches, num_inliers, score = match_image_pair(images[a], images[b])
+        num_matches, num_inliers, score, _direction = match_image_pair(images[a], images[b])
 
         # Status
         passes_inliers = num_inliers >= MIN_INLIERS_FOR_OVERLAP
@@ -145,7 +145,7 @@ def main():
         sim = (embedding_map[a] @ embedding_map[b].T).item()
 
         # Geometric match
-        num_matches, num_inliers, score = match_image_pair(images[a], images[b])
+        num_matches, num_inliers, score, _direction = match_image_pair(images[a], images[b])
 
         # Status (should NOT pass)
         passes_inliers = num_inliers >= MIN_INLIERS_FOR_OVERLAP
