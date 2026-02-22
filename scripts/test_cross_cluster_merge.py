@@ -140,6 +140,16 @@ EXPECTED_DIFFERENT_CLUSTERS_SET6 = [
     ([1938, 1939], [1960, 1961]), # Different interior zones
 ]
 
+# -----------------------------------------------------------------------------
+# TEST SET 7: Listing with photo IDs 2094-2099 (patio transition quality)
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET7 = []
+CONTEXT_PHOTOS_SET7 = [2096, 2097, 2098]  # Preserve real temporal spacing between 2094/2095 and 2099
+
+EXPECTED_DIFFERENT_CLUSTERS_SET7 = [
+    ([2099], [2094, 2095]),       # 2099 is opposite patio side and should not chain with 2094/2095
+]
+
 
 def check_same_cluster(photo_ids: list, clusters: list) -> tuple:
     """Check if all photo_ids are in the same cluster.
@@ -413,8 +423,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Test clustering against expected photo groupings')
     parser.add_argument('--job-id', type=int, help='Job ID to test (default: auto-detect)')
-    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', '4', '5', '6', 'all'], default='all',
-                       help='Test set: 1=original, 2=861-912, 3=805-815, 4=1633-1677, 5=1600-1606, 6=1929-1988, all=run all')
+    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', '4', '5', '6', '7', 'all'], default='all',
+                       help='Test set: 1=original, 2=861-912, 3=805-815, 4=1633-1677, 5=1600-1606, 6=1929-1988, 7=2094-2099, all=run all')
     parser.add_argument('--list-jobs', action='store_true', help='List available jobs with photo counts')
     args = parser.parse_args()
 
@@ -572,6 +582,29 @@ def main():
                              set_name="Set 6")
         if result is not None:
             results.append(("Set 6: 1929-1988", result))
+
+    # Test Set 7: Listing 2094-2099 (patio transition quality)
+    if args.test_set in ['7', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 7: Listing 2094-2099 (patio transition quality)")
+        print("="*70)
+
+        test_ids = set()
+        test_ids.update(CONTEXT_PHOTOS_SET7)
+        for group in EXPECTED_SAME_CLUSTER_SET7:
+            test_ids.update(group)
+        for g1, g2 in EXPECTED_DIFFERENT_CLUSTERS_SET7:
+            test_ids.update(g1)
+            test_ids.update(g2)
+
+        result = run_test_set(db, s3_client, test_ids,
+                             EXPECTED_SAME_CLUSTER_SET7,
+                             EXPECTED_DIFFERENT_CLUSTERS_SET7,
+                             order_tests=None,
+                             sequence_tests=None,
+                             set_name="Set 7")
+        if result is not None:
+            results.append(("Set 7: 2094-2099", result))
 
     # Summary
     print("\n" + "="*70)

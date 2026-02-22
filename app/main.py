@@ -15,6 +15,7 @@ from app.db.models import Job, Clip, JobPhoto, RoomCluster, AnalysisResult, Phot
 from app.schemas.job import JobMessage, JobStatusResponse
 from app.schemas.clip import (
     ClipResponse, ClipListResponse, SourcePhotoInfo, ClusterInfo, AnalysisInfo,
+    ClipTransitionStep,
     ClusterDebugResponse, ClusterListDebugResponse, PhotoDebugInfo, PhotoSimilarityInfo,
 )
 from app.pipeline.orchestrator import PipelineOrchestrator
@@ -39,6 +40,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _camera_direction_recommendation(dx: float | None, dy: float | None) -> str:
+    """Translate content-shift direction into camera motion recommendation."""
+    if dx is None or dy is None:
+        return "Direction unknown"
+
+    abs_x = abs(dx)
+    abs_y = abs(dy)
+    if abs_x < 0.15 and abs_y < 0.15:
+        return "Hold / very subtle move"
+
+    # Direction vector is content shift; camera motion is opposite.
+    if abs_x >= abs_y:
+        return "Move camera left" if dx > 0 else "Move camera right"
+    return "Move camera up" if dy > 0 else "Move camera down"
 
 
 @app.get("/health")
@@ -183,6 +200,42 @@ async def get_project_clips(
     analysis_results = db.query(AnalysisResult).filter(AnalysisResult.job_id == job.id).all()
     analysis_map = {a.room_cluster_id: a for a in analysis_results if a.room_cluster_id}
 
+    # Similarity records are used to provide transition direction recommendations.
+    try:
+        similarities = db.query(PhotoSimilarity).filter(PhotoSimilarity.job_id == job.id).all()
+    except ProgrammingError:
+        db.rollback()
+        legacy_rows = db.execute(
+            text(
+                """
+                SELECT photo_a_id, photo_b_id, pair_source, dinov2_similarity,
+                       geometric_inliers, geometric_score, is_connected
+                FROM photo_similarities
+                WHERE job_id = :job_id
+                """
+            ),
+            {"job_id": job.id},
+        ).fetchall()
+        similarities = [
+            SimpleNamespace(
+                photo_a_id=int(r.photo_a_id),
+                photo_b_id=int(r.photo_b_id),
+                pair_source=r.pair_source,
+                dinov2_similarity=r.dinov2_similarity,
+                geometric_inliers=r.geometric_inliers,
+                geometric_score=r.geometric_score,
+                direction_dx=None,
+                direction_dy=None,
+                is_connected=int(r.is_connected or 0),
+            )
+            for r in legacy_rows
+        ]
+
+    sim_lookup = {}
+    for sim in similarities:
+        key = (min(sim.photo_a_id, sim.photo_b_id), max(sim.photo_a_id, sim.photo_b_id))
+        sim_lookup[key] = sim
+
     # Generate pre-signed URLs for each clip
     clip_responses = []
 
@@ -215,12 +268,49 @@ async def get_project_clips(
                         s3_uri=photo.s3_uri,
                         thumbnail_url=thumb_url,
                         room_label=photo.room_label,
+                        room_override=photo.room_override,
+                        position=photo.position,
+                        cluster_order=photo.cluster_order,
+                        base_score=photo.base_score,
                         final_score=photo.final_score,
                         depth_variance=photo.depth_variance,
+                        depth_layers=photo.depth_layers,
                         sharpness=photo.sharpness,
+                        exposure_score=photo.exposure_score,
+                        composition_score=photo.composition_score,
                         is_duplicate=bool(photo.is_duplicate),
                         duplicate_of_photo_id=photo.duplicate_of_photo_id,
                     ))
+
+        transition_steps = []
+        if clip.source_photo_ids and len(clip.source_photo_ids) > 1:
+            for idx in range(len(clip.source_photo_ids) - 1):
+                from_photo_id = clip.source_photo_ids[idx]
+                to_photo_id = clip.source_photo_ids[idx + 1]
+                from_photo = photo_map.get(from_photo_id)
+                to_photo = photo_map.get(to_photo_id)
+                sim_key = (min(from_photo_id, to_photo_id), max(from_photo_id, to_photo_id))
+                sim = sim_lookup.get(sim_key)
+
+                transition_steps.append(
+                    ClipTransitionStep(
+                        from_photo_id=from_photo_id,
+                        to_photo_id=to_photo_id,
+                        from_filename=from_photo.filename if from_photo else None,
+                        to_filename=to_photo.filename if to_photo else None,
+                        dinov2_similarity=sim.dinov2_similarity if sim else None,
+                        geometric_inliers=sim.geometric_inliers if sim else None,
+                        geometric_score=sim.geometric_score if sim else None,
+                        direction_dx=sim.direction_dx if sim else None,
+                        direction_dy=sim.direction_dy if sim else None,
+                        recommendation=_camera_direction_recommendation(
+                            sim.direction_dx if sim else None,
+                            sim.direction_dy if sim else None,
+                        ),
+                        pair_source=sim.pair_source if sim else None,
+                        is_connected=bool(sim.is_connected) if sim else False,
+                    )
+                )
 
         # Get cluster info
         cluster_info = None
@@ -265,6 +355,7 @@ async def get_project_clips(
                 video_url=video_url,
                 status=clip.status,
                 source_photos=source_photos if source_photos else None,
+                transition_steps=transition_steps if transition_steps else None,
                 cluster_info=cluster_info,
                 analysis_info=analysis_info,
             )

@@ -287,6 +287,12 @@ MIN_SEMANTIC_FOR_GEOMETRIC = 0.15  # Skip geometric check if semantic < 15%
 MIN_TRANSITION_SCORE = 0.20  # Minimum overlap score to keep photo in ordered chain
 DIRECTION_CONSISTENCY_THRESHOLD = 0.5  # Cos similarity for direction vectors to be "consistent"
 SEMANTIC_BRIDGE_SUPPORT_THRESHOLD = 0.70  # Remove weak semantic-only bridges if cross-support is low
+HARD_TRANSITION_MIN_OVERLAP = 0.25  # Require at least ~25% overlap-like score for final transitions
+HARD_TRANSITION_MIN_INLIERS = 8  # Reject transition edges without enough geometric correspondences
+HARD_TRANSITION_ADJACENT_SEMANTIC_TRUST = NEIGHBOR_TRUST_THRESHOLD  # Keep trusted adjacent semantic links
+HARD_TRANSITION_DIST2_SEMANTIC_TRUST = DIST2_TRUST_THRESHOLD  # Keep trusted distance-2 semantic links
+HARD_TRANSITION_MAX_SEMANTIC_GAP = 2  # Split semantic-only transitions that jump too far in capture order
+HARD_TRANSITION_RECOVERY_SEMANTIC_TRUST = 0.86  # semantic-recovery edges require much stronger confidence
 
 # Deduplication thresholds
 # Only consecutive photos with very high similarity are considered "same angle" duplicates
@@ -808,6 +814,146 @@ def deduplicate_and_split_cluster(
     )
 
     return result_clusters + duplicate_clusters, duplicate_of
+
+
+def _build_similarity_lookup(
+    similarity_records: List[Dict[str, object]],
+) -> Dict[Tuple[int, int], Dict[str, object]]:
+    """Build quick lookup for per-pair metrics collected during stage 2."""
+    lookup: Dict[Tuple[int, int], Dict[str, object]] = {}
+    for record in similarity_records:
+        photo_a = record.get("photo_a_id")
+        photo_b = record.get("photo_b_id")
+        if photo_a is None or photo_b is None:
+            continue
+        key = (int(min(photo_a, photo_b)), int(max(photo_a, photo_b)))
+        lookup[key] = record
+    return lookup
+
+
+def enforce_transition_quality(
+    ordered_clusters: List[List[int]],
+    photo_ids: List[int],
+    adjacency: np.ndarray,
+    similarity: np.ndarray,
+    edge_has_geometry: np.ndarray,
+    similarity_records: List[Dict[str, object]],
+    min_overlap: float = HARD_TRANSITION_MIN_OVERLAP,
+    min_inliers: int = HARD_TRANSITION_MIN_INLIERS,
+    adjacent_semantic_trust: float = HARD_TRANSITION_ADJACENT_SEMANTIC_TRUST,
+    dist2_semantic_trust: float = HARD_TRANSITION_DIST2_SEMANTIC_TRUST,
+    max_semantic_gap: int = HARD_TRANSITION_MAX_SEMANTIC_GAP,
+    recovery_semantic_trust: float = HARD_TRANSITION_RECOVERY_SEMANTIC_TRUST,
+) -> List[List[int]]:
+    """Split ordered clusters at transition edges that are too weak for video cuts.
+
+    This is a final safety gate: connected-components can still keep semantic-only
+    links that are visually related but not transition-safe. We keep an edge only if:
+      1) it has geometric evidence + enough overlap/inliers, OR
+      2) it is adjacent in source order and semantic similarity is extremely high.
+    """
+    if not ordered_clusters:
+        return []
+
+    pid_to_idx = {pid: idx for idx, pid in enumerate(photo_ids)}
+    pair_lookup = _build_similarity_lookup(similarity_records)
+
+    refined_clusters: List[List[int]] = []
+    split_count = 0
+
+    for cluster in ordered_clusters:
+        if len(cluster) <= 1:
+            refined_clusters.append(cluster)
+            continue
+
+        current_chain = [cluster[0]]
+
+        for left_pid, right_pid in zip(cluster, cluster[1:]):
+            idx_left = pid_to_idx.get(left_pid)
+            idx_right = pid_to_idx.get(right_pid)
+            if idx_left is None or idx_right is None:
+                current_chain.append(right_pid)
+                continue
+
+            overlap_score = float(adjacency[idx_left, idx_right])
+            semantic_score = float(similarity[idx_left, idx_right])
+            has_geometry = bool(edge_has_geometry[idx_left, idx_right])
+            seq_gap = abs(idx_right - idx_left)
+
+            record = pair_lookup.get((min(left_pid, right_pid), max(left_pid, right_pid)), {})
+            raw_inliers = record.get("geometric_inliers")
+            try:
+                inliers = int(raw_inliers) if raw_inliers is not None else 0
+            except (TypeError, ValueError):
+                inliers = 0
+            pair_source = str(record.get("pair_source") or "")
+
+            keep_edge = False
+            keep_reason = ""
+
+            if has_geometry and (inliers >= min_inliers or overlap_score >= min_overlap):
+                keep_edge = True
+                keep_reason = "geometry"
+            elif "semantic_recovery" in pair_source:
+                if seq_gap <= max_semantic_gap and semantic_score >= recovery_semantic_trust:
+                    keep_edge = True
+                    keep_reason = "semantic_recovery"
+            elif seq_gap <= 1 and semantic_score >= adjacent_semantic_trust:
+                keep_edge = True
+                keep_reason = "adjacent_semantic"
+            elif seq_gap <= 2 and semantic_score >= dist2_semantic_trust:
+                keep_edge = True
+                keep_reason = "dist2_semantic"
+
+            if keep_edge:
+                current_chain.append(right_pid)
+                logger.debug(
+                    "Transition kept %s -> %s (%s: overlap=%.3f, inliers=%s, sem=%.3f, gap=%s, source=%s)",
+                    left_pid,
+                    right_pid,
+                    keep_reason,
+                    overlap_score,
+                    inliers,
+                    semantic_score,
+                    seq_gap,
+                    pair_source,
+                )
+                continue
+
+            split_count += 1
+            logger.info(
+                "Transition split %s -> %s (overlap=%.3f, inliers=%s, sem=%.3f, "
+                "has_geometry=%s, gap=%s, source=%s)",
+                left_pid,
+                right_pid,
+                overlap_score,
+                inliers,
+                semantic_score,
+                "yes" if has_geometry else "no",
+                seq_gap,
+                pair_source,
+            )
+            refined_clusters.append(current_chain)
+            current_chain = [right_pid]
+
+        if current_chain:
+            refined_clusters.append(current_chain)
+
+    logger.info(
+        "Transition quality enforcement: %s ordered clusters -> %s refined clusters "
+        "(splits=%s, min_overlap=%.2f, min_inliers=%s, adjacent_sem>=%.2f, dist2_sem>=%.2f, recovery_sem>=%.2f, max_sem_gap=%s)",
+        len(ordered_clusters),
+        len(refined_clusters),
+        split_count,
+        min_overlap,
+        min_inliers,
+        adjacent_semantic_trust,
+        dist2_semantic_trust,
+        recovery_semantic_trust,
+        max_semantic_gap,
+    )
+
+    return refined_clusters
 
 
 # LightGlue/LoFTR model singleton
@@ -1737,6 +1883,16 @@ def cluster_photos_graph_based(
             for iso_pid in isolated:
                 ordered_clusters.append([iso_pid])
                 logger.info(f"  Cluster {label}: isolated photo {iso_pid} -> own cluster")
+
+    # Stage 4b: Enforce hard transition quality constraints on ordered chains.
+    ordered_clusters = enforce_transition_quality(
+        ordered_clusters=ordered_clusters,
+        photo_ids=photo_ids,
+        adjacency=adjacency,
+        similarity=similarity,
+        edge_has_geometry=edge_has_geometry,
+        similarity_records=similarity_records,
+    )
 
     # -------------------------------------------------------------------------
     # Stage 5: Deduplicate and split large clusters

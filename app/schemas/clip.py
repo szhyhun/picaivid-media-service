@@ -11,9 +11,16 @@ class SourcePhotoInfo(BaseModel):
     s3_uri: Optional[str] = None
     thumbnail_url: Optional[str] = None
     room_label: Optional[str] = None
+    room_override: Optional[str] = None
+    position: Optional[int] = None
+    cluster_order: Optional[int] = None
+    base_score: Optional[float] = None
     final_score: Optional[float] = None
     depth_variance: Optional[float] = None
+    depth_layers: Optional[int] = None
     sharpness: Optional[float] = None
+    exposure_score: Optional[float] = None
+    composition_score: Optional[float] = None
     is_duplicate: bool = False
     duplicate_of_photo_id: Optional[int] = None
 
@@ -28,6 +35,22 @@ class ClusterInfo(BaseModel):
     depth_variance: Optional[float] = None
     recommended_motion: Optional[str] = None
     sequence_order: Optional[int] = None
+
+
+class ClipTransitionStep(BaseModel):
+    """Directional recommendation between consecutive photos in a clip."""
+    from_photo_id: int
+    to_photo_id: int
+    from_filename: Optional[str] = None
+    to_filename: Optional[str] = None
+    dinov2_similarity: Optional[float] = None
+    geometric_inliers: Optional[int] = None
+    geometric_score: Optional[float] = None
+    direction_dx: Optional[float] = None
+    direction_dy: Optional[float] = None
+    recommendation: Optional[str] = None
+    pair_source: Optional[str] = None
+    is_connected: bool = False
 
 
 class AnalysisInfo(BaseModel):
@@ -61,6 +84,7 @@ class ClipResponse(BaseModel):
 
     # Extended info for debugging
     source_photos: Optional[List[SourcePhotoInfo]] = None
+    transition_steps: Optional[List[ClipTransitionStep]] = None
     cluster_info: Optional[ClusterInfo] = None
     analysis_info: Optional[AnalysisInfo] = None
 
