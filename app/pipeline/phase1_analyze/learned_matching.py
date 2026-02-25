@@ -26,6 +26,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from app.core.config import settings
+
 if TYPE_CHECKING:
     from app.db.models import JobPhoto
 
@@ -293,11 +295,17 @@ HARD_TRANSITION_ADJACENT_SEMANTIC_TRUST = NEIGHBOR_TRUST_THRESHOLD  # Keep trust
 HARD_TRANSITION_DIST2_SEMANTIC_TRUST = DIST2_TRUST_THRESHOLD  # Keep trusted distance-2 semantic links
 HARD_TRANSITION_MAX_SEMANTIC_GAP = 2  # Split semantic-only transitions that jump too far in capture order
 HARD_TRANSITION_RECOVERY_SEMANTIC_TRUST = 0.86  # semantic-recovery edges require much stronger confidence
+HARD_TRANSITION_FRONT_RECOVERY_SEMANTIC_TRUST = 0.78  # Keep strong long-gap front-exterior recovery links
+HARD_TRANSITION_REQUIRE_GEOMETRY = settings.REQUIRE_GEOMETRIC_TRANSITIONS
+HARD_TRANSITION_REQUIRE_DIRECTION = settings.REQUIRE_DIRECTION_FOR_TRANSITIONS
 
 # Deduplication thresholds
 # Only consecutive photos with very high similarity are considered "same angle" duplicates
 # Different angles of the same room typically have 0.85-0.92 similarity
 DUPLICATE_SIMILARITY_THRESHOLD = 0.97  # Conservative dedup to avoid dropping transition-valuable near-duplicates
+DUPLICATE_GEOMETRIC_SEMANTIC_THRESHOLD = 0.95  # Allow slightly lower semantic threshold when geometry is near-identical
+DUPLICATE_GEOMETRIC_OVERLAP_THRESHOLD = 0.90  # Require very high overlap score for geometric-backed dedupe
+KEEP_DUPLICATE_SINGLETON_CLUSTERS = not settings.DELETE_OBVIOUS_DUPLICATES
 
 
 def compute_direction_vector(
@@ -635,6 +643,7 @@ def deduplicate_and_split_cluster(
     embeddings: np.ndarray,
     adjacency: np.ndarray,
     max_size: int = 3,
+    keep_duplicate_singletons: bool = True,
 ) -> Tuple[List[List[int]], Dict[int, int]]:
     """Remove duplicates and split large clusters into smaller ones.
 
@@ -652,6 +661,8 @@ def deduplicate_and_split_cluster(
         embeddings: NxD normalized embedding matrix for all photos
         adjacency: NxN geometric overlap matrix (higher = better overlap)
         max_size: Maximum photos per cluster
+        keep_duplicate_singletons: When True, duplicate photos are returned as
+            singleton clusters. When False, duplicate photos are dropped.
 
     Returns:
         Tuple:
@@ -701,32 +712,65 @@ def deduplicate_and_split_cluster(
         if j in to_remove:
             continue
 
-        if sem_sim[i, j] >= DUPLICATE_SIMILARITY_THRESHOLD:
+        idx_i = cluster_indices[i]
+        idx_j = cluster_indices[j]
+        semantic_score = float(sem_sim[i, j])
+        geometric_overlap = float(adjacency[idx_i, idx_j])
+        is_duplicate_pair = (
+            semantic_score >= DUPLICATE_SIMILARITY_THRESHOLD
+            or (
+                semantic_score >= DUPLICATE_GEOMETRIC_SEMANTIC_THRESHOLD
+                and geometric_overlap >= DUPLICATE_GEOMETRIC_OVERLAP_THRESHOLD
+            )
+        )
+
+        if is_duplicate_pair:
             if transition_scores[i] >= transition_scores[j]:
                 to_remove.add(j)
                 duplicate_of[cluster_photo_ids[j]] = cluster_photo_ids[i]
-                logger.debug(f"Marking consecutive duplicate {cluster_photo_ids[j]} -> {cluster_photo_ids[i]}")
+                logger.debug(
+                    "Marking consecutive duplicate %s -> %s (sem=%.3f, overlap=%.3f)",
+                    cluster_photo_ids[j],
+                    cluster_photo_ids[i],
+                    semantic_score,
+                    geometric_overlap,
+                )
             else:
                 to_remove.add(i)
                 duplicate_of[cluster_photo_ids[i]] = cluster_photo_ids[j]
-                logger.debug(f"Marking consecutive duplicate {cluster_photo_ids[i]} -> {cluster_photo_ids[j]}")
+                logger.debug(
+                    "Marking consecutive duplicate %s -> %s (sem=%.3f, overlap=%.3f)",
+                    cluster_photo_ids[i],
+                    cluster_photo_ids[j],
+                    semantic_score,
+                    geometric_overlap,
+                )
 
     # Keep canonical photos in order, split if needed.
     remaining_indices = [i for i in range(n) if i not in to_remove]
     remaining = [cluster_photo_ids[i] for i in remaining_indices]
     duplicate_clusters = [[cluster_photo_ids[i]] for i in range(n) if i in to_remove]
+    emitted_duplicate_clusters = duplicate_clusters if keep_duplicate_singletons else []
 
     if len(remaining) <= max_size:
         if len(remaining) < len(cluster_photo_ids):
-            logger.info(
-                "Deduplicated: %s -> %s canonical (+%s duplicate singleton clusters)",
-                len(cluster_photo_ids),
-                len(remaining),
-                len(duplicate_clusters),
-            )
+            if keep_duplicate_singletons:
+                logger.info(
+                    "Deduplicated: %s -> %s canonical (+%s duplicate singleton clusters)",
+                    len(cluster_photo_ids),
+                    len(remaining),
+                    len(duplicate_clusters),
+                )
+            else:
+                logger.info(
+                    "Deduplicated: %s -> %s canonical (dropped %s duplicates)",
+                    len(cluster_photo_ids),
+                    len(remaining),
+                    len(duplicate_clusters),
+                )
         if not remaining:
-            return duplicate_clusters, duplicate_of
-        return [remaining] + duplicate_clusters, duplicate_of
+            return emitted_duplicate_clusters, duplicate_of
+        return [remaining] + emitted_duplicate_clusters, duplicate_of
 
     # Too many photos - SPLIT into multiple clusters instead of dropping.
     # Use constrained partitioning to GUARANTEE each cluster size <= max_size.
@@ -805,15 +849,24 @@ def deduplicate_and_split_cluster(
 
     # Log the split
     sizes = [len(c) for c in result_clusters]
-    logger.info(
-        "Split cluster: %s photos -> %s canonical clusters (sizes: %s) + %s duplicate singleton clusters",
-        len(cluster_photo_ids),
-        len(result_clusters),
-        sizes,
-        len(duplicate_clusters),
-    )
+    if keep_duplicate_singletons:
+        logger.info(
+            "Split cluster: %s photos -> %s canonical clusters (sizes: %s) + %s duplicate singleton clusters",
+            len(cluster_photo_ids),
+            len(result_clusters),
+            sizes,
+            len(duplicate_clusters),
+        )
+    else:
+        logger.info(
+            "Split cluster: %s photos -> %s canonical clusters (sizes: %s), dropped %s duplicates",
+            len(cluster_photo_ids),
+            len(result_clusters),
+            sizes,
+            len(duplicate_clusters),
+        )
 
-    return result_clusters + duplicate_clusters, duplicate_of
+    return result_clusters + emitted_duplicate_clusters, duplicate_of
 
 
 def _build_similarity_lookup(
@@ -838,19 +891,22 @@ def enforce_transition_quality(
     similarity: np.ndarray,
     edge_has_geometry: np.ndarray,
     similarity_records: List[Dict[str, object]],
+    room_labels: Optional[List[str]] = None,
     min_overlap: float = HARD_TRANSITION_MIN_OVERLAP,
     min_inliers: int = HARD_TRANSITION_MIN_INLIERS,
     adjacent_semantic_trust: float = HARD_TRANSITION_ADJACENT_SEMANTIC_TRUST,
     dist2_semantic_trust: float = HARD_TRANSITION_DIST2_SEMANTIC_TRUST,
     max_semantic_gap: int = HARD_TRANSITION_MAX_SEMANTIC_GAP,
     recovery_semantic_trust: float = HARD_TRANSITION_RECOVERY_SEMANTIC_TRUST,
+    front_recovery_semantic_trust: float = HARD_TRANSITION_FRONT_RECOVERY_SEMANTIC_TRUST,
+    require_geometry: bool = HARD_TRANSITION_REQUIRE_GEOMETRY,
+    require_direction: bool = HARD_TRANSITION_REQUIRE_DIRECTION,
 ) -> List[List[int]]:
     """Split ordered clusters at transition edges that are too weak for video cuts.
 
     This is a final safety gate: connected-components can still keep semantic-only
-    links that are visually related but not transition-safe. We keep an edge only if:
-      1) it has geometric evidence + enough overlap/inliers, OR
-      2) it is adjacent in source order and semantic similarity is extremely high.
+    links that are visually related but not transition-safe.
+    By default this service enforces geometry-only transitions for reliability.
     """
     if not ordered_clusters:
         return []
@@ -886,24 +942,60 @@ def enforce_transition_quality(
                 inliers = int(raw_inliers) if raw_inliers is not None else 0
             except (TypeError, ValueError):
                 inliers = 0
+            raw_dx = record.get("direction_dx")
+            raw_dy = record.get("direction_dy")
+            try:
+                direction_dx = float(raw_dx) if raw_dx is not None else None
+                direction_dy = float(raw_dy) if raw_dy is not None else None
+            except (TypeError, ValueError):
+                direction_dx = None
+                direction_dy = None
+            has_direction = (
+                direction_dx is not None
+                and direction_dy is not None
+                and ((direction_dx * direction_dx) + (direction_dy * direction_dy)) > 1e-8
+            )
             pair_source = str(record.get("pair_source") or "")
+            room_left = room_labels[idx_left] if room_labels and idx_left < len(room_labels) else None
+            room_right = room_labels[idx_right] if room_labels and idx_right < len(room_labels) else None
+            both_front_exterior = (
+                room_family(room_left) == "front_exterior"
+                and room_family(room_right) == "front_exterior"
+            )
 
             keep_edge = False
             keep_reason = ""
 
-            if has_geometry and (inliers >= min_inliers or overlap_score >= min_overlap):
-                keep_edge = True
-                keep_reason = "geometry"
-            elif "semantic_recovery" in pair_source:
-                if seq_gap <= max_semantic_gap and semantic_score >= recovery_semantic_trust:
+            if require_geometry:
+                geometry_strong_enough = (
+                    has_geometry
+                    and inliers >= min_inliers
+                    and overlap_score >= min_overlap
+                )
+                direction_ok = (not require_direction) or has_direction
+                if geometry_strong_enough and direction_ok:
                     keep_edge = True
-                    keep_reason = "semantic_recovery"
-            elif seq_gap <= 1 and semantic_score >= adjacent_semantic_trust:
-                keep_edge = True
-                keep_reason = "adjacent_semantic"
-            elif seq_gap <= 2 and semantic_score >= dist2_semantic_trust:
-                keep_edge = True
-                keep_reason = "dist2_semantic"
+                    keep_reason = "geometry_strict"
+            else:
+                if has_geometry and (inliers >= min_inliers or overlap_score >= min_overlap):
+                    keep_edge = True
+                    keep_reason = "geometry"
+                elif "semantic_recovery" in pair_source:
+                    if (
+                        both_front_exterior
+                        and semantic_score >= front_recovery_semantic_trust
+                    ):
+                        keep_edge = True
+                        keep_reason = "front_recovery"
+                    elif seq_gap <= max_semantic_gap and semantic_score >= recovery_semantic_trust:
+                        keep_edge = True
+                        keep_reason = "semantic_recovery"
+                elif seq_gap <= 1 and semantic_score >= adjacent_semantic_trust:
+                    keep_edge = True
+                    keep_reason = "adjacent_semantic"
+                elif seq_gap <= 2 and semantic_score >= dist2_semantic_trust:
+                    keep_edge = True
+                    keep_reason = "dist2_semantic"
 
             if keep_edge:
                 current_chain.append(right_pid)
@@ -923,13 +1015,14 @@ def enforce_transition_quality(
             split_count += 1
             logger.info(
                 "Transition split %s -> %s (overlap=%.3f, inliers=%s, sem=%.3f, "
-                "has_geometry=%s, gap=%s, source=%s)",
+                "has_geometry=%s, has_direction=%s, gap=%s, source=%s)",
                 left_pid,
                 right_pid,
                 overlap_score,
                 inliers,
                 semantic_score,
                 "yes" if has_geometry else "no",
+                "yes" if has_direction else "no",
                 seq_gap,
                 pair_source,
             )
@@ -941,15 +1034,18 @@ def enforce_transition_quality(
 
     logger.info(
         "Transition quality enforcement: %s ordered clusters -> %s refined clusters "
-        "(splits=%s, min_overlap=%.2f, min_inliers=%s, adjacent_sem>=%.2f, dist2_sem>=%.2f, recovery_sem>=%.2f, max_sem_gap=%s)",
+        "(splits=%s, min_overlap=%.2f, min_inliers=%s, strict_geometry=%s, require_direction=%s, adjacent_sem>=%.2f, dist2_sem>=%.2f, recovery_sem>=%.2f, front_recovery_sem>=%.2f, max_sem_gap=%s)",
         len(ordered_clusters),
         len(refined_clusters),
         split_count,
         min_overlap,
         min_inliers,
+        "yes" if require_geometry else "no",
+        "yes" if require_direction else "no",
         adjacent_semantic_trust,
         dist2_semantic_trust,
         recovery_semantic_trust,
+        front_recovery_semantic_trust,
         max_semantic_gap,
     )
 
@@ -1367,7 +1463,7 @@ def cluster_photos_graph_based(
     job_id: int = None,
     room_labels: List[str] = None,
     return_metadata: bool = False,
-) -> List[List[int]] | Tuple[List[List[int]], Dict[str, Dict[int, int]]]:
+) -> List[List[int]] | Tuple[List[List[int]], Dict[str, object]]:
     """Graph-based clustering: semantic proposals + geometric verification.
 
     This is a cleaner architecture than semantic-first clustering:
@@ -1892,6 +1988,7 @@ def cluster_photos_graph_based(
         similarity=similarity,
         edge_has_geometry=edge_has_geometry,
         similarity_records=similarity_records,
+        room_labels=room_labels,
     )
 
     # -------------------------------------------------------------------------
@@ -1902,13 +1999,14 @@ def cluster_photos_graph_based(
     final_clusters = []
     duplicate_of_map: Dict[int, int] = {}
     for cluster in ordered_clusters:
-        # Deduplicate without dropping content: duplicates become singleton clusters.
+        # Deduplicate obvious same-angle shots.
         split_clusters, cluster_duplicate_map = deduplicate_and_split_cluster(
             cluster,
             photo_ids,
             embeddings,
             adjacency,
             max_size=max_cluster_size,
+            keep_duplicate_singletons=KEEP_DUPLICATE_SINGLETON_CLUSTERS,
         )
         final_clusters.extend(split_clusters)
         duplicate_of_map.update(cluster_duplicate_map)
@@ -1918,7 +2016,10 @@ def cluster_photos_graph_based(
         f"(sizes: {[len(c) for c in final_clusters]})"
     )
     if duplicate_of_map:
-        logger.info("Marked %s photos as duplicates (kept as singleton clusters)", len(duplicate_of_map))
+        if KEEP_DUPLICATE_SINGLETON_CLUSTERS:
+            logger.info("Marked %s photos as duplicates (kept as singleton clusters)", len(duplicate_of_map))
+        else:
+            logger.info("Removed %s obvious duplicates from final clustering output", len(duplicate_of_map))
 
     # Save similarity records to database if session provided
     if db_session is not None and job_id is not None and similarity_records:
@@ -2010,7 +2111,10 @@ def cluster_photos_graph_based(
         )
 
     if return_metadata:
-        return final_clusters, {"duplicate_of_map": duplicate_of_map}
+        return final_clusters, {
+            "duplicate_of_map": duplicate_of_map,
+            "duplicates_dropped": not KEEP_DUPLICATE_SINGLETON_CLUSTERS,
+        }
     return final_clusters
 
 
@@ -2026,7 +2130,7 @@ def cluster_photos_optimized(
     job_id: int = None,
     room_labels: List[str] = None,
     return_metadata: bool = False,
-) -> List[List[int]] | Tuple[List[List[int]], Dict[str, Dict[int, int]]]:
+) -> List[List[int]] | Tuple[List[List[int]], Dict[str, object]]:
     """Run optimized graph-based clustering pipeline.
 
     Uses the "propose + verify" pattern:

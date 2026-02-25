@@ -123,6 +123,7 @@ def _cluster_with_learned_matching(
         cluster_id_lists = cluster_result
         metadata = {}
     duplicate_of_map: Dict[int, int] = metadata.get("duplicate_of_map", {})
+    duplicates_dropped = bool(metadata.get("duplicates_dropped", False))
 
     # Mark duplicate metadata on JobPhoto records.
     for photo in photo_map.values():
@@ -134,6 +135,15 @@ def _cluster_with_learned_matching(
             continue
         dup_photo.is_duplicate = True
         dup_photo.duplicate_of_photo_id = canonical_id
+        if duplicates_dropped:
+            # Soft-delete from this job output: keep row for audit/debug, but remove
+            # it from downstream clustering/video generation.
+            dup_photo.exclude = True
+            dup_photo.room_cluster_id = None
+            dup_photo.cluster_order = None
+
+    if duplicates_dropped and duplicate_of_map:
+        logger.info("Excluded %s duplicate photos from downstream generation", len(duplicate_of_map))
 
     raw_cluster_photo_groups = []
     for cluster_ids in cluster_id_lists:

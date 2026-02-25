@@ -42,10 +42,102 @@ app.add_middleware(
 )
 
 
-def _camera_direction_recommendation(dx: float | None, dy: float | None) -> str:
-    """Translate content-shift direction into camera motion recommendation."""
+GEOMETRY_MIN_VERIFIED_INLIERS = 8
+GEOMETRY_MIN_VERIFIED_SCORE = 0.25
+OVERLAP_DIRECTION_COMPONENT_THRESHOLD = 0.2
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _direction_for_order(
+    from_photo_id: int,
+    to_photo_id: int,
+    sim: PhotoSimilarity | SimpleNamespace | None,
+) -> tuple[float | None, float | None]:
+    if sim is None:
+        return None, None
+
+    dx = _safe_float(getattr(sim, "direction_dx", None))
+    dy = _safe_float(getattr(sim, "direction_dy", None))
     if dx is None or dy is None:
-        return "Direction unknown"
+        return None, None
+
+    sim_a = int(getattr(sim, "photo_a_id", min(from_photo_id, to_photo_id)))
+    if from_photo_id != sim_a:
+        return -dx, -dy
+    return dx, dy
+
+
+def _is_geometrically_verified(
+    geometric_inliers: int | None,
+    geometric_score: float | None,
+    dx: float | None,
+    dy: float | None,
+    min_verified_inliers: int = GEOMETRY_MIN_VERIFIED_INLIERS,
+    min_verified_score: float = GEOMETRY_MIN_VERIFIED_SCORE,
+) -> bool:
+    if geometric_inliers is None or geometric_inliers < min_verified_inliers:
+        return False
+    if geometric_score is not None and geometric_score < min_verified_score:
+        return False
+    if dx is None or dy is None:
+        return False
+    return (dx * dx + dy * dy) > 1e-8
+
+
+def _overlap_zones_from_direction(
+    dx: float | None,
+    dy: float | None,
+    threshold: float = OVERLAP_DIRECTION_COMPONENT_THRESHOLD,
+) -> tuple[str | None, str | None]:
+    if dx is None or dy is None:
+        return None, None
+
+    if dx > threshold:
+        from_x, to_x = "left", "right"
+    elif dx < -threshold:
+        from_x, to_x = "right", "left"
+    else:
+        from_x = to_x = "center"
+
+    if dy > threshold:
+        from_y, to_y = "top", "bottom"
+    elif dy < -threshold:
+        from_y, to_y = "bottom", "top"
+    else:
+        from_y = to_y = "center"
+
+    from_zone = f"{from_x}-{from_y}"
+    to_zone = f"{to_x}-{to_y}"
+    return from_zone, to_zone
+
+
+def _camera_direction_recommendation(
+    dx: float | None,
+    dy: float | None,
+    geometric_inliers: int | None = None,
+    min_verified_inliers: int = GEOMETRY_MIN_VERIFIED_INLIERS,
+) -> str:
+    """Translate content-shift direction into camera motion recommendation."""
+    if (
+        geometric_inliers is None
+        or geometric_inliers < min_verified_inliers
+        or dx is None
+        or dy is None
+    ):
+        return "Not geometrically verified"
 
     abs_x = abs(dx)
     abs_y = abs(dy)
@@ -291,6 +383,25 @@ async def get_project_clips(
                 to_photo = photo_map.get(to_photo_id)
                 sim_key = (min(from_photo_id, to_photo_id), max(from_photo_id, to_photo_id))
                 sim = sim_lookup.get(sim_key)
+                ordered_dx, ordered_dy = _direction_for_order(from_photo_id, to_photo_id, sim)
+                inliers = _safe_int(sim.geometric_inliers if sim else None)
+                geo_score = _safe_float(sim.geometric_score if sim else None)
+                geometric_verified = _is_geometrically_verified(
+                    geometric_inliers=inliers,
+                    geometric_score=geo_score,
+                    dx=ordered_dx,
+                    dy=ordered_dy,
+                )
+                overlap_from_zone, overlap_to_zone = _overlap_zones_from_direction(
+                    ordered_dx if geometric_verified else None,
+                    ordered_dy if geometric_verified else None,
+                )
+                overlap_summary = None
+                if overlap_from_zone and overlap_to_zone:
+                    overlap_summary = (
+                        f"#{from_photo_id} {overlap_from_zone} overlaps with "
+                        f"#{to_photo_id} {overlap_to_zone}"
+                    )
 
                 transition_steps.append(
                     ClipTransitionStep(
@@ -299,16 +410,21 @@ async def get_project_clips(
                         from_filename=from_photo.filename if from_photo else None,
                         to_filename=to_photo.filename if to_photo else None,
                         dinov2_similarity=sim.dinov2_similarity if sim else None,
-                        geometric_inliers=sim.geometric_inliers if sim else None,
-                        geometric_score=sim.geometric_score if sim else None,
-                        direction_dx=sim.direction_dx if sim else None,
-                        direction_dy=sim.direction_dy if sim else None,
+                        geometric_inliers=inliers,
+                        geometric_score=geo_score,
+                        direction_dx=ordered_dx,
+                        direction_dy=ordered_dy,
                         recommendation=_camera_direction_recommendation(
-                            sim.direction_dx if sim else None,
-                            sim.direction_dy if sim else None,
+                            ordered_dx,
+                            ordered_dy,
+                            inliers,
                         ),
                         pair_source=sim.pair_source if sim else None,
                         is_connected=bool(sim.is_connected) if sim else False,
+                        geometric_verified=geometric_verified,
+                        overlap_from_zone=overlap_from_zone,
+                        overlap_to_zone=overlap_to_zone,
+                        overlap_summary=overlap_summary,
                     )
                 )
 
@@ -490,6 +606,26 @@ async def get_project_clusters_debug(
                 key = (min(photo_id, other_id), max(photo_id, other_id))
                 sim = sim_lookup.get(key)
                 if sim:
+                    sim_dx = _safe_float(sim.direction_dx)
+                    sim_dy = _safe_float(sim.direction_dy)
+                    sim_inliers = _safe_int(sim.geometric_inliers)
+                    sim_geo_score = _safe_float(sim.geometric_score)
+                    sim_verified = _is_geometrically_verified(
+                        geometric_inliers=sim_inliers,
+                        geometric_score=sim_geo_score,
+                        dx=sim_dx,
+                        dy=sim_dy,
+                    )
+                    sim_overlap_from_zone, sim_overlap_to_zone = _overlap_zones_from_direction(
+                        sim_dx if sim_verified else None,
+                        sim_dy if sim_verified else None,
+                    )
+                    sim_overlap_summary = None
+                    if sim_overlap_from_zone and sim_overlap_to_zone:
+                        sim_overlap_summary = (
+                            f"#{sim.photo_a_id} {sim_overlap_from_zone} overlaps with "
+                            f"#{sim.photo_b_id} {sim_overlap_to_zone}"
+                        )
                     photo_sims.append(PhotoSimilarityInfo(
                         photo_a_id=sim.photo_a_id,
                         photo_b_id=sim.photo_b_id,
@@ -498,11 +634,15 @@ async def get_project_clusters_debug(
                         pair_source=sim.pair_source,
                         dinov2_similarity=sim.dinov2_similarity,
                         geometric_matches=sim.geometric_matches,
-                        geometric_inliers=sim.geometric_inliers,
-                        geometric_score=sim.geometric_score,
-                        direction_dx=sim.direction_dx,
-                        direction_dy=sim.direction_dy,
+                        geometric_inliers=sim_inliers,
+                        geometric_score=sim_geo_score,
+                        direction_dx=sim_dx,
+                        direction_dy=sim_dy,
                         is_connected=bool(sim.is_connected),
+                        geometric_verified=sim_verified,
+                        overlap_from_zone=sim_overlap_from_zone,
+                        overlap_to_zone=sim_overlap_to_zone,
+                        overlap_summary=sim_overlap_summary,
                     ))
                     all_similarities.append(sim)
 

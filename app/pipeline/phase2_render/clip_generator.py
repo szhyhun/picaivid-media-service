@@ -10,6 +10,7 @@ from typing import List, Optional
 import imageio
 import numpy as np
 from PIL import Image
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db.models import Job, JobPhoto, RoomCluster, AnalysisResult, Clip
@@ -69,6 +70,13 @@ def generate_clip_for_cluster(
         prompt = analysis.prompt_template or _get_default_prompt(
             analysis.recommended_motion, cluster.room_type
         )
+        direction_guidance = _build_direction_prompt_guidance(
+            db=db,
+            job_id=job.id,
+            ordered_photo_ids=[p.id for p in photos],
+        )
+        if direction_guidance:
+            prompt = f"{prompt}\n\n{direction_guidance}"
         cfg_scale = analysis.cfg_scale or 4.0
         inference_steps = analysis.inference_steps or 20
 
@@ -245,6 +253,127 @@ No warping.
 No morphing.
 No flicker.
 Photorealistic."""
+
+
+def _camera_direction_recommendation(
+    dx: float | None,
+    dy: float | None,
+    geometric_inliers: int | None = None,
+    min_verified_inliers: int = 8,
+) -> str:
+    """Translate content-shift direction into camera motion recommendation."""
+    if (
+        geometric_inliers is None
+        or geometric_inliers < min_verified_inliers
+        or dx is None
+        or dy is None
+    ):
+        return "Not geometrically verified"
+
+    abs_x = abs(dx)
+    abs_y = abs(dy)
+    if abs_x < 0.15 and abs_y < 0.15:
+        return "Hold / very subtle move"
+
+    # Direction vector is content shift; camera motion is opposite.
+    if abs_x >= abs_y:
+        return "Move camera left" if dx > 0 else "Move camera right"
+    return "Move camera up" if dy > 0 else "Move camera down"
+
+
+def _build_direction_prompt_guidance(
+    db: Session,
+    job_id: int,
+    ordered_photo_ids: List[int],
+) -> str:
+    """Build prompt guidance from transition direction metrics by photo IDs."""
+    if len(ordered_photo_ids) < 2:
+        return ""
+
+    # Some environments may not have direction columns migrated yet.
+    supports_direction = False
+    try:
+        col_rows = db.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'photo_similarities'
+                  AND table_schema = current_schema()
+                """
+            )
+        ).fetchall()
+        available_cols = {str(row[0]) for row in col_rows}
+        supports_direction = {
+            "direction_dx",
+            "direction_dy",
+        }.issubset(available_cols)
+    except Exception as err:
+        logger.warning("Could not inspect photo_similarities schema for prompt guidance: %s", err)
+
+    if not supports_direction:
+        return ""
+
+    lines = []
+    for idx in range(len(ordered_photo_ids) - 1):
+        from_id = int(ordered_photo_ids[idx])
+        to_id = int(ordered_photo_ids[idx + 1])
+        photo_a = min(from_id, to_id)
+        photo_b = max(from_id, to_id)
+
+        row = db.execute(
+            text(
+                """
+                SELECT
+                    direction_dx,
+                    direction_dy,
+                    dinov2_similarity,
+                    geometric_inliers
+                FROM photo_similarities
+                WHERE job_id = :job_id
+                  AND photo_a_id = :photo_a_id
+                  AND photo_b_id = :photo_b_id
+                LIMIT 1
+                """
+            ),
+            {
+                "job_id": int(job_id),
+                "photo_a_id": photo_a,
+                "photo_b_id": photo_b,
+            },
+        ).fetchone()
+
+        if row is None:
+            lines.append(f"{from_id} -> {to_id}: keep smooth consistent transition.")
+            continue
+
+        dx = row[0]
+        dy = row[1]
+
+        # Direction in DB is stored for photo_a -> photo_b; flip when traversing opposite.
+        if from_id != photo_a and dx is not None and dy is not None:
+            dx = -float(dx)
+            dy = -float(dy)
+        elif dx is not None and dy is not None:
+            dx = float(dx)
+            dy = float(dy)
+
+        rec = _camera_direction_recommendation(dx, dy, int(inliers) if inliers is not None else None)
+        sem = row[2]
+        inliers = row[3]
+        sem_txt = f"{float(sem):.3f}" if sem is not None else "N/A"
+        inliers_txt = str(int(inliers)) if inliers is not None else "N/A"
+        lines.append(f"{from_id} -> {to_id}: {rec} (sem={sem_txt}, inliers={inliers_txt}).")
+
+    if not lines:
+        return ""
+
+    guidance = [
+        "Camera path guidance by photo ID:",
+        *[f"- {line}" for line in lines],
+        "Keep geometry, layout, and lighting consistent across these transitions.",
+    ]
+    return "\n".join(guidance)
 
 
 def _get_model_name(analysis: AnalysisResult, is_mock: bool) -> str:

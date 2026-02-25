@@ -93,6 +93,33 @@ def test_dedup_singleton_cluster() -> None:
     assert [2] in clusters, f"Expected duplicate singleton [2], got {clusters}"
 
 
+def test_dedup_drop_duplicates() -> None:
+    photo_ids = [1, 2, 3]
+    cluster_ids = [1, 2, 3]
+    embeddings = np.array(
+        [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+    adjacency = np.zeros((3, 3), dtype=np.float32)
+
+    clusters, duplicate_of = deduplicate_and_split_cluster(
+        cluster_ids,
+        photo_ids,
+        embeddings,
+        adjacency,
+        max_size=3,
+        keep_duplicate_singletons=False,
+    )
+
+    assert duplicate_of == {2: 1}, f"Expected duplicate map {{2: 1}}, got {duplicate_of}"
+    assert clusters == [[1, 3]], f"Expected dropped duplicate output [[1, 3]], got {clusters}"
+
+
 def test_transition_quality_splits_weak_semantic_chain() -> None:
     photo_ids = [2094, 2095, 2096, 2097, 2098, 2099]
     ordered_clusters = [[2095, 2094, 2099]]
@@ -162,6 +189,7 @@ if __name__ == "__main__":
     test_story_ordering()
     test_opposite_side_preference()
     test_dedup_singleton_cluster()
+    test_dedup_drop_duplicates()
     test_transition_quality_splits_weak_semantic_chain()
     test_transition_quality_keeps_geometric_chain()
     print("All unit checks passed")

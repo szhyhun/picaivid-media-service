@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
 
+    # Clustering behavior
+    DELETE_OBVIOUS_DUPLICATES: bool = True
+    REQUIRE_GEOMETRIC_TRANSITIONS: bool = False
+    REQUIRE_DIRECTION_FOR_TRANSITIONS: bool = False
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

@@ -51,6 +51,10 @@ class ClipTransitionStep(BaseModel):
     recommendation: Optional[str] = None
     pair_source: Optional[str] = None
     is_connected: bool = False
+    geometric_verified: bool = False
+    overlap_from_zone: Optional[str] = None
+    overlap_to_zone: Optional[str] = None
+    overlap_summary: Optional[str] = None
 
 
 class AnalysisInfo(BaseModel):
@@ -113,6 +117,10 @@ class PhotoSimilarityInfo(BaseModel):
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
     is_connected: bool = False
+    geometric_verified: bool = False
+    overlap_from_zone: Optional[str] = None
+    overlap_to_zone: Optional[str] = None
+    overlap_summary: Optional[str] = None
 
 
 class PhotoDebugInfo(BaseModel):

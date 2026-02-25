@@ -150,6 +150,16 @@ EXPECTED_DIFFERENT_CLUSTERS_SET7 = [
     ([2099], [2094, 2095]),       # 2099 is opposite patio side and should not chain with 2094/2095
 ]
 
+# -----------------------------------------------------------------------------
+# TEST SET 8: Listing 2428-2432 (latest duplicate review)
+# -----------------------------------------------------------------------------
+EXPECTED_SAME_CLUSTER_SET8 = []
+EXPECTED_DIFFERENT_CLUSTERS_SET8 = []
+EXPECTED_DUPLICATE_PAIRS_SET8 = [
+    (2428, 2431),
+    (2429, 2432),
+]
+
 
 def check_same_cluster(photo_ids: list, clusters: list) -> tuple:
     """Check if all photo_ids are in the same cluster.
@@ -267,7 +277,17 @@ def check_sequence(expected_sequence: list, clusters: list) -> tuple:
     return False, f"Photos in different clusters: {photo_clusters}"
 
 
-def run_test_set(db, s3_client, test_ids, same_cluster_tests, different_cluster_tests, order_tests=None, sequence_tests=None, set_name=""):
+def run_test_set(
+    db,
+    s3_client,
+    test_ids,
+    same_cluster_tests,
+    different_cluster_tests,
+    order_tests=None,
+    sequence_tests=None,
+    duplicate_pairs=None,
+    set_name="",
+):
     """Run a single test set and return results."""
 
     # Find job with most matching photos
@@ -416,6 +436,19 @@ def run_test_set(db, s3_client, test_ids, same_cluster_tests, different_cluster_
             if not success:
                 all_passed = False
 
+    if duplicate_pairs:
+        print("\n  DUPLICATE PAIR TESTS:")
+        photos_in_clusters = {pid for cluster in cluster_lists for pid in cluster}
+        for a, b in duplicate_pairs:
+            a_present = a in photos_in_clusters
+            b_present = b in photos_in_clusters
+            success = not (a_present and b_present)
+            status = "✓" if success else "✗"
+            present_text = f"{a}: {'in' if a_present else 'out'}, {b}: {'in' if b_present else 'out'}"
+            print(f"    {status} [{a}, {b}] dedupe: {present_text}")
+            if not success:
+                all_passed = False
+
     return all_passed
 
 
@@ -423,8 +456,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Test clustering against expected photo groupings')
     parser.add_argument('--job-id', type=int, help='Job ID to test (default: auto-detect)')
-    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', '4', '5', '6', '7', 'all'], default='all',
-                       help='Test set: 1=original, 2=861-912, 3=805-815, 4=1633-1677, 5=1600-1606, 6=1929-1988, 7=2094-2099, all=run all')
+    parser.add_argument('--test-set', type=str, choices=['1', '2', '3', '4', '5', '6', '7', '8', 'all'], default='all',
+                       help='Test set: 1=original, 2=861-912, 3=805-815, 4=1633-1677, 5=1600-1606, 6=1929-1988, 7=2094-2099, 8=2428-2432 duplicates, all=run all')
     parser.add_argument('--list-jobs', action='store_true', help='List available jobs with photo counts')
     args = parser.parse_args()
 
@@ -605,6 +638,27 @@ def main():
                              set_name="Set 7")
         if result is not None:
             results.append(("Set 7: 2094-2099", result))
+
+    # Test Set 8: Listing 2428-2432 (duplicate review)
+    if args.test_set in ['8', 'all']:
+        print("\n" + "="*70)
+        print("TEST SET 8: Listing 2428-2432 (duplicate review)")
+        print("="*70)
+
+        test_ids = {2428, 2429, 2430, 2431, 2432}
+        result = run_test_set(
+            db,
+            s3_client,
+            test_ids,
+            EXPECTED_SAME_CLUSTER_SET8,
+            EXPECTED_DIFFERENT_CLUSTERS_SET8,
+            order_tests=None,
+            sequence_tests=None,
+            duplicate_pairs=EXPECTED_DUPLICATE_PAIRS_SET8,
+            set_name="Set 8",
+        )
+        if result is not None:
+            results.append(("Set 8: 2428-2432", result))
 
     # Summary
     print("\n" + "="*70)
