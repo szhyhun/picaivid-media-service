@@ -1,36 +1,41 @@
-# Virtual Listing Studio - Media Service
+# Picaivid Media Service
 
-Python FastAPI service for AI and media processing.
+FastAPI + worker service for photo analysis, clustering, transition scoring, and video clip generation.
 
 ## Quick Start
 
 ```bash
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Copy environment variables
 cp .env.example .env
-
-# Run development server
 uvicorn app.main:app --reload --port 8000
 ```
 
-Visit http://localhost:8000
+Worker (separate terminal):
 
-## Documentation
+```bash
+source venv/bin/activate
+python -m app.worker
+```
 
-- [AGENTS.md](./AGENTS.md) - Agent contribution guidelines
-- [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) - Implementation roadmap
-- [INITIAL_STRUCTURE.md](./INITIAL_STRUCTURE.md) - Project structure guide
+## Local Dependencies
 
-## Health Check
+This service expects local infrastructure from `picaivid-rails/docker-compose.yml`:
+- PostgreSQL
+- LocalStack (SQS)
+- MinIO (S3-compatible storage)
 
-http://localhost:8000/health
+## Endpoints
 
-## API Documentation
+- Health: `http://localhost:8000/health`
+- OpenAPI docs: `http://localhost:8000/docs`
 
-http://localhost:8000/docs (when running)
+## Core Docs
+
+- `AGENTS.md` - Coding and ownership rules for this repo
+- `docs/DEVELOPMENT.md` - Day-to-day local workflow
+- `docs/ARCHITECTURE.md` - Runtime architecture and ownership boundaries
+- `docs/CLUSTERING.md` - Current clustering and geometry behavior
+- `docs/AWS_SETUP.md` - Minimal AWS deployment setup
+- `scripts/baselines/README.md` - Clustering baseline regression checks
