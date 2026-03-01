@@ -1,7 +1,6 @@
 """FastAPI application for Picaivid Media Service."""
 from datetime import datetime
 import logging
-import os
 from types import SimpleNamespace
 import numpy as np
 
@@ -716,7 +715,6 @@ async def debug_pair_geometry(
         )
     except Exception as err:
         message = str(err)
-        lower = message.lower()
         logger.exception(
             "Pair debug matcher failure (project=%s, job=%s, left_photo_id=%s, right_photo_id=%s, matcher=%s): %s",
             project_id,
@@ -726,67 +724,6 @@ async def debug_pair_geometry(
             payload.matcher,
             message,
         )
-        if payload.matcher in {
-            "loftr_zju_indoor_native",
-            "loftr_zju_legacy_native",
-            "loftr_zju_indoor_ds_native",
-            "loftr_zju_indoor_ot_native",
-            "loftr_zju_outdoor_ds_native",
-            "loftr_zju_outdoor_ot_native",
-        } and (
-            "zju loftr is not configured" in lower
-            or "loftr_zju_repo_dir" in lower
-            or "loftr_zju_indoor_ckpt" in lower
-            or "does not exist" in lower
-            or "failed to import zju loftr" in lower
-            or "checkpoint not found" in lower
-            or "requires repo-based loader" in lower
-            or "fallback to kornia checkpoint loader is disabled" in lower
-            or "model id not found" in lower
-            or "legacy model id not found" in lower
-        ):
-            matcher_to_env_keys = {
-                "loftr_zju_indoor_native": ["LOFTR_ZJU_INDOOR_DS_CKPT"],
-                "loftr_zju_legacy_native": ["LOFTR_ZJU_INDOOR_CKPT"],
-                "loftr_zju_indoor_ds_native": ["LOFTR_ZJU_INDOOR_DS_CKPT"],
-                "loftr_zju_indoor_ot_native": [
-                    "LOFTR_ZJU_INDOOR_OT_CKPT",
-                ],
-                "loftr_zju_outdoor_ds_native": ["LOFTR_ZJU_OUTDOOR_DS_CKPT"],
-                "loftr_zju_outdoor_ot_native": ["LOFTR_ZJU_OUTDOOR_OT_CKPT"],
-            }
-            repo_cfg = settings.LOFTR_ZJU_REPO_DIR
-            expected_env_keys = matcher_to_env_keys.get(payload.matcher or "", [])
-            expected_ckpts = [getattr(settings, key, None) for key in expected_env_keys]
-            repo_cfg_exists = bool(repo_cfg and os.path.isdir(os.path.expanduser(repo_cfg)))
-            ckpt_cfg_exists = any(
-                bool(path and os.path.isfile(os.path.expanduser(path)))
-                for path in expected_ckpts
-            )
-            repo_env = os.getenv("LOFTR_ZJU_REPO_DIR")
-            logger.error(
-                "ZJU strict matcher configuration error: matcher=%s, repo=%r exists=%s, expected_env_keys=%s, expected_ckpt_values=%r exists_any=%s, root_error=%s",
-                payload.matcher,
-                repo_cfg,
-                repo_cfg_exists,
-                expected_env_keys,
-                expected_ckpts,
-                ckpt_cfg_exists,
-                message,
-            )
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"ZJU LoFTR matcher '{payload.matcher}' requires a valid checkpoint. "
-                    "Strict mode: no fallback is allowed. "
-                    "Set LOFTR_ZJU_REPO_DIR plus exact variant checkpoint env var. "
-                    f"Root error: {message}. "
-                    f"Runtime values: settings.repo={repo_cfg!r} exists={repo_cfg_exists}, "
-                    f"expected_env_keys={expected_env_keys}, "
-                    f"expected_ckpt_values={expected_ckpts!r} exists_any={ckpt_cfg_exists}, "
-                    f"env.repo={repo_env!r}."
-                ),
-            ) from err
         raise HTTPException(status_code=500, detail=f"Pair debug matcher failed: {err}") from err
     if not isinstance(diagnostics, dict):
         diagnostics = {}

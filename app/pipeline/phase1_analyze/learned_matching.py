@@ -4012,232 +4012,29 @@ def match_image_pair(
     matcher_preference = str(options.get("matcher", "current")).strip().lower()
     if matcher_preference in {"", "current", "default"}:
         matcher_preference = DEFAULT_PRODUCTION_MATCHER
-    loftr_input_size = DEFAULT_LOFTR_INPUT_SIZE
-    confidence_thresholds = LOFTR_CONFIDENCE_LEVELS
-    has_custom_thresholds = False
-    reproj_threshold = RANSAC_REPROJ_THRESHOLD
-    enable_outdoor_fallback = True
 
-    raw_input_size = options.get("loftr_input_size")
-    if isinstance(raw_input_size, (list, tuple)) and len(raw_input_size) == 2:
-        try:
-            parsed_w = int(raw_input_size[0])
-            parsed_h = int(raw_input_size[1])
-            if parsed_w > 0 and parsed_h > 0:
-                loftr_input_size = (parsed_w, parsed_h)
-        except (TypeError, ValueError):
-            pass
-
-    raw_thresholds = options.get("confidence_thresholds")
-    if isinstance(raw_thresholds, (list, tuple)) and raw_thresholds:
-        parsed_thresholds = []
-        for value in raw_thresholds:
-            try:
-                parsed_thresholds.append(float(value))
-            except (TypeError, ValueError):
-                continue
-        parsed_thresholds = sorted({v for v in parsed_thresholds if 0.0 <= v <= 1.0}, reverse=True)
-        if parsed_thresholds:
-            confidence_thresholds = tuple(parsed_thresholds)
-            has_custom_thresholds = True
-
-    raw_reproj = options.get("reproj_threshold")
-    try:
-        if raw_reproj is not None:
-            parsed_reproj = float(raw_reproj)
-            if parsed_reproj > 0:
-                reproj_threshold = parsed_reproj
-    except (TypeError, ValueError):
-        pass
-
-    raw_outdoor = options.get("enable_outdoor_fallback")
-    if isinstance(raw_outdoor, bool):
-        enable_outdoor_fallback = raw_outdoor
-
-    if matcher_preference == "efficient_hf":
-        return _match_efficient_loftr_hf_native(
-            img1=img1,
-            img2=img2,
-            threshold=0.2,
+    allowed_matchers = {"loftr_kornia_indoor_native"}
+    if matcher_preference not in allowed_matchers:
+        raise ValueError(
+            f"Unsupported matcher '{matcher_preference}'. "
+            "Only 'loftr_kornia_indoor_native' is enabled."
         )
 
-    if matcher_preference in {"loftr_zju_indoor_native", "loftr_zju_indoor_ds_native"}:
-        result = _match_loftr_zju_indoor_native(
-            img1=img1,
-            img2=img2,
-            confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-        )
-        result = _maybe_retry_reverse_native(
-            img1=img1,
-            img2=img2,
-            forward_result=result,
-            run_fn=_match_loftr_zju_indoor_native,
-            run_kwargs={"confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
-        )
-        if return_diagnostics:
-            return result
-        return result[0], result[1], result[2], result[3]
-
-    if matcher_preference == "loftr_zju_legacy_native":
-        result = _match_loftr_zju_legacy_native(
-            img1=img1,
-            img2=img2,
-            confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-        )
-        result = _maybe_retry_reverse_native(
-            img1=img1,
-            img2=img2,
-            forward_result=result,
-            run_fn=_match_loftr_zju_legacy_native,
-            run_kwargs={"confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
-        )
-        if return_diagnostics:
-            return result
-        return result[0], result[1], result[2], result[3]
-
-    if matcher_preference == "loftr_zju_indoor_ot_native":
-        result = _match_loftr_zju_variant_native(
-            img1=img1,
-            img2=img2,
-            variant="indoor_ot",
-            confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-        )
-        result = _maybe_retry_reverse_native(
-            img1=img1,
-            img2=img2,
-            forward_result=result,
-            run_fn=_match_loftr_zju_variant_native,
-            run_kwargs={
-                "variant": "indoor_ot",
-                "confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-            },
-        )
-        if return_diagnostics:
-            return result
-        return result[0], result[1], result[2], result[3]
-
-    if matcher_preference == "loftr_zju_outdoor_ds_native":
-        result = _match_loftr_zju_variant_native(
-            img1=img1,
-            img2=img2,
-            variant="outdoor_ds",
-            confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-        )
-        result = _maybe_retry_reverse_native(
-            img1=img1,
-            img2=img2,
-            forward_result=result,
-            run_fn=_match_loftr_zju_variant_native,
-            run_kwargs={
-                "variant": "outdoor_ds",
-                "confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-            },
-        )
-        if return_diagnostics:
-            return result
-        return result[0], result[1], result[2], result[3]
-
-    if matcher_preference == "loftr_zju_outdoor_ot_native":
-        result = _match_loftr_zju_variant_native(
-            img1=img1,
-            img2=img2,
-            variant="outdoor_ot",
-            confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-        )
-        result = _maybe_retry_reverse_native(
-            img1=img1,
-            img2=img2,
-            forward_result=result,
-            run_fn=_match_loftr_zju_variant_native,
-            run_kwargs={
-                "variant": "outdoor_ot",
-                "confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-            },
-        )
-        if return_diagnostics:
-            return result
-        return result[0], result[1], result[2], result[3]
-
-    if matcher_preference == "loftr_kornia_indoor_native":
-        result = _match_loftr_kornia_indoor_native(
-            img1=img1,
-            img2=img2,
-            confidence_threshold=LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
-        )
-        result = _maybe_retry_reverse_native(
-            img1=img1,
-            img2=img2,
-            forward_result=result,
-            run_fn=_match_loftr_kornia_indoor_native,
-            run_kwargs={"confidence_threshold": LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
-        )
-        if return_diagnostics:
-            return result
-        return result[0], result[1], result[2], result[3]
-
-    if matcher_preference == "efficient":
-        efficient_thresholds = confidence_thresholds if has_custom_thresholds else EFFICIENT_LOFTR_CONFIDENCE_LEVELS
-        num_matches, num_inliers, score, direction, diagnostics = _match_efficient_loftr(
-            img1=img1,
-            img2=img2,
-            confidence_thresholds=efficient_thresholds,
-            reproj_threshold=reproj_threshold,
-        )
-        if return_diagnostics:
-            return num_matches, num_inliers, score, direction, diagnostics
-        return num_matches, num_inliers, score, direction
-
-    matcher, matcher_type = _load_matcher()
-
-    # If LoFTR is not available, just use ORB
-    if matcher_type != "loftr" or matcher is None:
-        num_matches, num_inliers, score, direction, diagnostics = _match_orb(
-            img1,
-            img2,
-            reproj_threshold=reproj_threshold,
-        )
-        if return_diagnostics:
-            return num_matches, num_inliers, score, direction, diagnostics
-        return num_matches, num_inliers, score, direction
-
-    # ORB pre-filter is disabled by default for consistency.
-    # It can produce unstable errors and false positives on repetitive textures.
-    if use_orb_prefilter:
-        orb_matches, orb_inliers, orb_score, orb_direction, orb_diag = _match_orb(
-            img1,
-            img2,
-            reproj_threshold=reproj_threshold,
-        )
-
-        # Definitely no overlap - skip LoFTR
-        if orb_inliers <= ORB_QUICK_REJECT_INLIERS:
-            logger.debug(f"ORB pre-filter: {orb_inliers} inliers ≤ {ORB_QUICK_REJECT_INLIERS} → skip LoFTR")
-            if return_diagnostics:
-                return orb_matches, orb_inliers, orb_score, orb_direction, orb_diag
-            return orb_matches, orb_inliers, orb_score, orb_direction
-
-        # Definitely overlap - use ORB result (skip expensive LoFTR)
-        if orb_inliers >= ORB_QUICK_ACCEPT_INLIERS:
-            logger.debug(f"ORB pre-filter: {orb_inliers} inliers ≥ {ORB_QUICK_ACCEPT_INLIERS} → use ORB")
-            if return_diagnostics:
-                return orb_matches, orb_inliers, orb_score, orb_direction, orb_diag
-            return orb_matches, orb_inliers, orb_score, orb_direction
-
-        # Ambiguous case - need LoFTR for accuracy
-        logger.debug(f"ORB pre-filter: {orb_inliers} inliers → ambiguous, running LoFTR")
-
-    num_matches, num_inliers, score, direction, diagnostics = _match_loftr(
-        matcher,
-        img1,
-        img2,
-        input_size=loftr_input_size,
-        confidence_thresholds=confidence_thresholds,
-        reproj_threshold=reproj_threshold,
-        enable_outdoor_fallback=enable_outdoor_fallback,
+    result = _match_loftr_kornia_indoor_native(
+        img1=img1,
+        img2=img2,
+        confidence_threshold=LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+    )
+    result = _maybe_retry_reverse_native(
+        img1=img1,
+        img2=img2,
+        forward_result=result,
+        run_fn=_match_loftr_kornia_indoor_native,
+        run_kwargs={"confidence_threshold": LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
     )
     if return_diagnostics:
-        return num_matches, num_inliers, score, direction, diagnostics
-    return num_matches, num_inliers, score, direction
+        return result
+    return result[0], result[1], result[2], result[3]
 
 
 def _match_loftr(

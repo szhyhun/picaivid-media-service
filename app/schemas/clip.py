@@ -193,14 +193,6 @@ class PairDebugRequest(BaseModel):
     sample_limit: int = 250
     matcher: Literal[
         "current",
-        "efficient",
-        "efficient_hf",
-        "loftr_zju_indoor_native",
-        "loftr_zju_legacy_native",
-        "loftr_zju_indoor_ds_native",
-        "loftr_zju_indoor_ot_native",
-        "loftr_zju_outdoor_ds_native",
-        "loftr_zju_outdoor_ot_native",
         "loftr_kornia_indoor_native",
     ] = "current"
 
