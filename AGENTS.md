@@ -13,6 +13,7 @@ It does **not** own product/business logic, auth, billing, or user-facing API co
 ## Current Production Direction
 
 - Primary matcher path is `loftr_kornia_indoor_native`.
+- Reverse-direction LoFTR retry (`_maybe_retry_reverse_native`) is intentional and required; treat it as non-regression and do not remove/disable it unless explicitly requested by the user.
 - Cluster membership is geometry-first and strict-gated.
 - Pair debug is matcher-limited (Kornia native path).
 - Rails remains the orchestration and user-facing system of record.

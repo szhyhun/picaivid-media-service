@@ -1,6 +1,6 @@
 """Photo quality scoring for Phase 1."""
 import logging
-from typing import List
+from typing import Dict, List, Optional
 
 import numpy as np
 from PIL import Image
@@ -11,7 +11,10 @@ from app.services.storage.s3_client import s3_client
 logger = logging.getLogger(__name__)
 
 
-def compute_photo_scores(photos: List[JobPhoto]) -> None:
+def compute_photo_scores(
+    photos: List[JobPhoto],
+    image_cache: Optional[Dict[int, Image.Image]] = None,
+) -> None:
     """Compute quality scores for all photos.
 
     Scores are based on:
@@ -26,7 +29,11 @@ def compute_photo_scores(photos: List[JobPhoto]) -> None:
 
     for photo in photos:
         try:
-            image = s3_client.download_image(photo.s3_uri)
+            image = image_cache.get(photo.id) if image_cache is not None else None
+            if image is None:
+                image = s3_client.download_image(photo.s3_uri)
+                if image_cache is not None:
+                    image_cache[photo.id] = image
             _score_photo(photo, image)
         except Exception as e:
             logger.warning(f"Failed to score photo {photo.id}: {e}")

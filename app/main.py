@@ -711,7 +711,11 @@ async def debug_pair_geometry(
             left_image,
             right_image,
             return_diagnostics=True,
-            debug_options={"matcher": payload.matcher},
+            debug_options={
+                "matcher": payload.matcher,
+                "confidence_threshold": payload.confidence_threshold,
+                "full_diagnostics": True,
+            },
         )
     except Exception as err:
         message = str(err)

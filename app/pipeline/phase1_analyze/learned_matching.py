@@ -20,6 +20,7 @@ This keeps 90% of compute small while getting high-quality results.
 import logging
 import io
 import base64
+import time
 from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any
 from collections import defaultdict
 
@@ -56,14 +57,41 @@ def _load_dinov2():
         from transformers import AutoImageProcessor, AutoModel
 
         model_name = "facebook/dinov2-base"
-        _dinov2_transform = AutoImageProcessor.from_pretrained(model_name)
-        _dinov2_model = AutoModel.from_pretrained(model_name)
+        cache_dir = settings.MODEL_CACHE_DIR
+        processor_kwargs: Dict[str, Any] = {
+            "cache_dir": cache_dir,
+            # Keep preprocessing deterministic across transformers versions.
+            "use_fast": False,
+        }
+        model_kwargs: Dict[str, Any] = {"cache_dir": cache_dir}
+        load_source = "local-cache"
+        try:
+            _dinov2_transform = AutoImageProcessor.from_pretrained(
+                model_name,
+                local_files_only=True,
+                **processor_kwargs,
+            )
+            _dinov2_model = AutoModel.from_pretrained(
+                model_name,
+                local_files_only=True,
+                **model_kwargs,
+            )
+        except Exception:
+            load_source = "hf-hub"
+            _dinov2_transform = AutoImageProcessor.from_pretrained(
+                model_name,
+                **processor_kwargs,
+            )
+            _dinov2_model = AutoModel.from_pretrained(
+                model_name,
+                **model_kwargs,
+            )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         _dinov2_model = _dinov2_model.to(device)
         _dinov2_model.eval()
 
-        logger.info(f"Loaded DINOv2 model on {device}")
+        logger.info("Loaded DINOv2 model on %s (source=%s, use_fast=False)", device, load_source)
         return _dinov2_model, _dinov2_transform
 
     except Exception as e:
@@ -267,6 +295,8 @@ NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac
 NATIVE_REVERSE_RETRY_ENABLED = True
 NATIVE_REVERSE_RETRY_MATCH_THRESHOLD = 120
 NATIVE_REVERSE_RETRY_INLIER_THRESHOLD = 25
+# Do not run reverse retry if forward geometry score is already acceptable.
+NATIVE_REVERSE_RETRY_SCORE_THRESHOLD = MIN_GEOMETRIC_SCORE_FOR_EDGE
 ENABLE_PHOTOMETRIC_PREFILTER = False
 PHOTOMETRIC_PATCH_RADIUS = 4
 PHOTOMETRIC_MIN_NCC = 0.55
@@ -616,11 +646,14 @@ def _compute_transition_geometry_components(
     segment_scores: Dict[str, float],
     inlier_ratio_zero_point: float = 0.20,
     inlier_ratio_full_point: float = 1.00,
+    inlier_ratio_denominator: int | None = None,
 ) -> Dict[str, float]:
     """Return detailed score components used by transition geometry scoring."""
     if num_matches <= 0 or num_inliers <= 0:
         return {
             "inlier_ratio": 0.0,
+            "inlier_ratio_numerator": 0.0,
+            "inlier_ratio_denominator": 0.0,
             "inlier_ratio_term": 0.0,
             "inlier_volume_bonus": 0.0,
             "spread_area0": 0.0,
@@ -629,10 +662,16 @@ def _compute_transition_geometry_components(
             "segment_strength": 0.0,
             "segment_bonus": 0.0,
             "motion_coherence": 0.0,
+            "motion_unit_mean_dx": 0.0,
+            "motion_unit_mean_dy": 0.0,
+            "motion_valid_count": 0.0,
+            "motion_multiplier": 0.0,
             "final_score": 0.0,
         }
 
-    inlier_ratio = float(num_inliers / max(1, num_matches))
+    ratio_den = int(inlier_ratio_denominator) if inlier_ratio_denominator is not None else int(num_matches)
+    ratio_den = max(1, ratio_den)
+    inlier_ratio = float(num_inliers / ratio_den)
     zero_point = float(np.clip(inlier_ratio_zero_point, 0.0, 0.99))
     full_point = float(np.clip(inlier_ratio_full_point, zero_point + 1e-6, 1.0))
     inlier_ratio_term = float(np.clip((inlier_ratio - zero_point) / (full_point - zero_point), 0.0, 1.0))
@@ -654,21 +693,32 @@ def _compute_transition_geometry_components(
     valid = norms > 1e-6
     if int(valid.sum()) >= 3:
         unit = deltas[valid] / norms[valid][:, None]
-        motion_coherence = float(np.linalg.norm(unit.mean(axis=0)))
+        motion_mean = unit.mean(axis=0)
+        motion_mean_dx = float(motion_mean[0])
+        motion_mean_dy = float(motion_mean[1])
+        motion_coherence = float(np.linalg.norm(motion_mean))
+        motion_valid_count = int(valid.sum())
     else:
+        motion_mean_dx = 0.0
+        motion_mean_dy = 0.0
         motion_coherence = 0.0
+        motion_valid_count = 0
+
+    motion_multiplier = (0.45 + 0.55 * motion_coherence)
 
     score = (
         inlier_ratio_term
         * (0.45 + 0.55 * inlier_volume_bonus)
         * (0.35 + 0.65 * spread_bonus)
         * (0.40 + 0.60 * segment_bonus)
-        * (0.45 + 0.55 * motion_coherence)
+        * motion_multiplier
     )
     final_score = float(np.clip(score, 0.0, 1.0))
 
     return {
         "inlier_ratio": float(inlier_ratio),
+        "inlier_ratio_numerator": float(num_inliers),
+        "inlier_ratio_denominator": float(ratio_den),
         "inlier_ratio_term": float(inlier_ratio_term),
         "inlier_ratio_zero_point": float(zero_point),
         "inlier_ratio_full_point": float(full_point),
@@ -679,6 +729,10 @@ def _compute_transition_geometry_components(
         "segment_strength": float(transition_segment_strength),
         "segment_bonus": float(segment_bonus),
         "motion_coherence": float(motion_coherence),
+        "motion_unit_mean_dx": float(motion_mean_dx),
+        "motion_unit_mean_dy": float(motion_mean_dy),
+        "motion_valid_count": float(motion_valid_count),
+        "motion_multiplier": float(motion_multiplier),
         "final_score": float(final_score),
     }
 
@@ -847,13 +901,26 @@ def strict_geometry_edge_gate(
         return False
 
     native_scores = diagnostics.get("native_matching_scores")
-    if not isinstance(native_scores, dict):
+    filter_scores = diagnostics.get("filter_scores")
+    score_mean = 0.0
+    score_median = 0.0
+
+    if isinstance(filter_scores, dict):
+        combined = filter_scores.get("combined")
+        if isinstance(combined, dict):
+            score_mean = float(combined.get("removed_score_mean", 0.0) or 0.0)
+            score_median = float(combined.get("removed_score_median", 0.0) or 0.0)
+
+    # Fallback for lightweight diagnostics (or missing filter stats).
+    if score_mean <= 0.0 or score_median <= 0.0:
+        if not isinstance(native_scores, dict):
+            return False
+        score_mean = float(native_scores.get("mean", 0.0) or 0.0)
+        score_median = float(native_scores.get("median", 0.0) or 0.0)
+
+    if score_mean < NATIVE_EDGE_MIN_MEAN:
         return False
-    native_mean = float(native_scores.get("mean", 0.0) or 0.0)
-    native_median = float(native_scores.get("median", 0.0) or 0.0)
-    if native_mean < NATIVE_EDGE_MIN_MEAN:
-        return False
-    if native_median < NATIVE_EDGE_MIN_MEDIAN:
+    if score_median < NATIVE_EDGE_MIN_MEDIAN:
         return False
     return True
 
@@ -2095,7 +2162,9 @@ def _filter_metric(
             "active_total": 0.0,
             "kept_ratio": 0.0,
             "kept_score_mean": 0.0,
+            "kept_score_median": 0.0,
             "removed_score_mean": 0.0,
+            "removed_score_median": 0.0,
             "kept_count_term": 0.0,
             "final_score": 0.0,
         }
@@ -2126,14 +2195,18 @@ def _filter_metric(
             "active_total": 0.0,
             "kept_ratio": 0.0,
             "kept_score_mean": 0.0,
+            "kept_score_median": 0.0,
             "removed_score_mean": 0.0,
+            "removed_score_median": 0.0,
             "kept_count_term": 0.0,
             "final_score": 0.0,
         }
 
     kept_ratio = float(kept_count / max(1, active_total))
     kept_score_mean = float(np.mean(scores[keep_active])) if kept_count > 0 else 0.0
+    kept_score_median = float(np.median(scores[keep_active])) if kept_count > 0 else 0.0
     removed_score_mean = float(np.mean(scores[removed_active])) if removed_count > 0 else 0.0
+    removed_score_median = float(np.median(scores[removed_active])) if removed_count > 0 else 0.0
 
     # Scale count targets by active population so neutral exclusions (e.g. low texture)
     # do not penalize the final score.
@@ -2153,7 +2226,9 @@ def _filter_metric(
         "active_total": float(active_total),
         "kept_ratio": float(kept_ratio),
         "kept_score_mean": float(kept_score_mean),
+        "kept_score_median": float(kept_score_median),
         "removed_score_mean": float(removed_score_mean),
+        "removed_score_median": float(removed_score_median),
         "kept_count_term": float(kept_count_term),
         "final_score": float(final_score),
     }
@@ -2321,19 +2396,16 @@ def _analyze_loftr_match_filters(
         "wall_pair",
     }
     combined_reject = np.zeros((n,), dtype=bool)
-    combined_reject_strict = np.zeros((n,), dtype=bool)
     score_table: Dict[str, Dict[str, float]] = {}
     for key, reject_mask in reject_masks.items():
         single_keep = ~reject_mask
         score_table[key] = _filter_metric(scores, single_keep)
         if key in hard_reject_keys:
             combined_reject |= reject_mask
-        combined_reject_strict |= reject_mask
     combined_base = ~low_texture_pair
     combined_keep = (~combined_reject) & combined_base
     # Combined metric is evaluated only on non-low-texture population.
     score_table["combined"] = _filter_metric(scores, combined_keep, base_mask=combined_base)
-    score_table["combined_strict"] = _filter_metric(scores, ~combined_reject_strict)
 
     return {
         "config": {
@@ -2477,6 +2549,7 @@ def _build_native_loftr_diagnostics(
     image1_gray: np.ndarray,
     image0_rgb: np.ndarray | None = None,
     image1_rgb: np.ndarray | None = None,
+    full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     raw_count = int(len(points0))
     conf_mask = scores >= float(confidence_threshold) if scores.size > 0 else np.zeros((0,), dtype=bool)
@@ -2486,6 +2559,8 @@ def _build_native_loftr_diagnostics(
     kept_count = int(len(conf_points0))
     native_score_summary = _matching_score_summary(conf_scores)
     native_raw_summary = _matching_score_summary(scores)
+    # Always compute filter scores so strict gating can use removed-score stats.
+    # In non-debug flow image*_rgb is None, so only grayscale-based filters are active.
     filter_analysis = _analyze_loftr_match_filters(
         points0=conf_points0,
         points1=conf_points1,
@@ -2500,17 +2575,23 @@ def _build_native_loftr_diagnostics(
         filter_keep_mask = np.ones((kept_count,), dtype=bool)
     filter_combined = filter_analysis.get("scores", {}).get("combined", {})
     filtered_final_score = float(filter_combined.get("final_score", 0.0) or 0.0)
-    filter_match_sets = _build_filter_match_sets(
-        points0=conf_points0,
-        points1=conf_points1,
-        width0=width0,
-        height0=height0,
-        width1=width1,
-        height1=height1,
-        filter_analysis=filter_analysis,
-    )
+    inlier_ratio_denominator = int(round(float(filter_combined.get("active_total", kept_count) or kept_count)))
+    if inlier_ratio_denominator <= 0:
+        inlier_ratio_denominator = int(max(1, kept_count))
     filtered_points0 = conf_points0[filter_keep_mask] if kept_count > 0 else conf_points0
     filtered_points1 = conf_points1[filter_keep_mask] if kept_count > 0 else conf_points1
+    if full_diagnostics:
+        filter_match_sets = _build_filter_match_sets(
+            points0=conf_points0,
+            points1=conf_points1,
+            width0=width0,
+            height0=height0,
+            width1=width1,
+            height1=height1,
+            filter_analysis=filter_analysis,
+        )
+    else:
+        filter_match_sets = {}
 
     inlier_points0 = np.empty((0, 2), dtype=np.float32)
     inlier_points1 = np.empty((0, 2), dtype=np.float32)
@@ -2537,6 +2618,7 @@ def _build_native_loftr_diagnostics(
         segment_scores=segment_scores,
         inlier_ratio_zero_point=0.03,
         inlier_ratio_full_point=0.35,
+        inlier_ratio_denominator=inlier_ratio_denominator,
     )
     geometric_score = 0.0
 
@@ -2572,6 +2654,7 @@ def _build_native_loftr_diagnostics(
                     segment_scores=segment_scores,
                     inlier_ratio_zero_point=0.03,
                     inlier_ratio_full_point=0.35,
+                    inlier_ratio_denominator=inlier_ratio_denominator,
                 )
                 geometric_score = float(score_components.get("final_score", 0.0) or 0.0)
 
@@ -2582,6 +2665,39 @@ def _build_native_loftr_diagnostics(
     score_components = dict(score_components or {})
     score_components["match_count_term"] = float(match_count_term)
     score_components["combined_score"] = float(combined_score)
+
+    if full_diagnostics:
+        raw_matches_payload = _sample_normalized_matches(
+            points0=points0,
+            points1=points1,
+            width0=width0,
+            height0=height0,
+            width1=width1,
+            height1=height1,
+            max_points=5000,
+        )
+        filtered_matches_payload = _sample_normalized_matches(
+            points0=filtered_points0,
+            points1=filtered_points1,
+            width0=width0,
+            height0=height0,
+            width1=width1,
+            height1=height1,
+            max_points=5000,
+        )
+        inlier_matches_payload = _sample_normalized_matches(
+            points0=inlier_points0,
+            points1=inlier_points1,
+            width0=width0,
+            height0=height0,
+            width1=width1,
+            height1=height1,
+            max_points=5000,
+        )
+    else:
+        raw_matches_payload = []
+        filtered_matches_payload = []
+        inlier_matches_payload = []
 
     diagnostics = {
         "matcher": matcher_name,
@@ -2603,6 +2719,7 @@ def _build_native_loftr_diagnostics(
                 "geometric_score": float(geometric_score),
                 "match_count_term": float(match_count_term),
                 "geometry_model": geometry_model,
+                "inlier_ratio_denominator": int(inlier_ratio_denominator),
                 "native_score_mean": float(native_score_summary["mean"]),
                 "native_score_median": float(native_score_summary["median"]),
                 "native_score_p95": float(native_score_summary["p95"]),
@@ -2612,39 +2729,15 @@ def _build_native_loftr_diagnostics(
         "loftr_input_width": int(input_w if input_w is not None else width0),
         "loftr_input_height": int(input_h if input_h is not None else height0),
         "ransac_reproj_threshold": float(RANSAC_REPROJ_THRESHOLD),
-        "raw_matches": _sample_normalized_matches(
-            points0=points0,
-            points1=points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        ),
+        "raw_matches": raw_matches_payload,
         "filtered_match_count": int(len(filtered_points0)),
-        "filtered_matches": _sample_normalized_matches(
-            points0=filtered_points0,
-            points1=filtered_points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        ),
+        "filtered_matches": filtered_matches_payload,
         "filtered_final_score": float(filtered_final_score),
         "filter_config": filter_analysis.get("config", {}),
         "filter_scores": filter_analysis.get("scores", {}),
         "filter_match_sets": filter_match_sets,
         "inlier_match_count": int(num_inliers),
-        "inlier_matches": _sample_normalized_matches(
-            points0=inlier_points0,
-            points1=inlier_points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        ),
+        "inlier_matches": inlier_matches_payload,
         "oracle": {
             "mode": "off",
             "evaluated": False,
@@ -2717,8 +2810,10 @@ def _reorient_reverse_native_diagnostics(diagnostics: Dict[str, Any] | None) -> 
     return out
 
 
-def _should_retry_reverse_native(num_matches: int, num_inliers: int) -> bool:
+def _should_retry_reverse_native(num_matches: int, num_inliers: int, score: float) -> bool:
     if not NATIVE_REVERSE_RETRY_ENABLED:
+        return False
+    if float(score) >= float(NATIVE_REVERSE_RETRY_SCORE_THRESHOLD):
         return False
     return (
         int(num_matches) < int(NATIVE_REVERSE_RETRY_MATCH_THRESHOLD)
@@ -2748,7 +2843,7 @@ def _maybe_retry_reverse_native(
     run_kwargs: Dict[str, Any],
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     num_matches, num_inliers, score, direction, diagnostics = forward_result
-    if not _should_retry_reverse_native(num_matches, num_inliers):
+    if not _should_retry_reverse_native(num_matches, num_inliers, score):
         return forward_result
 
     rev_matches, rev_inliers, rev_score, rev_direction, rev_diag = run_fn(
@@ -2783,6 +2878,7 @@ def _match_loftr_kornia_indoor_native(
     img1: Image.Image,
     img2: Image.Image,
     confidence_threshold: float = LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+    full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     """Native Kornia LoFTR indoor debug path (no custom geometric scoring)."""
     matcher = _load_loftr_checkpoint("indoor")
@@ -2790,14 +2886,24 @@ def _match_loftr_kornia_indoor_native(
 
     img1_gray = np.array(img1.convert("L"), dtype=np.float32) / 255.0
     img2_gray = np.array(img2.convert("L"), dtype=np.float32) / 255.0
-    img1_rgb = np.array(img1.convert("RGB"), dtype=np.uint8)
-    img2_rgb = np.array(img2.convert("RGB"), dtype=np.uint8)
-
     target_long_side = max(64, int(max(DEFAULT_LOFTR_INPUT_SIZE)))
     img1_resized, meta0 = _resize_by_longest_side_and_pad(img1_gray, target_long_side=target_long_side, multiple=8)
     img2_resized, meta1 = _resize_by_longest_side_and_pad(img2_gray, target_long_side=target_long_side, multiple=8)
-    img1_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(img1_rgb, target_long_side=target_long_side, multiple=8)
-    img2_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(img2_rgb, target_long_side=target_long_side, multiple=8)
+    img1_rgb_resized: np.ndarray | None = None
+    img2_rgb_resized: np.ndarray | None = None
+    if full_diagnostics:
+        img1_rgb = np.array(img1.convert("RGB"), dtype=np.uint8)
+        img2_rgb = np.array(img2.convert("RGB"), dtype=np.uint8)
+        img1_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(
+            img1_rgb,
+            target_long_side=target_long_side,
+            multiple=8,
+        )
+        img2_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(
+            img2_rgb,
+            target_long_side=target_long_side,
+            multiple=8,
+        )
 
     tensor1 = torch.from_numpy(img1_resized).unsqueeze(0).unsqueeze(0).to(device)
     tensor2 = torch.from_numpy(img2_resized).unsqueeze(0).unsqueeze(0).to(device)
@@ -2825,6 +2931,7 @@ def _match_loftr_kornia_indoor_native(
         image1_gray=img2_resized,
         image0_rgb=img1_rgb_resized,
         image1_rgb=img2_rgb_resized,
+        full_diagnostics=full_diagnostics,
     )
 
 
@@ -3095,6 +3202,15 @@ def match_image_pair(
     matcher_preference = str(options.get("matcher", "current")).strip().lower()
     if matcher_preference in {"", "current", "default"}:
         matcher_preference = DEFAULT_PRODUCTION_MATCHER
+    full_diagnostics = bool(options.get("full_diagnostics", False))
+    requested_threshold = options.get("confidence_threshold")
+    confidence_threshold = LOFTR_NATIVE_CONFIDENCE_THRESHOLD
+    if requested_threshold is not None:
+        try:
+            confidence_threshold = float(requested_threshold)
+        except (TypeError, ValueError):
+            confidence_threshold = LOFTR_NATIVE_CONFIDENCE_THRESHOLD
+    confidence_threshold = float(np.clip(confidence_threshold, 0.1, 1.0))
 
     allowed_matchers = {"loftr_kornia_indoor_native"}
     if matcher_preference not in allowed_matchers:
@@ -3106,14 +3222,18 @@ def match_image_pair(
     result = _match_loftr_kornia_indoor_native(
         img1=img1,
         img2=img2,
-        confidence_threshold=LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+        confidence_threshold=confidence_threshold,
+        full_diagnostics=full_diagnostics,
     )
     result = _maybe_retry_reverse_native(
         img1=img1,
         img2=img2,
         forward_result=result,
         run_fn=_match_loftr_kornia_indoor_native,
-        run_kwargs={"confidence_threshold": LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
+        run_kwargs={
+            "confidence_threshold": confidence_threshold,
+            "full_diagnostics": full_diagnostics,
+        },
     )
     if return_diagnostics:
         return result
@@ -3804,6 +3924,9 @@ def cluster_photos_graph_based(
     temporal_matched = 0
     temporal_semantic_only = 0
     temporal_geometric = 0
+    temporal_geo_checks = 0
+    temporal_geo_seconds = 0.0
+    stage2a_started_at = time.perf_counter()
 
     for i, j in sorted(temporal_pairs):
         sem_sim = similarity[i, j]
@@ -3862,11 +3985,14 @@ def cluster_photos_graph_based(
         # - legacy mode: allow semantic-first trust with geometric refinement
         if sem_sim >= TEMPORAL_SEMANTIC_THRESHOLD and not is_cross_room:
             # Still run geometric to get direction for ordering
+            pair_started_at = time.perf_counter()
             num_matches, num_inliers, geo_score, direction, diagnostics = match_image_pair(
                 images[i],
                 images[j],
                 return_diagnostics=True,
             )
+            temporal_geo_checks += 1
+            temporal_geo_seconds += (time.perf_counter() - pair_started_at)
 
             blended_score = None
             if strict_geometry_edge_gate(
@@ -3932,11 +4058,14 @@ def cluster_photos_graph_based(
                 NATIVE_EDGE_MIN_MEDIAN,
                 sorted(NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS),
             )
+            pair_started_at = time.perf_counter()
             num_matches, num_inliers, geo_score, direction, diagnostics = match_image_pair(
                 images[i],
                 images[j],
                 return_diagnostics=True,
             )
+            temporal_geo_checks += 1
+            temporal_geo_seconds += (time.perf_counter() - pair_started_at)
 
             if strict_geometry_edge_gate(
                 num_matches=num_matches,
@@ -4139,6 +4268,15 @@ def cluster_photos_graph_based(
 
     logger.info(f"Stage 2a: {temporal_matched}/{len(temporal_pairs)} temporal pairs matched "
                f"(semantic-only={temporal_semantic_only}, geometric={temporal_geometric})")
+    total_stage2a_seconds = time.perf_counter() - stage2a_started_at
+    avg_geo_ms = (temporal_geo_seconds / temporal_geo_checks * 1000.0) if temporal_geo_checks > 0 else 0.0
+    logger.info(
+        "Stage 2a timing: total=%.2fs, geo_checks=%s, geo_time=%.2fs, avg_geo=%.1fms",
+        total_stage2a_seconds,
+        temporal_geo_checks,
+        temporal_geo_seconds,
+        avg_geo_ms,
+    )
 
     # -------------------------------------------------------------------------
     # Stage 2b: Non-temporal pairs - use GEOMETRIC verification (pixel overlap)

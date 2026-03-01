@@ -10,7 +10,7 @@ while minimizing compute (90% of work is in cheap Stage 1).
 """
 import logging
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
@@ -42,6 +42,7 @@ def cluster_photos_by_room(
     photos: List[JobPhoto],
     s3_client=None,
     use_overlap_detection: bool = True,
+    preloaded_images: Optional[Dict[int, Image.Image]] = None,
 ) -> List[RoomCluster]:
     """Cluster photos by room type with visual overlap detection.
 
@@ -74,7 +75,13 @@ def cluster_photos_by_room(
 
     # Try optimized pipeline (DINOv2 + LightGlue)
     if USE_LEARNED_MATCHING and use_overlap_detection and s3_client:
-        return _cluster_with_learned_matching(db, job, active_photos, s3_client)
+        return _cluster_with_learned_matching(
+            db,
+            job,
+            active_photos,
+            s3_client,
+            preloaded_images=preloaded_images,
+        )
 
     # Fallback to original ORB-based pipeline
     return _cluster_with_orb(db, job, active_photos, s3_client, use_overlap_detection)
@@ -85,6 +92,7 @@ def _cluster_with_learned_matching(
     job: Job,
     photos: List[JobPhoto],
     s3_client,
+    preloaded_images: Optional[Dict[int, Image.Image]] = None,
 ) -> List[RoomCluster]:
     """Cluster using optimized DINOv2 + LightGlue pipeline."""
     logger.info("Using optimized DINOv2 + LightGlue pipeline")
@@ -97,7 +105,11 @@ def _cluster_with_learned_matching(
 
     for photo in photos:
         try:
-            img = s3_client.download_image(photo.s3_uri)
+            img = preloaded_images.get(photo.id) if preloaded_images is not None else None
+            if img is None:
+                img = s3_client.download_image(photo.s3_uri)
+                if preloaded_images is not None:
+                    preloaded_images[photo.id] = img
             img = img.resize((512, 384), Image.Resampling.LANCZOS)
             images.append(img)
             photo_ids.append(photo.id)

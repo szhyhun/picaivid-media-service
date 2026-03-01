@@ -1,9 +1,10 @@
 """Phase 1 Analyzer - Main coordinator for photo analysis and planning."""
 import logging
 import json
-from typing import List
+from typing import Dict, List
 
 from sqlalchemy.orm import Session
+from PIL import Image
 
 from app.db.models import Job, JobPhoto, RoomCluster, PhotoSimilarity
 from app.models.openclip import openclip_model
@@ -70,17 +71,18 @@ class Phase1Analyzer:
             # Step 2: Create JobPhoto records in Python DB
             job_photos = self._create_job_photos(job, rails_photos)
             self.db.commit()
+            image_cache: Dict[int, Image.Image] = {}
 
             # Step 3: Compute embeddings
-            self._compute_embeddings(job_photos)
+            self._compute_embeddings(job_photos, image_cache)
             self.db.commit()
 
             # Step 4: Classify room types
-            self._classify_rooms(job_photos)
+            self._classify_rooms(job_photos, image_cache)
             self.db.commit()
 
             # Step 5: Analyze depth
-            self._analyze_depth(job_photos)
+            self._analyze_depth(job_photos, image_cache)
             self.db.commit()
 
             # Step 5b: Correct common exterior label confusions using
@@ -94,12 +96,16 @@ class Phase1Analyzer:
             self.db.commit()
 
             # Step 6: Compute quality scores
-            compute_photo_scores(job_photos)
+            compute_photo_scores(job_photos, image_cache=image_cache)
             self.db.commit()
 
             # Step 7: Cluster photos by room (with visual overlap detection)
             clusters = cluster_photos_by_room(
-                self.db, job, job_photos, s3_client=s3_client
+                self.db,
+                job,
+                job_photos,
+                s3_client=s3_client,
+                preloaded_images=image_cache,
             )
 
             # Step 7b: Refine interior labels using verified geometric links
@@ -164,7 +170,15 @@ class Phase1Analyzer:
         logger.info(f"Created {len(job_photos)} JobPhoto records")
         return job_photos
 
-    def _compute_embeddings(self, photos: List[JobPhoto]) -> None:
+    def _get_cached_image(self, photo: JobPhoto, image_cache: Dict[int, Image.Image]) -> Image.Image:
+        cached = image_cache.get(photo.id)
+        if cached is not None:
+            return cached
+        image = s3_client.download_image(photo.s3_uri)
+        image_cache[photo.id] = image
+        return image
+
+    def _compute_embeddings(self, photos: List[JobPhoto], image_cache: Dict[int, Image.Image]) -> None:
         """Compute OpenCLIP embeddings for all photos."""
         logger.info("Computing embeddings...")
 
@@ -173,7 +187,7 @@ class Phase1Analyzer:
                 continue
 
             try:
-                image = s3_client.download_image(photo.s3_uri)
+                image = self._get_cached_image(photo, image_cache)
                 embedding = openclip_model.get_embedding(image)
                 photo.embedding = embedding.tolist()
                 logger.info(f"Embedding computed for photo {i+1}/{len(photos)}")
@@ -181,7 +195,7 @@ class Phase1Analyzer:
                 logger.error(f"FAILED to compute embedding for photo {photo.id}: {e}", exc_info=True)
                 photo.embedding = None
 
-    def _classify_rooms(self, photos: List[JobPhoto]) -> None:
+    def _classify_rooms(self, photos: List[JobPhoto], image_cache: Dict[int, Image.Image]) -> None:
         """Classify room type for each photo."""
         logger.info("Classifying rooms...")
 
@@ -195,7 +209,7 @@ class Phase1Analyzer:
                 continue
 
             try:
-                image = s3_client.download_image(photo.s3_uri)
+                image = self._get_cached_image(photo, image_cache)
                 room_type, confidence = openclip_model.classify_room(image)
 
                 # Lightweight metadata guardrail for a common confusion:
@@ -213,7 +227,7 @@ class Phase1Analyzer:
                 logger.error(f"FAILED to classify room for photo {photo.id}: {e}", exc_info=True)
                 photo.room_label = "unknown"
 
-    def _analyze_depth(self, photos: List[JobPhoto]) -> None:
+    def _analyze_depth(self, photos: List[JobPhoto], image_cache: Dict[int, Image.Image]) -> None:
         """Analyze depth for each photo."""
         logger.info("Analyzing depth...")
 
@@ -222,7 +236,7 @@ class Phase1Analyzer:
                 continue
 
             try:
-                image = s3_client.download_image(photo.s3_uri)
+                image = self._get_cached_image(photo, image_cache)
                 depth_metrics = midas_model.analyze_depth(image)
                 photo.depth_variance = depth_metrics["variance"]
                 photo.depth_layers = depth_metrics["depth_layers"]

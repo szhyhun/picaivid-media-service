@@ -1,6 +1,6 @@
 """Pydantic schemas for clip responses."""
 from typing import List, Optional, Any, Dict, Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SourcePhotoInfo(BaseModel):
@@ -191,6 +191,7 @@ class PairDebugRequest(BaseModel):
     right_photo_id: int
     job_id: Optional[int] = None
     sample_limit: int = 250
+    confidence_threshold: Optional[float] = Field(default=None, ge=0.1, le=1.0)
     matcher: Literal[
         "current",
         "loftr_kornia_indoor_native",
