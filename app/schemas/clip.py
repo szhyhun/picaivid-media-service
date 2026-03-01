@@ -1,5 +1,5 @@
 """Pydantic schemas for clip responses."""
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Literal
 from pydantic import BaseModel
 
 
@@ -55,6 +55,18 @@ class ClipTransitionStep(BaseModel):
     overlap_from_zone: Optional[str] = None
     overlap_to_zone: Optional[str] = None
     overlap_summary: Optional[str] = None
+    from_left_25_50_score: Optional[float] = None
+    from_right_50_75_score: Optional[float] = None
+    to_left_25_50_score: Optional[float] = None
+    to_right_50_75_score: Optional[float] = None
+    cross_left_to_right_score: Optional[float] = None
+    cross_right_to_left_score: Optional[float] = None
+    cross_center_to_center_score: Optional[float] = None
+    kornia_overlap_ratio: Optional[float] = None
+    kornia_side_overlap: Optional[float] = None
+    kornia_center_overlap: Optional[float] = None
+    kornia_inlier_ratio: Optional[float] = None
+    kornia_transition_overlap_ok: Optional[bool] = None
 
 
 class AnalysisInfo(BaseModel):
@@ -121,6 +133,18 @@ class PhotoSimilarityInfo(BaseModel):
     overlap_from_zone: Optional[str] = None
     overlap_to_zone: Optional[str] = None
     overlap_summary: Optional[str] = None
+    from_left_25_50_score: Optional[float] = None
+    from_right_50_75_score: Optional[float] = None
+    to_left_25_50_score: Optional[float] = None
+    to_right_50_75_score: Optional[float] = None
+    cross_left_to_right_score: Optional[float] = None
+    cross_right_to_left_score: Optional[float] = None
+    cross_center_to_center_score: Optional[float] = None
+    kornia_overlap_ratio: Optional[float] = None
+    kornia_side_overlap: Optional[float] = None
+    kornia_center_overlap: Optional[float] = None
+    kornia_inlier_ratio: Optional[float] = None
+    kornia_transition_overlap_ok: Optional[bool] = None
 
 
 class PhotoDebugInfo(BaseModel):
@@ -160,3 +184,110 @@ class ClusterListDebugResponse(BaseModel):
     job_id: Optional[int] = None
     clusters: List[ClusterDebugResponse]
     total_clusters: int
+
+
+class PairDebugRequest(BaseModel):
+    left_photo_id: int
+    right_photo_id: int
+    job_id: Optional[int] = None
+    sample_limit: int = 250
+    matcher: Literal[
+        "current",
+        "efficient",
+        "efficient_hf",
+        "loftr_zju_indoor_native",
+        "loftr_zju_legacy_native",
+        "loftr_zju_indoor_ds_native",
+        "loftr_zju_indoor_ot_native",
+        "loftr_zju_outdoor_ds_native",
+        "loftr_zju_outdoor_ot_native",
+        "loftr_kornia_indoor_native",
+    ] = "current"
+
+
+class PairDebugPhotoInfo(BaseModel):
+    id: int
+    rails_photo_id: str
+    filename: Optional[str] = None
+    room_label: Optional[str] = None
+    position: Optional[int] = None
+    s3_uri: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+
+
+class PairDebugPoint(BaseModel):
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    dx: float
+    dy: float
+
+
+class PairDebugStoredMetrics(BaseModel):
+    pair_source: Optional[str] = None
+    dinov2_similarity: Optional[float] = None
+    geometric_matches: Optional[int] = None
+    geometric_inliers: Optional[int] = None
+    geometric_score: Optional[float] = None
+    direction_dx: Optional[float] = None
+    direction_dy: Optional[float] = None
+    cross_left_to_right: Optional[float] = None
+    cross_right_to_left: Optional[float] = None
+    cross_center_to_center: Optional[float] = None
+    kornia_overlap_ratio: Optional[float] = None
+    kornia_side_overlap: Optional[float] = None
+    kornia_center_overlap: Optional[float] = None
+    kornia_inlier_ratio: Optional[float] = None
+    kornia_transition_overlap_ok: Optional[bool] = None
+    is_connected: Optional[bool] = None
+
+
+class PairDebugLiveMetrics(BaseModel):
+    matcher: Optional[str] = None
+    checkpoint: Optional[str] = None
+    confidence_threshold: Optional[float] = None
+    geometry_model: Optional[str] = None
+    raw_correspondence_count: Optional[int] = None
+    raw_matches: List[PairDebugPoint] = []
+    filter_match_sets: Dict[str, List[PairDebugPoint]] = {}
+    filtered_match_count: int = 0
+    filtered_matches: List[PairDebugPoint] = []
+    filtered_final_score: Optional[float] = None
+    threshold_trials: List[Dict[str, Any]] = []
+    loftr_input_width: Optional[int] = None
+    loftr_input_height: Optional[int] = None
+    ransac_reproj_threshold: Optional[float] = None
+    num_matches: int = 0
+    num_inliers: int = 0
+    geometric_score: float = 0.0
+    direction_dx: Optional[float] = None
+    direction_dy: Optional[float] = None
+    match_width: Optional[int] = None
+    match_height: Optional[int] = None
+    segment_scores: Dict[str, float] = {}
+    score_components: Dict[str, float] = {}
+    oracle: Dict[str, Any] = {}
+    filter_config: Dict[str, Any] = {}
+    filter_scores: Dict[str, Any] = {}
+    native_matching_scores: Dict[str, float] = {}
+    native_matching_scores_raw: Dict[str, float] = {}
+    zju_variant: Optional[str] = None
+    zju_loader: Optional[str] = None
+    zju_checkpoint_path: Optional[str] = None
+    zju_repo_dir: Optional[str] = None
+    zju_match_type: Optional[str] = None
+    zju_model_class: Optional[str] = None
+    hf_visualization_data_url: Optional[str] = None
+    inlier_match_count: int = 0
+    inlier_matches: List[PairDebugPoint] = []
+
+
+class PairDebugResponse(BaseModel):
+    project_id: str
+    job_id: int
+    left_photo: PairDebugPhotoInfo
+    right_photo: PairDebugPhotoInfo
+    stored_metrics: Optional[PairDebugStoredMetrics] = None
+    live_metrics: PairDebugLiveMetrics

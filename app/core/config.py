@@ -38,11 +38,43 @@ class Settings(BaseSettings):
     MODEL_CACHE_DIR: str = "./ml_models"
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
+    LOFTR_ZJU_REPO_DIR: str | None = None
+    LOFTR_ZJU_INDOOR_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_DS_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_OT_CKPT: str | None = None
+    LOFTR_ZJU_OUTDOOR_DS_CKPT: str | None = None
+    LOFTR_ZJU_OUTDOOR_OT_CKPT: str | None = None
 
     # Clustering behavior
     DELETE_OBVIOUS_DUPLICATES: bool = True
-    REQUIRE_GEOMETRIC_TRANSITIONS: bool = False
+    REQUIRE_GEOMETRIC_TRANSITIONS: bool = True
     REQUIRE_DIRECTION_FOR_TRANSITIONS: bool = False
+    HARD_TRANSITION_MIN_SIDE_OVERLAP: float = 0.06
+    HARD_TRANSITION_MIN_CENTER_OVERLAP: float = 0.09
+    HARD_TRANSITION_MIN_OVERLAP_RATIO: float = 0.08
+    GEOMETRIC_SCORE_WEIGHT: float = 0.90
+    SEMANTIC_SCORE_WEIGHT: float = 0.10
+    GEOMETRY_ONLY_CLUSTER_MEMBERSHIP: bool = True
+    STRICT_SEMANTIC_COMPONENT_CONNECTIVITY: bool = True
+    COMPONENT_SEMANTIC_ADJ_MIN: float = 0.78
+    COMPONENT_SEMANTIC_DIST2_MIN: float = 0.82
+    COMPONENT_SEMANTIC_RECOVERY_MIN: float = 0.88
+    COMPONENT_FRONT_RECOVERY_MIN: float = 0.80
+    COMPONENT_SEMANTIC_MAX_GAP: int = 2
+    COMPONENT_SAME_LABEL_ADJ_MIN: float = 0.70
+    COMPONENT_SAME_LABEL_DIST2_MIN: float = 0.74
+    COMPONENT_AMBIGUOUS_SAME_LABEL_MIN: float = 0.82
+    COMPONENT_CROSS_LABEL_ADJ_MIN: float = 0.84
+    COMPONENT_CROSS_LABEL_DIST2_MIN: float = 0.88
+
+    # Kornia geometric oracle (A/B)
+    # off: disabled, shadow: log-only, gate: enforce oracle pass for geometric edges
+    KORNIA_ORACLE_MODE: str = "off"
+    KORNIA_ORACLE_MIN_OVERLAP_RATIO: float = 0.08
+    KORNIA_ORACLE_MIN_SIDE_OVERLAP: float = 0.06
+    KORNIA_ORACLE_MIN_CENTER_OVERLAP: float = 0.09
+    KORNIA_ORACLE_MIN_INLIER_RATIO: float = 0.20
+    KORNIA_ORACLE_INLIER_THRESHOLD_PX: float = 2.0
 
     # Logging
     LOG_LEVEL: str = "INFO"

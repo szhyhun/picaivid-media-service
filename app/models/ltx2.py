@@ -287,7 +287,7 @@ class LTX2Model:
                 frame = self._apply_zoom(img_a, scale)
             elif motion_type in ("push_out", "dolly_out", "micro_push_out"):
                 # Zoom out effect
-                scale = 1.15 - 0.15 * t
+                scale = max(1.0, 1.15 - 0.15 * t)
                 frame = self._apply_zoom(img_a, scale)
             elif motion_type in ("pan_left", "subtle_pan"):
                 # Pan left effect
@@ -318,7 +318,8 @@ class LTX2Model:
         import cv2
 
         h, w = img.shape[:2]
-        new_h, new_w = int(h * scale), int(w * scale)
+        new_h = max(h, int(round(h * scale)))
+        new_w = max(w, int(round(w * scale)))
 
         # Resize
         zoomed = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
@@ -327,6 +328,10 @@ class LTX2Model:
         start_y = (new_h - h) // 2
         start_x = (new_w - w) // 2
         cropped = zoomed[start_y:start_y + h, start_x:start_x + w]
+
+        # Guard against rare rounding/crop edge-cases.
+        if cropped.shape[0] != h or cropped.shape[1] != w:
+            cropped = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
         return cropped
 

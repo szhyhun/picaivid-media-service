@@ -33,6 +33,18 @@ class PhotoSimilarity(Base):
     geometric_score = Column(Float)  # Overlap score (0.0 to 1.0)
     direction_dx = Column(Float)  # Content shift X from photo_a -> photo_b (normalized)
     direction_dy = Column(Float)  # Content shift Y from photo_a -> photo_b (normalized)
+    from_left_25_50 = Column(Float)
+    from_right_50_75 = Column(Float)
+    to_left_25_50 = Column(Float)
+    to_right_50_75 = Column(Float)
+    cross_left_to_right = Column(Float)
+    cross_right_to_left = Column(Float)
+    cross_center_to_center = Column(Float)
+    kornia_overlap_ratio = Column(Float)
+    kornia_side_overlap = Column(Float)
+    kornia_center_overlap = Column(Float)
+    kornia_inlier_ratio = Column(Float)
+    kornia_transition_overlap_ok = Column(Integer)
 
     # Whether this pair was used in final clustering
     is_connected = Column(Integer, default=0)  # 0=no, 1=yes

@@ -158,17 +158,20 @@ def _cluster_with_learned_matching(
 
     # Create RoomCluster records
     clusters = []
+    room_instance_counts = defaultdict(int)
     for sequence_order, cluster_photos in enumerate(ordered_cluster_photo_groups):
         if not cluster_photos:
             continue
 
         # Determine room type from majority vote
-        cluster_room_labels = [p.room_override or p.room_label or "unknown" for p in cluster_photos]
-        room_type = max(set(cluster_room_labels), key=cluster_room_labels.count)
+        room_type = _majority_room_label(cluster_photos)
+        base_room_name = _room_instance_base_label(room_type)
+        room_instance_counts[base_room_name] += 1
+        room_instance_label = f"{base_room_name} {room_instance_counts[base_room_name]}"
 
         cluster = RoomCluster(
             job_id=job.id,
-            room_type=room_type,
+            room_type=room_instance_label,
             image_count=len(cluster_photos),
             sequence_order=sequence_order,
         )
@@ -183,7 +186,7 @@ def _cluster_with_learned_matching(
         clusters.append(cluster)
 
         logger.info(
-            f"Created cluster {cluster.id}: {room_type} "
+            f"Created cluster {cluster.id}: {room_instance_label} "
             f"with {len(cluster_photos)} photos"
         )
 
@@ -233,13 +236,16 @@ def _cluster_with_orb(
                     raw_cluster_photo_groups.append(overlap_group)
 
     ordered_cluster_photo_groups = _order_clusters_for_story(raw_cluster_photo_groups)
+    room_instance_counts = defaultdict(int)
     for sequence_order, overlap_group in enumerate(ordered_cluster_photo_groups):
-        room_labels = [p.room_override or p.room_label or "unknown" for p in overlap_group]
-        room_type = max(set(room_labels), key=room_labels.count)
+        room_type = _majority_room_label(overlap_group)
+        base_room_name = _room_instance_base_label(room_type)
+        room_instance_counts[base_room_name] += 1
+        room_instance_label = f"{base_room_name} {room_instance_counts[base_room_name]}"
 
         cluster = RoomCluster(
             job_id=job.id,
-            room_type=room_type,
+            room_type=room_instance_label,
             image_count=len(overlap_group),
             sequence_order=sequence_order,
         )
@@ -254,7 +260,7 @@ def _cluster_with_orb(
         clusters.append(cluster)
 
         logger.info(
-            f"Created cluster {cluster.id}: {room_type} "
+            f"Created cluster {cluster.id}: {room_instance_label} "
             f"with {len(overlap_group)} photos"
         )
 
@@ -273,10 +279,11 @@ def _create_single_cluster(
         return []
 
     room_type = photos[0].room_override or photos[0].room_label or "unknown"
+    room_instance_label = f"{_room_instance_base_label(room_type)} 1"
 
     cluster = RoomCluster(
         job_id=job.id,
-        room_type=room_type,
+        room_type=room_instance_label,
         image_count=len(photos),
         sequence_order=0,
     )
@@ -523,6 +530,40 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return False
+
+
+def _majority_room_label(photos: List[JobPhoto]) -> str:
+    labels = [p.room_override or p.room_label or "unknown" for p in photos]
+    return max(set(labels), key=labels.count)
+
+
+def _room_instance_base_label(room_type: str | None) -> str:
+    """Normalize room label for per-job room-instance naming."""
+    bucket = _room_bucket(room_type)
+    bucket_to_name = {
+        "drone": "drone",
+        "aerial": "aerial",
+        "exterior_front": "front yard",
+        "entrance": "entrance",
+        "living_room": "living room",
+        "kitchen": "kitchen",
+        "dining_room": "dining room",
+        "bedroom": "bedroom",
+        "bathroom": "bathroom",
+        "office": "office",
+        "laundry": "laundry room",
+        "hallway": "hallway",
+        "garage": "garage",
+        "basement": "basement",
+        "attic": "attic",
+        "patio": "patio",
+        "backyard": "backyard",
+        "pool": "pool",
+        "exterior_back": "exterior back",
+        "exterior_other": "exterior",
+        "unknown": "unknown",
+    }
+    return bucket_to_name.get(bucket, _normalize_room_label(room_type) or "unknown")
 
 
 def _master_priority(photo: JobPhoto) -> int:

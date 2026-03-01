@@ -358,9 +358,13 @@ def _build_direction_prompt_guidance(
             dx = float(dx)
             dy = float(dy)
 
-        rec = _camera_direction_recommendation(dx, dy, int(inliers) if inliers is not None else None)
         sem = row[2]
         inliers = row[3]
+        rec = _camera_direction_recommendation(
+            dx,
+            dy,
+            int(inliers) if inliers is not None else None,
+        )
         sem_txt = f"{float(sem):.3f}" if sem is not None else "N/A"
         inliers_txt = str(int(inliers)) if inliers is not None else "N/A"
         lines.append(f"{from_id} -> {to_id}: {rec} (sem={sem_txt}, inliers={inliers_txt}).")

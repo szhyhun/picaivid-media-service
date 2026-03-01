@@ -1,6 +1,9 @@
 """FastAPI application for Picaivid Media Service."""
 from datetime import datetime
+import logging
+import os
 from types import SimpleNamespace
+import numpy as np
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,11 +20,19 @@ from app.schemas.clip import (
     ClipResponse, ClipListResponse, SourcePhotoInfo, ClusterInfo, AnalysisInfo,
     ClipTransitionStep,
     ClusterDebugResponse, ClusterListDebugResponse, PhotoDebugInfo, PhotoSimilarityInfo,
+    PairDebugRequest, PairDebugResponse, PairDebugPhotoInfo, PairDebugStoredMetrics,
+    PairDebugLiveMetrics, PairDebugPoint,
 )
 from app.pipeline.orchestrator import PipelineOrchestrator
+from app.pipeline.phase1_analyze.learned_matching import match_image_pair
 
 # Setup logging
 setup_logging()
+logger = logging.getLogger(__name__)
+
+# Segment overlap metrics are expensive to compute (S3 + matcher per pair).
+# Keep disabled for normal API reads; enable only when explicitly requested.
+ENABLE_ON_DEMAND_SEGMENT_SCORES = False
 
 # Create FastAPI app
 app = FastAPI(
@@ -85,6 +96,9 @@ def _is_geometrically_verified(
     geometric_score: float | None,
     dx: float | None,
     dy: float | None,
+    side_overlap: float | None = None,
+    center_overlap: float | None = None,
+    overlap_ratio: float | None = None,
     min_verified_inliers: int = GEOMETRY_MIN_VERIFIED_INLIERS,
     min_verified_score: float = GEOMETRY_MIN_VERIFIED_SCORE,
 ) -> bool:
@@ -94,7 +108,24 @@ def _is_geometrically_verified(
         return False
     if dx is None or dy is None:
         return False
-    return (dx * dx + dy * dy) > 1e-8
+    if (dx * dx + dy * dy) <= 1e-8:
+        return False
+
+    if side_overlap is not None or center_overlap is not None:
+        side = side_overlap if side_overlap is not None else 0.0
+        center = center_overlap if center_overlap is not None else 0.0
+        if (
+            side < settings.HARD_TRANSITION_MIN_SIDE_OVERLAP
+            and center < settings.HARD_TRANSITION_MIN_CENTER_OVERLAP
+        ):
+            return False
+
+    if (
+        overlap_ratio is not None
+        and overlap_ratio < settings.HARD_TRANSITION_MIN_OVERLAP_RATIO
+    ):
+        return False
+    return True
 
 
 def _overlap_zones_from_direction(
@@ -122,6 +153,120 @@ def _overlap_zones_from_direction(
     from_zone = f"{from_x}-{from_y}"
     to_zone = f"{to_x}-{to_y}"
     return from_zone, to_zone
+
+
+def _coerce_segment_scores(raw_segment_scores: object) -> dict[str, float | None]:
+    raw = raw_segment_scores if isinstance(raw_segment_scores, dict) else {}
+
+    def f(key: str) -> float | None:
+        value = raw.get(key)
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "from_left_25_50_score": f("from_left_25_50"),
+        "from_right_50_75_score": f("from_right_50_75"),
+        "to_left_25_50_score": f("to_left_25_50"),
+        "to_right_50_75_score": f("to_right_50_75"),
+        "cross_left_to_right_score": f("cross_left_to_right"),
+        "cross_right_to_left_score": f("cross_right_to_left"),
+        "cross_center_to_center_score": f("cross_center_to_center"),
+    }
+
+
+def _segment_scores_from_similarity(sim: PhotoSimilarity | SimpleNamespace | None) -> dict[str, float | None]:
+    if sim is None:
+        return _coerce_segment_scores({})
+    return {
+        "from_left_25_50_score": _safe_float(getattr(sim, "from_left_25_50", None)),
+        "from_right_50_75_score": _safe_float(getattr(sim, "from_right_50_75", None)),
+        "to_left_25_50_score": _safe_float(getattr(sim, "to_left_25_50", None)),
+        "to_right_50_75_score": _safe_float(getattr(sim, "to_right_50_75", None)),
+        "cross_left_to_right_score": _safe_float(getattr(sim, "cross_left_to_right", None)),
+        "cross_right_to_left_score": _safe_float(getattr(sim, "cross_right_to_left", None)),
+        "cross_center_to_center_score": _safe_float(getattr(sim, "cross_center_to_center", None)),
+    }
+
+
+def _kornia_metrics_from_similarity(sim: PhotoSimilarity | SimpleNamespace | None) -> dict[str, float | bool | None]:
+    if sim is None:
+        return {
+            "kornia_overlap_ratio": None,
+            "kornia_side_overlap": None,
+            "kornia_center_overlap": None,
+            "kornia_inlier_ratio": None,
+            "kornia_transition_overlap_ok": None,
+        }
+    raw_ok = getattr(sim, "kornia_transition_overlap_ok", None)
+    ok: bool | None = None
+    if raw_ok is not None:
+        ok = bool(raw_ok)
+    return {
+        "kornia_overlap_ratio": _safe_float(getattr(sim, "kornia_overlap_ratio", None)),
+        "kornia_side_overlap": _safe_float(getattr(sim, "kornia_side_overlap", None)),
+        "kornia_center_overlap": _safe_float(getattr(sim, "kornia_center_overlap", None)),
+        "kornia_inlier_ratio": _safe_float(getattr(sim, "kornia_inlier_ratio", None)),
+        "kornia_transition_overlap_ok": ok,
+    }
+
+
+def _compute_pair_segment_scores(
+    from_photo: JobPhoto | None,
+    to_photo: JobPhoto | None,
+    s3_client,
+    cache: dict[tuple[int, int], dict[str, float | None]],
+) -> dict[str, float | None]:
+    if not ENABLE_ON_DEMAND_SEGMENT_SCORES:
+        return _coerce_segment_scores({})
+
+    if from_photo is None or to_photo is None:
+        return _coerce_segment_scores({})
+
+    # Keep orientation in cache key: segment metrics are directional.
+    key = (from_photo.id, to_photo.id)
+    if key in cache:
+        return cache[key]
+
+    try:
+        img_from = s3_client.download_image(from_photo.s3_uri)
+        img_to = s3_client.download_image(to_photo.s3_uri)
+        _, _, _, _, diagnostics = match_image_pair(
+            img_from,
+            img_to,
+            return_diagnostics=True,
+        )
+        segment_scores = _coerce_segment_scores(diagnostics.get("segment_scores"))
+    except Exception as err:
+        logger.debug(
+            "Failed to compute segment scores for %s -> %s: %s",
+            from_photo.id,
+            to_photo.id,
+            err,
+        )
+        segment_scores = _coerce_segment_scores({})
+
+    cache[key] = segment_scores
+    return segment_scores
+
+
+def _s3_key_from_uri(s3_uri: str | None) -> str | None:
+    if not s3_uri:
+        return None
+    if s3_uri.startswith("s3://"):
+        parts = s3_uri[5:].split("/", 1)
+        if len(parts) == 2:
+            return parts[1]
+        return None
+    return s3_uri
+
+
+def _sample_points(points: list[dict[str, object]], sample_limit: int) -> list[dict[str, object]]:
+    if sample_limit <= 0 or len(points) <= sample_limit:
+        return points
+    indexes = [int(i) for i in np.linspace(0, len(points) - 1, num=sample_limit)]
+    return [points[i] for i in indexes]
 
 
 def _camera_direction_recommendation(
@@ -327,6 +472,7 @@ async def get_project_clips(
     for sim in similarities:
         key = (min(sim.photo_a_id, sim.photo_b_id), max(sim.photo_a_id, sim.photo_b_id))
         sim_lookup[key] = sim
+    pair_segment_cache: dict[tuple[int, int], dict[str, float | None]] = {}
 
     # Generate pre-signed URLs for each clip
     clip_responses = []
@@ -383,6 +529,19 @@ async def get_project_clips(
                 to_photo = photo_map.get(to_photo_id)
                 sim_key = (min(from_photo_id, to_photo_id), max(from_photo_id, to_photo_id))
                 sim = sim_lookup.get(sim_key)
+                segment_scores = _segment_scores_from_similarity(sim)
+                if (
+                    segment_scores["cross_left_to_right_score"] is None
+                    and segment_scores["cross_right_to_left_score"] is None
+                    and segment_scores["cross_center_to_center_score"] is None
+                ):
+                    segment_scores = _compute_pair_segment_scores(
+                        from_photo=from_photo,
+                        to_photo=to_photo,
+                        s3_client=s3_client,
+                        cache=pair_segment_cache,
+                    )
+                kornia_metrics = _kornia_metrics_from_similarity(sim)
                 ordered_dx, ordered_dy = _direction_for_order(from_photo_id, to_photo_id, sim)
                 inliers = _safe_int(sim.geometric_inliers if sim else None)
                 geo_score = _safe_float(sim.geometric_score if sim else None)
@@ -391,6 +550,12 @@ async def get_project_clips(
                     geometric_score=geo_score,
                     dx=ordered_dx,
                     dy=ordered_dy,
+                    side_overlap=max(
+                        segment_scores["cross_left_to_right_score"] or 0.0,
+                        segment_scores["cross_right_to_left_score"] or 0.0,
+                    ),
+                    center_overlap=segment_scores["cross_center_to_center_score"],
+                    overlap_ratio=_safe_float(kornia_metrics["kornia_overlap_ratio"]),
                 )
                 overlap_from_zone, overlap_to_zone = _overlap_zones_from_direction(
                     ordered_dx if geometric_verified else None,
@@ -425,6 +590,18 @@ async def get_project_clips(
                         overlap_from_zone=overlap_from_zone,
                         overlap_to_zone=overlap_to_zone,
                         overlap_summary=overlap_summary,
+                        from_left_25_50_score=segment_scores["from_left_25_50_score"],
+                        from_right_50_75_score=segment_scores["from_right_50_75_score"],
+                        to_left_25_50_score=segment_scores["to_left_25_50_score"],
+                        to_right_50_75_score=segment_scores["to_right_50_75_score"],
+                        cross_left_to_right_score=segment_scores["cross_left_to_right_score"],
+                        cross_right_to_left_score=segment_scores["cross_right_to_left_score"],
+                        cross_center_to_center_score=segment_scores["cross_center_to_center_score"],
+                        kornia_overlap_ratio=kornia_metrics["kornia_overlap_ratio"],
+                        kornia_side_overlap=kornia_metrics["kornia_side_overlap"],
+                        kornia_center_overlap=kornia_metrics["kornia_center_overlap"],
+                        kornia_inlier_ratio=kornia_metrics["kornia_inlier_ratio"],
+                        kornia_transition_overlap_ok=kornia_metrics["kornia_transition_overlap_ok"],
                     )
                 )
 
@@ -483,6 +660,330 @@ async def get_project_clips(
         job_status=job.status,
         clips=clip_responses,
         total_clips=len(clip_responses),
+    )
+
+
+@app.post("/api/projects/{project_id}/pairs/debug", response_model=PairDebugResponse)
+async def debug_pair_geometry(
+    project_id: str,
+    payload: PairDebugRequest,
+    db: Session = Depends(get_db),
+):
+    """Run on-demand matching for two job photo IDs and return full geometry diagnostics."""
+    from app.services.storage.s3_client import s3_client
+
+    if payload.left_photo_id == payload.right_photo_id:
+        raise HTTPException(status_code=400, detail="left_photo_id and right_photo_id must be different")
+
+    raw_limit = payload.sample_limit
+    if raw_limit is None:
+        sample_limit = 250
+    else:
+        sample_limit = max(int(raw_limit), 0)
+
+    job_query = db.query(Job).filter(Job.project_id == project_id)
+    if payload.job_id is not None:
+        job_query = job_query.filter(Job.id == payload.job_id)
+    job = job_query.order_by(Job.created_at.desc()).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="No job found for project")
+
+    left_photo = (
+        db.query(JobPhoto)
+        .filter(JobPhoto.job_id == job.id, JobPhoto.id == payload.left_photo_id)
+        .first()
+    )
+    right_photo = (
+        db.query(JobPhoto)
+        .filter(JobPhoto.job_id == job.id, JobPhoto.id == payload.right_photo_id)
+        .first()
+    )
+    if not left_photo or not right_photo:
+        raise HTTPException(status_code=404, detail=f"Photo IDs must belong to job {job.id}")
+
+    try:
+        left_image = s3_client.download_image(left_photo.s3_uri)
+        right_image = s3_client.download_image(right_photo.s3_uri)
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Failed to load pair images: {err}") from err
+
+    try:
+        num_matches, num_inliers, score, direction, diagnostics = match_image_pair(
+            left_image,
+            right_image,
+            return_diagnostics=True,
+            debug_options={"matcher": payload.matcher},
+        )
+    except Exception as err:
+        message = str(err)
+        lower = message.lower()
+        logger.exception(
+            "Pair debug matcher failure (project=%s, job=%s, left_photo_id=%s, right_photo_id=%s, matcher=%s): %s",
+            project_id,
+            job.id if job else None,
+            payload.left_photo_id,
+            payload.right_photo_id,
+            payload.matcher,
+            message,
+        )
+        if payload.matcher in {
+            "loftr_zju_indoor_native",
+            "loftr_zju_legacy_native",
+            "loftr_zju_indoor_ds_native",
+            "loftr_zju_indoor_ot_native",
+            "loftr_zju_outdoor_ds_native",
+            "loftr_zju_outdoor_ot_native",
+        } and (
+            "zju loftr is not configured" in lower
+            or "loftr_zju_repo_dir" in lower
+            or "loftr_zju_indoor_ckpt" in lower
+            or "does not exist" in lower
+            or "failed to import zju loftr" in lower
+            or "checkpoint not found" in lower
+            or "requires repo-based loader" in lower
+            or "fallback to kornia checkpoint loader is disabled" in lower
+            or "model id not found" in lower
+            or "legacy model id not found" in lower
+        ):
+            matcher_to_env_keys = {
+                "loftr_zju_indoor_native": ["LOFTR_ZJU_INDOOR_DS_CKPT"],
+                "loftr_zju_legacy_native": ["LOFTR_ZJU_INDOOR_CKPT"],
+                "loftr_zju_indoor_ds_native": ["LOFTR_ZJU_INDOOR_DS_CKPT"],
+                "loftr_zju_indoor_ot_native": [
+                    "LOFTR_ZJU_INDOOR_OT_CKPT",
+                ],
+                "loftr_zju_outdoor_ds_native": ["LOFTR_ZJU_OUTDOOR_DS_CKPT"],
+                "loftr_zju_outdoor_ot_native": ["LOFTR_ZJU_OUTDOOR_OT_CKPT"],
+            }
+            repo_cfg = settings.LOFTR_ZJU_REPO_DIR
+            expected_env_keys = matcher_to_env_keys.get(payload.matcher or "", [])
+            expected_ckpts = [getattr(settings, key, None) for key in expected_env_keys]
+            repo_cfg_exists = bool(repo_cfg and os.path.isdir(os.path.expanduser(repo_cfg)))
+            ckpt_cfg_exists = any(
+                bool(path and os.path.isfile(os.path.expanduser(path)))
+                for path in expected_ckpts
+            )
+            repo_env = os.getenv("LOFTR_ZJU_REPO_DIR")
+            logger.error(
+                "ZJU strict matcher configuration error: matcher=%s, repo=%r exists=%s, expected_env_keys=%s, expected_ckpt_values=%r exists_any=%s, root_error=%s",
+                payload.matcher,
+                repo_cfg,
+                repo_cfg_exists,
+                expected_env_keys,
+                expected_ckpts,
+                ckpt_cfg_exists,
+                message,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"ZJU LoFTR matcher '{payload.matcher}' requires a valid checkpoint. "
+                    "Strict mode: no fallback is allowed. "
+                    "Set LOFTR_ZJU_REPO_DIR plus exact variant checkpoint env var. "
+                    f"Root error: {message}. "
+                    f"Runtime values: settings.repo={repo_cfg!r} exists={repo_cfg_exists}, "
+                    f"expected_env_keys={expected_env_keys}, "
+                    f"expected_ckpt_values={expected_ckpts!r} exists_any={ckpt_cfg_exists}, "
+                    f"env.repo={repo_env!r}."
+                ),
+            ) from err
+        raise HTTPException(status_code=500, detail=f"Pair debug matcher failed: {err}") from err
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+
+    raw_points = diagnostics.get("raw_matches")
+    filter_match_sets = diagnostics.get("filter_match_sets")
+    filtered_points = diagnostics.get("filtered_matches")
+    inlier_points = diagnostics.get("inlier_matches")
+    raw_points_list = raw_points if isinstance(raw_points, list) else []
+    filtered_points_list = filtered_points if isinstance(filtered_points, list) else []
+    inlier_points_list = inlier_points if isinstance(inlier_points, list) else []
+    sampled_raw_points = _sample_points(raw_points_list, sample_limit)
+    sampled_filtered_points = _sample_points(filtered_points_list, sample_limit)
+    sampled_inlier_points = _sample_points(inlier_points_list, sample_limit)
+
+    sim = (
+        db.query(PhotoSimilarity)
+        .filter(PhotoSimilarity.job_id == job.id)
+        .filter(
+            PhotoSimilarity.photo_a_id == min(left_photo.id, right_photo.id),
+            PhotoSimilarity.photo_b_id == max(left_photo.id, right_photo.id),
+        )
+        .first()
+    )
+
+    stored_metrics = None
+    if sim is not None:
+        stored_metrics = PairDebugStoredMetrics(
+            pair_source=sim.pair_source,
+            dinov2_similarity=_safe_float(sim.dinov2_similarity),
+            geometric_matches=_safe_int(sim.geometric_matches),
+            geometric_inliers=_safe_int(sim.geometric_inliers),
+            geometric_score=_safe_float(sim.geometric_score),
+            direction_dx=_safe_float(sim.direction_dx),
+            direction_dy=_safe_float(sim.direction_dy),
+            cross_left_to_right=_safe_float(getattr(sim, "cross_left_to_right", None)),
+            cross_right_to_left=_safe_float(getattr(sim, "cross_right_to_left", None)),
+            cross_center_to_center=_safe_float(getattr(sim, "cross_center_to_center", None)),
+            kornia_overlap_ratio=_safe_float(getattr(sim, "kornia_overlap_ratio", None)),
+            kornia_side_overlap=_safe_float(getattr(sim, "kornia_side_overlap", None)),
+            kornia_center_overlap=_safe_float(getattr(sim, "kornia_center_overlap", None)),
+            kornia_inlier_ratio=_safe_float(getattr(sim, "kornia_inlier_ratio", None)),
+            kornia_transition_overlap_ok=(
+                bool(getattr(sim, "kornia_transition_overlap_ok"))
+                if getattr(sim, "kornia_transition_overlap_ok", None) is not None
+                else None
+            ),
+            is_connected=bool(sim.is_connected) if sim.is_connected is not None else None,
+        )
+
+    left_key = _s3_key_from_uri(left_photo.s3_uri)
+    right_key = _s3_key_from_uri(right_photo.s3_uri)
+
+    live_metrics = PairDebugLiveMetrics(
+        matcher=str(diagnostics.get("matcher")) if diagnostics.get("matcher") is not None else None,
+        checkpoint=str(diagnostics.get("checkpoint")) if diagnostics.get("checkpoint") is not None else None,
+        confidence_threshold=_safe_float(diagnostics.get("confidence_threshold")),
+        geometry_model=str(diagnostics.get("geometry_model")) if diagnostics.get("geometry_model") is not None else None,
+        raw_correspondence_count=_safe_int(diagnostics.get("raw_correspondence_count")),
+        raw_matches=[
+            PairDebugPoint(
+                x0=float(p.get("x0", 0.0)),
+                y0=float(p.get("y0", 0.0)),
+                x1=float(p.get("x1", 0.0)),
+                y1=float(p.get("y1", 0.0)),
+                dx=float(p.get("dx", 0.0)),
+                dy=float(p.get("dy", 0.0)),
+            )
+            for p in sampled_raw_points
+        ],
+        filter_match_sets={
+            str(name): [
+                PairDebugPoint(
+                    x0=float(p.get("x0", 0.0)),
+                    y0=float(p.get("y0", 0.0)),
+                    x1=float(p.get("x1", 0.0)),
+                    y1=float(p.get("y1", 0.0)),
+                    dx=float(p.get("dx", 0.0)),
+                    dy=float(p.get("dy", 0.0)),
+                )
+                for p in _sample_points(points if isinstance(points, list) else [], sample_limit)
+            ]
+            for name, points in (filter_match_sets.items() if isinstance(filter_match_sets, dict) else [])
+        },
+        filtered_match_count=len(filtered_points_list),
+        filtered_matches=[
+            PairDebugPoint(
+                x0=float(p.get("x0", 0.0)),
+                y0=float(p.get("y0", 0.0)),
+                x1=float(p.get("x1", 0.0)),
+                y1=float(p.get("y1", 0.0)),
+                dx=float(p.get("dx", 0.0)),
+                dy=float(p.get("dy", 0.0)),
+            )
+            for p in sampled_filtered_points
+        ],
+        filtered_final_score=_safe_float(diagnostics.get("filtered_final_score")),
+        threshold_trials=[t for t in (diagnostics.get("threshold_trials") or []) if isinstance(t, dict)],
+        loftr_input_width=_safe_int(diagnostics.get("loftr_input_width")),
+        loftr_input_height=_safe_int(diagnostics.get("loftr_input_height")),
+        ransac_reproj_threshold=_safe_float(diagnostics.get("ransac_reproj_threshold")),
+        num_matches=int(num_matches),
+        num_inliers=int(num_inliers),
+        geometric_score=float(score),
+        direction_dx=_safe_float(direction[0]) if direction else None,
+        direction_dy=_safe_float(direction[1]) if direction else None,
+        match_width=_safe_int(diagnostics.get("match_width")),
+        match_height=_safe_int(diagnostics.get("match_height")),
+        segment_scores={
+            str(k): float(v) for k, v in (diagnostics.get("segment_scores") or {}).items() if v is not None
+        },
+        score_components={
+            str(k): float(v) for k, v in (diagnostics.get("score_components") or {}).items() if v is not None
+        },
+        oracle=(diagnostics.get("oracle") or {}) if isinstance(diagnostics.get("oracle"), dict) else {},
+        filter_config=(diagnostics.get("filter_config") or {}) if isinstance(diagnostics.get("filter_config"), dict) else {},
+        filter_scores=(diagnostics.get("filter_scores") or {}) if isinstance(diagnostics.get("filter_scores"), dict) else {},
+        native_matching_scores={
+            str(k): float(v) for k, v in (diagnostics.get("native_matching_scores") or {}).items() if v is not None
+        },
+        native_matching_scores_raw={
+            str(k): float(v) for k, v in (diagnostics.get("native_matching_scores_raw") or {}).items() if v is not None
+        },
+        zju_variant=(
+            str(diagnostics.get("zju_variant"))
+            if diagnostics.get("zju_variant") is not None
+            else None
+        ),
+        zju_loader=(
+            str(diagnostics.get("zju_loader"))
+            if diagnostics.get("zju_loader") is not None
+            else None
+        ),
+        zju_checkpoint_path=(
+            str(diagnostics.get("zju_checkpoint_path"))
+            if diagnostics.get("zju_checkpoint_path") is not None
+            else None
+        ),
+        zju_repo_dir=(
+            str(diagnostics.get("zju_repo_dir"))
+            if diagnostics.get("zju_repo_dir") is not None
+            else None
+        ),
+        zju_match_type=(
+            str(diagnostics.get("zju_match_type"))
+            if diagnostics.get("zju_match_type") is not None
+            else None
+        ),
+        zju_model_class=(
+            str(diagnostics.get("zju_model_class"))
+            if diagnostics.get("zju_model_class") is not None
+            else None
+        ),
+        hf_visualization_data_url=(
+            str(diagnostics.get("hf_visualization_data_url"))
+            if diagnostics.get("hf_visualization_data_url") is not None
+            else None
+        ),
+        inlier_match_count=len(inlier_points_list),
+        inlier_matches=[
+            PairDebugPoint(
+                x0=float(p.get("x0", 0.0)),
+                y0=float(p.get("y0", 0.0)),
+                x1=float(p.get("x1", 0.0)),
+                y1=float(p.get("y1", 0.0)),
+                dx=float(p.get("dx", 0.0)),
+                dy=float(p.get("dy", 0.0)),
+            )
+            for p in sampled_inlier_points
+        ],
+    )
+
+    return PairDebugResponse(
+        project_id=project_id,
+        job_id=job.id,
+        left_photo=PairDebugPhotoInfo(
+            id=left_photo.id,
+            rails_photo_id=left_photo.rails_photo_id,
+            filename=left_photo.filename,
+            room_label=left_photo.room_label,
+            position=left_photo.position,
+            s3_uri=left_photo.s3_uri,
+            image_url=s3_client.generate_presigned_url(left_key, expires_in=3600) if left_key else None,
+            thumbnail_url=s3_client.generate_presigned_url(left_key, expires_in=3600) if left_key else None,
+        ),
+        right_photo=PairDebugPhotoInfo(
+            id=right_photo.id,
+            rails_photo_id=right_photo.rails_photo_id,
+            filename=right_photo.filename,
+            room_label=right_photo.room_label,
+            position=right_photo.position,
+            s3_uri=right_photo.s3_uri,
+            image_url=s3_client.generate_presigned_url(right_key, expires_in=3600) if right_key else None,
+            thumbnail_url=s3_client.generate_presigned_url(right_key, expires_in=3600) if right_key else None,
+        ),
+        stored_metrics=stored_metrics,
+        live_metrics=live_metrics,
     )
 
 
@@ -569,6 +1070,7 @@ async def get_project_clusters_debug(
     for sim in similarities:
         key = (min(sim.photo_a_id, sim.photo_b_id), max(sim.photo_a_id, sim.photo_b_id))
         sim_lookup[key] = sim
+    pair_segment_cache: dict[tuple[int, int], dict[str, float | None]] = {}
 
     # Get clusters info
     clusters = db.query(RoomCluster).filter(RoomCluster.job_id == job.id).all()
@@ -606,6 +1108,19 @@ async def get_project_clusters_debug(
                 key = (min(photo_id, other_id), max(photo_id, other_id))
                 sim = sim_lookup.get(key)
                 if sim:
+                    segment_scores = _segment_scores_from_similarity(sim)
+                    if (
+                        segment_scores["cross_left_to_right_score"] is None
+                        and segment_scores["cross_right_to_left_score"] is None
+                        and segment_scores["cross_center_to_center_score"] is None
+                    ):
+                        segment_scores = _compute_pair_segment_scores(
+                            from_photo=photo_map.get(sim.photo_a_id),
+                            to_photo=photo_map.get(sim.photo_b_id),
+                            s3_client=s3_client,
+                            cache=pair_segment_cache,
+                        )
+                    kornia_metrics = _kornia_metrics_from_similarity(sim)
                     sim_dx = _safe_float(sim.direction_dx)
                     sim_dy = _safe_float(sim.direction_dy)
                     sim_inliers = _safe_int(sim.geometric_inliers)
@@ -615,6 +1130,12 @@ async def get_project_clusters_debug(
                         geometric_score=sim_geo_score,
                         dx=sim_dx,
                         dy=sim_dy,
+                        side_overlap=max(
+                            segment_scores["cross_left_to_right_score"] or 0.0,
+                            segment_scores["cross_right_to_left_score"] or 0.0,
+                        ),
+                        center_overlap=segment_scores["cross_center_to_center_score"],
+                        overlap_ratio=_safe_float(kornia_metrics["kornia_overlap_ratio"]),
                     )
                     sim_overlap_from_zone, sim_overlap_to_zone = _overlap_zones_from_direction(
                         sim_dx if sim_verified else None,
@@ -643,6 +1164,18 @@ async def get_project_clusters_debug(
                         overlap_from_zone=sim_overlap_from_zone,
                         overlap_to_zone=sim_overlap_to_zone,
                         overlap_summary=sim_overlap_summary,
+                        from_left_25_50_score=segment_scores["from_left_25_50_score"],
+                        from_right_50_75_score=segment_scores["from_right_50_75_score"],
+                        to_left_25_50_score=segment_scores["to_left_25_50_score"],
+                        to_right_50_75_score=segment_scores["to_right_50_75_score"],
+                        cross_left_to_right_score=segment_scores["cross_left_to_right_score"],
+                        cross_right_to_left_score=segment_scores["cross_right_to_left_score"],
+                        cross_center_to_center_score=segment_scores["cross_center_to_center_score"],
+                        kornia_overlap_ratio=kornia_metrics["kornia_overlap_ratio"],
+                        kornia_side_overlap=kornia_metrics["kornia_side_overlap"],
+                        kornia_center_overlap=kornia_metrics["kornia_center_overlap"],
+                        kornia_inlier_ratio=kornia_metrics["kornia_inlier_ratio"],
+                        kornia_transition_overlap_ok=kornia_metrics["kornia_transition_overlap_ok"],
                     ))
                     all_similarities.append(sim)
 

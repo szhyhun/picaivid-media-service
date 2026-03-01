@@ -5,7 +5,7 @@ from typing import List
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Job, JobPhoto, RoomCluster
+from app.db.models import Job, JobPhoto, RoomCluster, PhotoSimilarity
 from app.models.openclip import openclip_model
 from app.models.midas import midas_model
 from app.services.storage.s3_client import s3_client
@@ -83,6 +83,16 @@ class Phase1Analyzer:
             self._analyze_depth(job_photos)
             self.db.commit()
 
+            # Step 5b: Correct common exterior label confusions using
+            # sequence context + depth hints (front/back/aerial).
+            self._postprocess_exterior_room_labels(job_photos)
+            self.db.commit()
+
+            # Step 5c: Correct common interior label confusions using
+            # local sequence context (kitchen/living/dining).
+            self._postprocess_interior_room_labels(job_photos)
+            self.db.commit()
+
             # Step 6: Compute quality scores
             compute_photo_scores(job_photos)
             self.db.commit()
@@ -91,6 +101,11 @@ class Phase1Analyzer:
             clusters = cluster_photos_by_room(
                 self.db, job, job_photos, s3_client=s3_client
             )
+
+            # Step 7b: Refine interior labels using verified geometric links
+            # (e.g., living vs dining confusion in adjacent shots).
+            self._postprocess_interior_room_labels(job_photos, job_id=job.id)
+            self.db.commit()
 
             # Step 8: Plan motion for each cluster
             for cluster in clusters:
@@ -217,6 +232,194 @@ class Phase1Analyzer:
                 photo.depth_variance = 0.0
                 photo.depth_layers = 1
 
+    def _postprocess_exterior_room_labels(self, photos: List[JobPhoto]) -> None:
+        """Correct common exterior room label confusions.
+
+        Targeted fixes:
+        - mid-early front-yard frames bracketed by aerial frames -> aerial view
+        - late-sequence front-yard frames near patio/backyard context -> backyard
+        """
+        if not photos:
+            return
+
+        ordered = sorted(photos, key=lambda p: p.position or 0)
+        n = len(ordered)
+        if n < 3:
+            return
+
+        def rel_pos(idx: int) -> float:
+            return float(idx / max(1, n - 1))
+
+        changed = 0
+        for idx, photo in enumerate(ordered):
+            if photo.room_override:
+                continue
+
+            current = _normalize_room_label(photo.room_label)
+            if current not in {"front yard", "exterior front"}:
+                continue
+
+            window = ordered[max(0, idx - 8): min(n, idx + 9)]
+            prev_close = ordered[max(0, idx - 2): idx]
+            next_close = ordered[idx + 1: min(n, idx + 3)]
+
+            prev_has_aerial = any(_is_aerial_label(_normalize_room_label(p.room_label)) for p in prev_close)
+            next_has_aerial = any(_is_aerial_label(_normalize_room_label(p.room_label)) for p in next_close)
+            near_back_context = any(_is_back_context_label(_normalize_room_label(p.room_label)) for p in window if p.id != photo.id)
+
+            dv = float(photo.depth_variance or 0.0)
+            rp = rel_pos(idx)
+
+            # 1) Early front-yard frame bracketed by aerial context -> aerial.
+            if rp <= 0.20 and dv >= 0.06 and prev_has_aerial and next_has_aerial:
+                photo.room_label = "aerial view"
+                changed += 1
+                logger.info(
+                    "Photo %s room relabel: %s -> aerial view (early bracketed aerial context, pos=%.2f, depth_var=%.3f)",
+                    photo.id,
+                    current,
+                    rp,
+                    dv,
+                )
+                continue
+
+            # 2) Late front-yard frame near patio/backyard context -> backyard.
+            if current == "front yard" and rp >= 0.85 and near_back_context:
+                photo.room_label = "backyard"
+                changed += 1
+                logger.info(
+                    "Photo %s room relabel: %s -> backyard (late exterior context, pos=%.2f)",
+                    photo.id,
+                    current,
+                    rp,
+                )
+
+        if changed:
+            logger.info("Exterior room-label postprocess changed %s photos", changed)
+
+    def _postprocess_interior_room_labels(self, photos: List[JobPhoto], job_id: int | None = None) -> None:
+        """Correct common interior room label confusions.
+
+        Sequence-context rules:
+        - patio/exterior false-positive inside kitchen/living/dining runs -> kitchen
+
+        Geometry-context rules (when job_id provided and similarities are available):
+        - living room frame with strong adjacent dining geometric link -> dining room
+        """
+        if not photos:
+            return
+
+        ordered = sorted(photos, key=lambda p: p.position or 0)
+        n = len(ordered)
+        if n < 3:
+            return
+
+        exterior_like = {
+            "patio",
+            "front yard",
+            "backyard",
+            "exterior front",
+            "exterior back",
+            "pool",
+        }
+        interior_social = {"living room", "dining room", "kitchen", "entrance", "hallway"}
+
+        changed = 0
+
+        # Rule 1: recover interior kitchen shots mislabeled as patio/exterior.
+        for idx, photo in enumerate(ordered):
+            if photo.room_override:
+                continue
+
+            current = _normalize_room_label(photo.room_label)
+            if current not in exterior_like:
+                continue
+
+            window = ordered[max(0, idx - 2): min(n, idx + 3)]
+            neighbor_labels = [
+                _normalize_room_label(p.room_label)
+                for p in window
+                if p.id != photo.id
+            ]
+
+            kitchen_votes = sum(label == "kitchen" for label in neighbor_labels)
+            interior_votes = sum(label in interior_social for label in neighbor_labels)
+            exterior_votes = sum(label in exterior_like for label in neighbor_labels)
+            depth_var = float(photo.depth_variance or 0.0)
+
+            if (
+                kitchen_votes >= 2
+                and interior_votes >= 3
+                and exterior_votes == 0
+                and depth_var <= 0.08
+            ):
+                photo.room_label = "kitchen"
+                changed += 1
+                logger.info(
+                    "Photo %s room relabel: %s -> kitchen (interior sequence context: kitchen_votes=%s, interior_votes=%s, depth_var=%.3f)",
+                    photo.id,
+                    current,
+                    kitchen_votes,
+                    interior_votes,
+                    depth_var,
+                )
+
+        # Rule 2: living->dining corrections with strong verified adjacent dining links.
+        if job_id is not None and self.db is not None:
+            strong_links = (
+                self.db.query(PhotoSimilarity)
+                .filter(PhotoSimilarity.job_id == job_id)
+                .filter(PhotoSimilarity.is_connected == 1)
+                .filter(PhotoSimilarity.geometric_inliers.isnot(None))
+                .filter(PhotoSimilarity.geometric_inliers >= 20)
+                .filter(PhotoSimilarity.geometric_score.isnot(None))
+                .filter(PhotoSimilarity.geometric_score >= 0.40)
+                .all()
+            )
+
+            photo_by_id = {p.id: p for p in photos}
+            for sim in strong_links:
+                left = photo_by_id.get(int(sim.photo_a_id))
+                right = photo_by_id.get(int(sim.photo_b_id))
+                if left is None or right is None:
+                    continue
+
+                for candidate, other in ((left, right), (right, left)):
+                    if candidate.room_override:
+                        continue
+                    if _normalize_room_label(candidate.room_label) != "living room":
+                        continue
+                    if _normalize_room_label(other.room_label) != "dining room":
+                        continue
+
+                    cand_pos = int(candidate.position or 0)
+                    other_pos = int(other.position or 0)
+                    if abs(cand_pos - other_pos) > 1:
+                        continue
+
+                    photo_by_pos = {int(p.position or 0): p for p in ordered}
+                    prev_photo = photo_by_pos.get(cand_pos - 1)
+                    next_photo = photo_by_pos.get(cand_pos + 1)
+                    adjacent_labels = {
+                        _normalize_room_label(prev_photo.room_label) if prev_photo else "",
+                        _normalize_room_label(next_photo.room_label) if next_photo else "",
+                    }
+                    if "kitchen" in adjacent_labels:
+                        continue
+
+                    candidate.room_label = "dining room"
+                    changed += 1
+                    logger.info(
+                        "Photo %s room relabel: living room -> dining room (strong geometric dining link to %s, inliers=%s, score=%.3f)",
+                        candidate.id,
+                        other.id,
+                        int(sim.geometric_inliers or 0),
+                        float(sim.geometric_score or 0.0),
+                    )
+
+        if changed:
+            logger.info("Interior room-label postprocess changed %s photos", changed)
+
 
 def _looks_like_laundry(photo: JobPhoto) -> bool:
     """Infer laundry room from filename/metadata hints."""
@@ -235,3 +438,15 @@ def _looks_like_laundry(photo: JobPhoto) -> bool:
 
     laundry_tokens = ("laundry", "washer", "dryer", "washing machine")
     return any(token in corpus for token in laundry_tokens)
+
+
+def _normalize_room_label(room: str | None) -> str:
+    return (room or "").strip().lower().replace("_", " ")
+
+
+def _is_aerial_label(room: str) -> bool:
+    return "aerial" in room or "drone" in room
+
+
+def _is_back_context_label(room: str) -> bool:
+    return any(token in room for token in ("backyard", "exterior back", "patio", "pool", "garden", "deck"))

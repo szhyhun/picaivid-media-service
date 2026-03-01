@@ -1,0 +1,697 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-02-26T06:21:11.158706+00:00",
+  "project_id": "7dc060b2-f2ef-483b-87b2-bc4f2ccb4273",
+  "job_id": 56,
+  "job_status": "render_complete",
+  "job_created_at": "2026-02-25T06:27:07.744426",
+  "photo_count": 55,
+  "cluster_count": 37,
+  "clusters": [
+    {
+      "cluster_key": "1083",
+      "room_type": "front yard",
+      "room_labels": [
+        "front yard"
+      ],
+      "photo_ids": [
+        2472,
+        2471,
+        2515
+      ],
+      "photo_filenames": [
+        "2-web-or-mls-2923 Mt Baker View Rd_11.jpg",
+        "1-web-or-mls-2923 Mt Baker View Rd_2.jpg",
+        "45-web-or-mls-2923 Mt Baker View Rd_1.jpg"
+      ],
+      "normalized_filenames": [
+        "2-web-or-mls-2923 mt baker view rd_11.jpg",
+        "1-web-or-mls-2923 mt baker view rd_2.jpg",
+        "45-web-or-mls-2923 mt baker view rd_1.jpg"
+      ],
+      "size": 3
+    },
+    {
+      "cluster_key": "1086",
+      "room_type": "front yard",
+      "room_labels": [
+        "front yard"
+      ],
+      "photo_ids": [
+        2530,
+        2527,
+        2528
+      ],
+      "photo_filenames": [
+        "60-web-or-mls-2923 Mt Baker View Rd_46.jpg",
+        "57-web-or-mls-2923 Mt Baker View Rd_47.jpg",
+        "58-web-or-mls-2923 Mt Baker View Rd_48.jpg"
+      ],
+      "normalized_filenames": [
+        "60-web-or-mls-2923 mt baker view rd_46.jpg",
+        "57-web-or-mls-2923 mt baker view rd_47.jpg",
+        "58-web-or-mls-2923 mt baker view rd_48.jpg"
+      ],
+      "size": 3
+    },
+    {
+      "cluster_key": "1098",
+      "room_type": "kitchen",
+      "room_labels": [
+        "kitchen"
+      ],
+      "photo_ids": [
+        2491,
+        2489,
+        2490
+      ],
+      "photo_filenames": [
+        "21-web-or-mls-2923 Mt Baker View Rd_28.jpg",
+        "19-web-or-mls-2923 Mt Baker View Rd_26.jpg",
+        "20-web-or-mls-2923 Mt Baker View Rd_27.jpg"
+      ],
+      "normalized_filenames": [
+        "21-web-or-mls-2923 mt baker view rd_28.jpg",
+        "19-web-or-mls-2923 mt baker view rd_26.jpg",
+        "20-web-or-mls-2923 mt baker view rd_27.jpg"
+      ],
+      "size": 3
+    },
+    {
+      "cluster_key": "1085",
+      "room_type": "front yard",
+      "room_labels": [
+        "front yard"
+      ],
+      "photo_ids": [
+        2474,
+        2476
+      ],
+      "photo_filenames": [
+        "4-web-or-mls-2923 Mt Baker View Rd_4.jpg",
+        "6-web-or-mls-2923 Mt Baker View Rd_6.jpg"
+      ],
+      "normalized_filenames": [
+        "4-web-or-mls-2923 mt baker view rd_4.jpg",
+        "6-web-or-mls-2923 mt baker view rd_6.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1088",
+      "room_type": "exterior front",
+      "room_labels": [
+        "exterior front"
+      ],
+      "photo_ids": [
+        2523,
+        2524
+      ],
+      "photo_filenames": [
+        "53-web-or-mls-2923 Mt Baker View Rd_52.jpg",
+        "54-web-or-mls-2923 Mt Baker View Rd_53.jpg"
+      ],
+      "normalized_filenames": [
+        "53-web-or-mls-2923 mt baker view rd_52.jpg",
+        "54-web-or-mls-2923 mt baker view rd_53.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1092",
+      "room_type": "living room",
+      "room_labels": [
+        "entrance",
+        "living room"
+      ],
+      "photo_ids": [
+        2481,
+        2482
+      ],
+      "photo_filenames": [
+        "11-web-or-mls-2923 Mt Baker View Rd_22.jpg",
+        "12-web-or-mls-2923 Mt Baker View Rd_54.jpg"
+      ],
+      "normalized_filenames": [
+        "11-web-or-mls-2923 mt baker view rd_22.jpg",
+        "12-web-or-mls-2923 mt baker view rd_54.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1093",
+      "room_type": "living room",
+      "room_labels": [
+        "living room"
+      ],
+      "photo_ids": [
+        2497,
+        2499
+      ],
+      "photo_filenames": [
+        "27-web-or-mls-2923 Mt Baker View Rd_38.jpg",
+        "29-web-or-mls-2923 Mt Baker View Rd_39.jpg"
+      ],
+      "normalized_filenames": [
+        "27-web-or-mls-2923 mt baker view rd_38.jpg",
+        "29-web-or-mls-2923 mt baker view rd_39.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1095",
+      "room_type": "living room",
+      "room_labels": [
+        "living room"
+      ],
+      "photo_ids": [
+        2494,
+        2496
+      ],
+      "photo_filenames": [
+        "24-web-or-mls-2923 Mt Baker View Rd_31.jpg",
+        "26-web-or-mls-2923 Mt Baker View Rd_33.jpg"
+      ],
+      "normalized_filenames": [
+        "24-web-or-mls-2923 mt baker view rd_31.jpg",
+        "26-web-or-mls-2923 mt baker view rd_33.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1096",
+      "room_type": "living room",
+      "room_labels": [
+        "living room"
+      ],
+      "photo_ids": [
+        2493,
+        2495
+      ],
+      "photo_filenames": [
+        "23-web-or-mls-2923 Mt Baker View Rd_30.jpg",
+        "25-web-or-mls-2923 Mt Baker View Rd_32.jpg"
+      ],
+      "normalized_filenames": [
+        "23-web-or-mls-2923 mt baker view rd_30.jpg",
+        "25-web-or-mls-2923 mt baker view rd_32.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1099",
+      "room_type": "dining room",
+      "room_labels": [
+        "dining room"
+      ],
+      "photo_ids": [
+        2483,
+        2484
+      ],
+      "photo_filenames": [
+        "13-web-or-mls-2923 Mt Baker View Rd_19.jpg",
+        "14-web-or-mls-2923 Mt Baker View Rd_20.jpg"
+      ],
+      "normalized_filenames": [
+        "13-web-or-mls-2923 mt baker view rd_19.jpg",
+        "14-web-or-mls-2923 mt baker view rd_20.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1101",
+      "room_type": "bedroom",
+      "room_labels": [
+        "bedroom"
+      ],
+      "photo_ids": [
+        2500,
+        2501
+      ],
+      "photo_filenames": [
+        "30-web-or-mls-2923 Mt Baker View Rd_18.jpg",
+        "31-web-or-mls-2923 Mt Baker View Rd_12.jpg"
+      ],
+      "normalized_filenames": [
+        "30-web-or-mls-2923 mt baker view rd_18.jpg",
+        "31-web-or-mls-2923 mt baker view rd_12.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1102",
+      "room_type": "bedroom",
+      "room_labels": [
+        "bedroom"
+      ],
+      "photo_ids": [
+        2507,
+        2508
+      ],
+      "photo_filenames": [
+        "37-web-or-mls-2923 Mt Baker View Rd_35.jpg",
+        "38-web-or-mls-2923 Mt Baker View Rd_36.jpg"
+      ],
+      "normalized_filenames": [
+        "37-web-or-mls-2923 mt baker view rd_35.jpg",
+        "38-web-or-mls-2923 mt baker view rd_36.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1106",
+      "room_type": "laundry room",
+      "room_labels": [
+        "bathroom",
+        "laundry room"
+      ],
+      "photo_ids": [
+        2503,
+        2504
+      ],
+      "photo_filenames": [
+        "33-web-or-mls-2923 Mt Baker View Rd_14.jpg",
+        "34-web-or-mls-2923 Mt Baker View Rd_15.jpg"
+      ],
+      "normalized_filenames": [
+        "33-web-or-mls-2923 mt baker view rd_14.jpg",
+        "34-web-or-mls-2923 mt baker view rd_15.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1115",
+      "room_type": "patio",
+      "room_labels": [
+        "patio"
+      ],
+      "photo_ids": [
+        2517,
+        2516
+      ],
+      "photo_filenames": [
+        "47-web-or-mls-2923 Mt Baker View Rd_55.jpg",
+        "46-web-or-mls-2923 Mt Baker View Rd_57.jpg"
+      ],
+      "normalized_filenames": [
+        "47-web-or-mls-2923 mt baker view rd_55.jpg",
+        "46-web-or-mls-2923 mt baker view rd_57.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1117",
+      "room_type": "patio",
+      "room_labels": [
+        "patio"
+      ],
+      "photo_ids": [
+        2518,
+        2520
+      ],
+      "photo_filenames": [
+        "48-web-or-mls-2923 Mt Baker View Rd_58.jpg",
+        "50-web-or-mls-2923 Mt Baker View Rd_59.jpg"
+      ],
+      "normalized_filenames": [
+        "48-web-or-mls-2923 mt baker view rd_58.jpg",
+        "50-web-or-mls-2923 mt baker view rd_59.jpg"
+      ],
+      "size": 2
+    },
+    {
+      "cluster_key": "1084",
+      "room_type": "front yard",
+      "room_labels": [
+        "front yard"
+      ],
+      "photo_ids": [
+        2529
+      ],
+      "photo_filenames": [
+        "59-web-or-mls-2923 Mt Baker View Rd_50.jpg"
+      ],
+      "normalized_filenames": [
+        "59-web-or-mls-2923 mt baker view rd_50.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1087",
+      "room_type": "front yard",
+      "room_labels": [
+        "front yard"
+      ],
+      "photo_ids": [
+        2519
+      ],
+      "photo_filenames": [
+        "49-web-or-mls-2923 Mt Baker View Rd_56.jpg"
+      ],
+      "normalized_filenames": [
+        "49-web-or-mls-2923 mt baker view rd_56.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1089",
+      "room_type": "aerial view",
+      "room_labels": [
+        "aerial view"
+      ],
+      "photo_ids": [
+        2473
+      ],
+      "photo_filenames": [
+        "3-web-or-mls-2923 Mt Baker View Rd_3.jpg"
+      ],
+      "normalized_filenames": [
+        "3-web-or-mls-2923 mt baker view rd_3.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1090",
+      "room_type": "aerial view",
+      "room_labels": [
+        "aerial view"
+      ],
+      "photo_ids": [
+        2480
+      ],
+      "photo_filenames": [
+        "10-web-or-mls-2923 Mt Baker View Rd_10.jpg"
+      ],
+      "normalized_filenames": [
+        "10-web-or-mls-2923 mt baker view rd_10.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1091",
+      "room_type": "aerial view",
+      "room_labels": [
+        "aerial view"
+      ],
+      "photo_ids": [
+        2477
+      ],
+      "photo_filenames": [
+        "7-web-or-mls-2923 Mt Baker View Rd_7.jpg"
+      ],
+      "normalized_filenames": [
+        "7-web-or-mls-2923 mt baker view rd_7.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1094",
+      "room_type": "living room",
+      "room_labels": [
+        "living room"
+      ],
+      "photo_ids": [
+        2485
+      ],
+      "photo_filenames": [
+        "15-web-or-mls-2923 Mt Baker View Rd_21.jpg"
+      ],
+      "normalized_filenames": [
+        "15-web-or-mls-2923 mt baker view rd_21.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1097",
+      "room_type": "kitchen",
+      "room_labels": [
+        "kitchen"
+      ],
+      "photo_ids": [
+        2487
+      ],
+      "photo_filenames": [
+        "17-web-or-mls-2923 Mt Baker View Rd_24.jpg"
+      ],
+      "normalized_filenames": [
+        "17-web-or-mls-2923 mt baker view rd_24.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1100",
+      "room_type": "dining room",
+      "room_labels": [
+        "dining room"
+      ],
+      "photo_ids": [
+        2498
+      ],
+      "photo_filenames": [
+        "28-web-or-mls-2923 Mt Baker View Rd_40.jpg"
+      ],
+      "normalized_filenames": [
+        "28-web-or-mls-2923 mt baker view rd_40.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1103",
+      "room_type": "bathroom",
+      "room_labels": [
+        "bathroom"
+      ],
+      "photo_ids": [
+        2510
+      ],
+      "photo_filenames": [
+        "40-web-or-mls-2923 Mt Baker View Rd_37.jpg"
+      ],
+      "normalized_filenames": [
+        "40-web-or-mls-2923 mt baker view rd_37.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1104",
+      "room_type": "laundry room",
+      "room_labels": [
+        "laundry room"
+      ],
+      "photo_ids": [
+        2502
+      ],
+      "photo_filenames": [
+        "32-web-or-mls-2923 Mt Baker View Rd_13.jpg"
+      ],
+      "normalized_filenames": [
+        "32-web-or-mls-2923 mt baker view rd_13.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1105",
+      "room_type": "laundry room",
+      "room_labels": [
+        "laundry room"
+      ],
+      "photo_ids": [
+        2513
+      ],
+      "photo_filenames": [
+        "43-web-or-mls-2923 Mt Baker View Rd_44.jpg"
+      ],
+      "normalized_filenames": [
+        "43-web-or-mls-2923 mt baker view rd_44.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1107",
+      "room_type": "laundry room",
+      "room_labels": [
+        "laundry room"
+      ],
+      "photo_ids": [
+        2511
+      ],
+      "photo_filenames": [
+        "41-web-or-mls-2923 Mt Baker View Rd_42.jpg"
+      ],
+      "normalized_filenames": [
+        "41-web-or-mls-2923 mt baker view rd_42.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1108",
+      "room_type": "laundry room",
+      "room_labels": [
+        "laundry room"
+      ],
+      "photo_ids": [
+        2505
+      ],
+      "photo_filenames": [
+        "35-web-or-mls-2923 Mt Baker View Rd_16.jpg"
+      ],
+      "normalized_filenames": [
+        "35-web-or-mls-2923 mt baker view rd_16.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1109",
+      "room_type": "laundry room",
+      "room_labels": [
+        "laundry room"
+      ],
+      "photo_ids": [
+        2509
+      ],
+      "photo_filenames": [
+        "39-web-or-mls-2923 Mt Baker View Rd_34.jpg"
+      ],
+      "normalized_filenames": [
+        "39-web-or-mls-2923 mt baker view rd_34.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1110",
+      "room_type": "laundry room",
+      "room_labels": [
+        "laundry room"
+      ],
+      "photo_ids": [
+        2506
+      ],
+      "photo_filenames": [
+        "36-web-or-mls-2923 Mt Baker View Rd_17.jpg"
+      ],
+      "normalized_filenames": [
+        "36-web-or-mls-2923 mt baker view rd_17.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1111",
+      "room_type": "garage",
+      "room_labels": [
+        "garage"
+      ],
+      "photo_ids": [
+        2514
+      ],
+      "photo_filenames": [
+        "44-web-or-mls-2923 Mt Baker View Rd_45.jpg"
+      ],
+      "normalized_filenames": [
+        "44-web-or-mls-2923 mt baker view rd_45.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1112",
+      "room_type": "attic",
+      "room_labels": [
+        "attic"
+      ],
+      "photo_ids": [
+        2512
+      ],
+      "photo_filenames": [
+        "42-web-or-mls-2923 Mt Baker View Rd_43.jpg"
+      ],
+      "normalized_filenames": [
+        "42-web-or-mls-2923 mt baker view rd_43.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1113",
+      "room_type": "patio",
+      "room_labels": [
+        "patio"
+      ],
+      "photo_ids": [
+        2486
+      ],
+      "photo_filenames": [
+        "16-web-or-mls-2923 Mt Baker View Rd_23.jpg"
+      ],
+      "normalized_filenames": [
+        "16-web-or-mls-2923 mt baker view rd_23.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1114",
+      "room_type": "patio",
+      "room_labels": [
+        "patio"
+      ],
+      "photo_ids": [
+        2525
+      ],
+      "photo_filenames": [
+        "55-web-or-mls-2923 Mt Baker View Rd_51.jpg"
+      ],
+      "normalized_filenames": [
+        "55-web-or-mls-2923 mt baker view rd_51.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1116",
+      "room_type": "patio",
+      "room_labels": [
+        "patio"
+      ],
+      "photo_ids": [
+        2522
+      ],
+      "photo_filenames": [
+        "52-web-or-mls-2923 Mt Baker View Rd_60.jpg"
+      ],
+      "normalized_filenames": [
+        "52-web-or-mls-2923 mt baker view rd_60.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1118",
+      "room_type": "patio",
+      "room_labels": [
+        "patio"
+      ],
+      "photo_ids": [
+        2521
+      ],
+      "photo_filenames": [
+        "51-web-or-mls-2923 Mt Baker View Rd_61.jpg"
+      ],
+      "normalized_filenames": [
+        "51-web-or-mls-2923 mt baker view rd_61.jpg"
+      ],
+      "size": 1
+    },
+    {
+      "cluster_key": "1119",
+      "room_type": "backyard",
+      "room_labels": [
+        "backyard"
+      ],
+      "photo_ids": [
+        2526
+      ],
+      "photo_filenames": [
+        "56-web-or-mls-2923 Mt Baker View Rd_49.jpg"
+      ],
+      "normalized_filenames": [
+        "56-web-or-mls-2923 mt baker view rd_49.jpg"
+      ],
+      "size": 1
+    }
+  ]
+}

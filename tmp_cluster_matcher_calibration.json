@@ -1,0 +1,102 @@
+{
+  "project_id": "7dc060b2-f2ef-483b-87b2-bc4f2ccb4273",
+  "job_id": 56,
+  "multi_photo_clusters": 15,
+  "pair_count": 21,
+  "matcher_summaries": {
+    "loftr_zju_legacy_native": {
+      "pairs": 21,
+      "geom_verified_pairs": 21,
+      "geom_verified_ratio": 1.0,
+      "geometry_models": {
+        "fundamental_ransac": 5,
+        "fundamental_magsac": 16
+      },
+      "num_matches": {
+        "p25": 240.0,
+        "median": 345.0,
+        "p75": 737.0
+      },
+      "num_inliers": {
+        "p25": 48.0,
+        "median": 73.0,
+        "p75": 106.0
+      },
+      "score": {
+        "p25": 0.0,
+        "median": 0.023,
+        "p75": 0.0683
+      },
+      "native_mean": {
+        "p25": 0.6397,
+        "median": 0.6805,
+        "p75": 0.7034
+      },
+      "native_median": {
+        "p25": 0.6332,
+        "median": 0.7002,
+        "p75": 0.7633
+      },
+      "native_count": {
+        "p25": 240.0,
+        "median": 345.0,
+        "p75": 737.0
+      },
+      "suggested_thresholds": {
+        "min_num_matches": 166,
+        "min_num_inliers": 35,
+        "min_geometric_score": 0.0,
+        "native_mean_floor": 0.6397,
+        "native_median_floor": 0.6332,
+        "native_count_floor": 240
+      }
+    },
+    "loftr_kornia_indoor_native": {
+      "pairs": 21,
+      "geom_verified_pairs": 21,
+      "geom_verified_ratio": 1.0,
+      "geometry_models": {
+        "fundamental_ransac": 5,
+        "fundamental_magsac": 16
+      },
+      "num_matches": {
+        "p25": 240.0,
+        "median": 345.0,
+        "p75": 737.0
+      },
+      "num_inliers": {
+        "p25": 48.0,
+        "median": 73.0,
+        "p75": 106.0
+      },
+      "score": {
+        "p25": 0.0,
+        "median": 0.023,
+        "p75": 0.0683
+      },
+      "native_mean": {
+        "p25": 0.6397,
+        "median": 0.6805,
+        "p75": 0.7034
+      },
+      "native_median": {
+        "p25": 0.6332,
+        "median": 0.7002,
+        "p75": 0.7633
+      },
+      "native_count": {
+        "p25": 240.0,
+        "median": 345.0,
+        "p75": 737.0
+      },
+      "suggested_thresholds": {
+        "min_num_matches": 166,
+        "min_num_inliers": 35,
+        "min_geometric_score": 0.0,
+        "native_mean_floor": 0.6397,
+        "native_median_floor": 0.6332,
+        "native_count_floor": 240
+      }
+    }
+  }
+}
