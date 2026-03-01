@@ -275,6 +275,11 @@ NATIVE_EDGE_MIN_INLIERS = 35
 NATIVE_EDGE_MIN_MEAN = 0.64
 NATIVE_EDGE_MIN_MEDIAN = 0.63
 NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac"}
+# If native forward pass is weak, retry reverse orientation and keep the stronger result.
+# This stabilizes pair-debug and clustering against directional LoFTR asymmetry.
+NATIVE_REVERSE_RETRY_ENABLED = True
+NATIVE_REVERSE_RETRY_MATCH_THRESHOLD = 120
+NATIVE_REVERSE_RETRY_INLIER_THRESHOLD = 25
 ENABLE_PHOTOMETRIC_PREFILTER = False
 PHOTOMETRIC_PATCH_RADIUS = 4
 PHOTOMETRIC_MIN_NCC = 0.55
@@ -2942,6 +2947,125 @@ def _build_native_loftr_diagnostics(
     return kept_count, int(num_inliers), float(combined_score), direction, diagnostics
 
 
+def _swap_normalized_match_points(points: Any) -> List[Dict[str, float]]:
+    swapped: List[Dict[str, float]] = []
+    if not isinstance(points, list):
+        return swapped
+    for p in points:
+        if not isinstance(p, dict):
+            continue
+        x0 = float(p.get("x0", 0.0))
+        y0 = float(p.get("y0", 0.0))
+        x1 = float(p.get("x1", 0.0))
+        y1 = float(p.get("y1", 0.0))
+        swapped.append(
+            {
+                "x0": x1,
+                "y0": y1,
+                "x1": x0,
+                "y1": y0,
+                "dx": (x0 - x1),
+                "dy": (y0 - y1),
+            }
+        )
+    return swapped
+
+
+def _swap_segment_scores(segment_scores: Any) -> Dict[str, float]:
+    if not isinstance(segment_scores, dict):
+        return {}
+    return {
+        "from_left_25_50": float(segment_scores.get("to_left_25_50", 0.0) or 0.0),
+        "from_right_50_75": float(segment_scores.get("to_right_50_75", 0.0) or 0.0),
+        "to_left_25_50": float(segment_scores.get("from_left_25_50", 0.0) or 0.0),
+        "to_right_50_75": float(segment_scores.get("from_right_50_75", 0.0) or 0.0),
+        "cross_left_to_right": float(segment_scores.get("cross_right_to_left", 0.0) or 0.0),
+        "cross_right_to_left": float(segment_scores.get("cross_left_to_right", 0.0) or 0.0),
+        "cross_center_to_center": float(segment_scores.get("cross_center_to_center", 0.0) or 0.0),
+    }
+
+
+def _reorient_reverse_native_diagnostics(diagnostics: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(diagnostics, dict):
+        return {}
+    out = dict(diagnostics)
+    for key in ("raw_matches", "filtered_matches", "inlier_matches"):
+        out[key] = _swap_normalized_match_points(out.get(key))
+
+    filter_sets = out.get("filter_match_sets")
+    if isinstance(filter_sets, dict):
+        swapped_sets: Dict[str, List[Dict[str, float]]] = {}
+        for name, points in filter_sets.items():
+            swapped_sets[str(name)] = _swap_normalized_match_points(points)
+        out["filter_match_sets"] = swapped_sets
+
+    out["segment_scores"] = _swap_segment_scores(out.get("segment_scores"))
+    out["reverse_orientation_selected"] = True
+    return out
+
+
+def _should_retry_reverse_native(num_matches: int, num_inliers: int) -> bool:
+    if not NATIVE_REVERSE_RETRY_ENABLED:
+        return False
+    return (
+        int(num_matches) < int(NATIVE_REVERSE_RETRY_MATCH_THRESHOLD)
+        or int(num_inliers) < int(NATIVE_REVERSE_RETRY_INLIER_THRESHOLD)
+    )
+
+
+def _is_better_native_result(
+    candidate: Tuple[int, int, float],
+    current: Tuple[int, int, float],
+) -> bool:
+    c_matches, c_inliers, c_score = candidate
+    p_matches, p_inliers, p_score = current
+    # Prioritize geometric reliability first, then match count, then score.
+    return (int(c_inliers), int(c_matches), float(c_score)) > (
+        int(p_inliers),
+        int(p_matches),
+        float(p_score),
+    )
+
+
+def _maybe_retry_reverse_native(
+    img1: Image.Image,
+    img2: Image.Image,
+    forward_result: Tuple[int, int, float, Tuple[float, float], Dict[str, Any]],
+    run_fn,
+    run_kwargs: Dict[str, Any],
+) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
+    num_matches, num_inliers, score, direction, diagnostics = forward_result
+    if not _should_retry_reverse_native(num_matches, num_inliers):
+        return forward_result
+
+    rev_matches, rev_inliers, rev_score, rev_direction, rev_diag = run_fn(
+        img1=img2,
+        img2=img1,
+        **run_kwargs,
+    )
+    if not _is_better_native_result(
+        (int(rev_matches), int(rev_inliers), float(rev_score)),
+        (int(num_matches), int(num_inliers), float(score)),
+    ):
+        if isinstance(diagnostics, dict):
+            diagnostics = dict(diagnostics)
+            diagnostics["reverse_retry_attempted"] = True
+            diagnostics["reverse_retry_selected"] = False
+        return num_matches, num_inliers, score, direction, diagnostics
+
+    adjusted_direction = (-float(rev_direction[0]), -float(rev_direction[1]))
+    adjusted_diag = _reorient_reverse_native_diagnostics(rev_diag)
+    adjusted_diag["reverse_retry_attempted"] = True
+    adjusted_diag["reverse_retry_selected"] = True
+    adjusted_diag["reverse_forward_matches"] = int(num_matches)
+    adjusted_diag["reverse_forward_inliers"] = int(num_inliers)
+    adjusted_diag["reverse_forward_score"] = float(score)
+    adjusted_diag["reverse_selected_matches"] = int(rev_matches)
+    adjusted_diag["reverse_selected_inliers"] = int(rev_inliers)
+    adjusted_diag["reverse_selected_score"] = float(rev_score)
+    return int(rev_matches), int(rev_inliers), float(rev_score), adjusted_direction, adjusted_diag
+
+
 def _match_loftr_kornia_indoor_native(
     img1: Image.Image,
     img2: Image.Image,
@@ -3938,49 +4062,118 @@ def match_image_pair(
         )
 
     if matcher_preference in {"loftr_zju_indoor_native", "loftr_zju_indoor_ds_native"}:
-        return _match_loftr_zju_indoor_native(
+        result = _match_loftr_zju_indoor_native(
             img1=img1,
             img2=img2,
             confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
         )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_zju_indoor_native,
+            run_kwargs={"confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
+        )
+        if return_diagnostics:
+            return result
+        return result[0], result[1], result[2], result[3]
 
     if matcher_preference == "loftr_zju_legacy_native":
-        return _match_loftr_zju_legacy_native(
+        result = _match_loftr_zju_legacy_native(
             img1=img1,
             img2=img2,
             confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
         )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_zju_legacy_native,
+            run_kwargs={"confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
+        )
+        if return_diagnostics:
+            return result
+        return result[0], result[1], result[2], result[3]
 
     if matcher_preference == "loftr_zju_indoor_ot_native":
-        return _match_loftr_zju_variant_native(
+        result = _match_loftr_zju_variant_native(
             img1=img1,
             img2=img2,
             variant="indoor_ot",
             confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
         )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_zju_variant_native,
+            run_kwargs={
+                "variant": "indoor_ot",
+                "confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+            },
+        )
+        if return_diagnostics:
+            return result
+        return result[0], result[1], result[2], result[3]
 
     if matcher_preference == "loftr_zju_outdoor_ds_native":
-        return _match_loftr_zju_variant_native(
+        result = _match_loftr_zju_variant_native(
             img1=img1,
             img2=img2,
             variant="outdoor_ds",
             confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
         )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_zju_variant_native,
+            run_kwargs={
+                "variant": "outdoor_ds",
+                "confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+            },
+        )
+        if return_diagnostics:
+            return result
+        return result[0], result[1], result[2], result[3]
 
     if matcher_preference == "loftr_zju_outdoor_ot_native":
-        return _match_loftr_zju_variant_native(
+        result = _match_loftr_zju_variant_native(
             img1=img1,
             img2=img2,
             variant="outdoor_ot",
             confidence_threshold=ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
         )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_zju_variant_native,
+            run_kwargs={
+                "variant": "outdoor_ot",
+                "confidence_threshold": ZJU_LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+            },
+        )
+        if return_diagnostics:
+            return result
+        return result[0], result[1], result[2], result[3]
 
     if matcher_preference == "loftr_kornia_indoor_native":
-        return _match_loftr_kornia_indoor_native(
+        result = _match_loftr_kornia_indoor_native(
             img1=img1,
             img2=img2,
             confidence_threshold=LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
         )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_kornia_indoor_native,
+            run_kwargs={"confidence_threshold": LOFTR_NATIVE_CONFIDENCE_THRESHOLD},
+        )
+        if return_diagnostics:
+            return result
+        return result[0], result[1], result[2], result[3]
 
     if matcher_preference == "efficient":
         efficient_thresholds = confidence_thresholds if has_custom_thresholds else EFFICIENT_LOFTR_CONFIDENCE_LEVELS
