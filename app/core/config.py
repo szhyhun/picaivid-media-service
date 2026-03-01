@@ -38,12 +38,6 @@ class Settings(BaseSettings):
     MODEL_CACHE_DIR: str = "./ml_models"
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
-    LOFTR_ZJU_REPO_DIR: str | None = None
-    LOFTR_ZJU_INDOOR_CKPT: str | None = None
-    LOFTR_ZJU_INDOOR_DS_CKPT: str | None = None
-    LOFTR_ZJU_INDOOR_OT_CKPT: str | None = None
-    LOFTR_ZJU_OUTDOOR_DS_CKPT: str | None = None
-    LOFTR_ZJU_OUTDOOR_OT_CKPT: str | None = None
 
     # Clustering behavior
     DELETE_OBVIOUS_DUPLICATES: bool = True
