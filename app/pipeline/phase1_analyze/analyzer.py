@@ -1,6 +1,7 @@
 """Phase 1 Analyzer - Main coordinator for photo analysis and planning."""
 import logging
 import json
+import time
 from typing import Dict, List
 
 from sqlalchemy.orm import Session
@@ -34,6 +35,9 @@ class Phase1Analyzer:
 
     def __init__(self, db: Session):
         self.db = db
+        self._image_cache_hits = 0
+        self._image_cache_misses = 0
+        self._image_download_seconds = 0.0
 
     def run(self, job_id: int) -> bool:
         """Run Phase 1 analysis for a job.
@@ -45,6 +49,10 @@ class Phase1Analyzer:
             True if successful
         """
         logger.info(f"Starting Phase 1 analysis for job {job_id}")
+        run_started_at = time.perf_counter()
+        self._image_cache_hits = 0
+        self._image_cache_misses = 0
+        self._image_download_seconds = 0.0
 
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
@@ -122,6 +130,15 @@ class Phase1Analyzer:
             self.db.commit()
 
             logger.info(f"Phase 1 complete for job {job_id}: {len(clusters)} room clusters")
+            total_run_seconds = time.perf_counter() - run_started_at
+            logger.info(
+                "PHASE1_RUNTIME job_id=%s total_time=%.3fs image_cache_hits=%s image_cache_misses=%s image_download_time=%.3fs",
+                job_id,
+                total_run_seconds,
+                self._image_cache_hits,
+                self._image_cache_misses,
+                self._image_download_seconds,
+            )
             return True
 
         except Exception as e:
@@ -173,8 +190,12 @@ class Phase1Analyzer:
     def _get_cached_image(self, photo: JobPhoto, image_cache: Dict[int, Image.Image]) -> Image.Image:
         cached = image_cache.get(photo.id)
         if cached is not None:
+            self._image_cache_hits += 1
             return cached
+        self._image_cache_misses += 1
+        started_at = time.perf_counter()
         image = s3_client.download_image(photo.s3_uri)
+        self._image_download_seconds += (time.perf_counter() - started_at)
         image_cache[photo.id] = image
         return image
 

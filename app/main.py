@@ -1,6 +1,7 @@
 """FastAPI application for Picaivid Media Service."""
 from datetime import datetime
 import logging
+import time
 from types import SimpleNamespace
 import numpy as np
 
@@ -670,6 +671,17 @@ async def debug_pair_geometry(
 ):
     """Run on-demand matching for two job photo IDs and return full geometry diagnostics."""
     from app.services.storage.s3_client import s3_client
+    request_started_at = time.perf_counter()
+    logger.info(
+        "pair_debug start project=%s job_id=%s left_photo_id=%s right_photo_id=%s matcher=%s threshold=%.3f sample_limit=%s",
+        project_id,
+        payload.job_id,
+        payload.left_photo_id,
+        payload.right_photo_id,
+        payload.matcher,
+        float(payload.confidence_threshold),
+        payload.sample_limit,
+    )
 
     if payload.left_photo_id == payload.right_photo_id:
         raise HTTPException(status_code=400, detail="left_photo_id and right_photo_id must be different")
@@ -680,6 +692,7 @@ async def debug_pair_geometry(
     else:
         sample_limit = max(int(raw_limit), 0)
 
+    lookup_started_at = time.perf_counter()
     job_query = db.query(Job).filter(Job.project_id == project_id)
     if payload.job_id is not None:
         job_query = job_query.filter(Job.id == payload.job_id)
@@ -698,15 +711,53 @@ async def debug_pair_geometry(
         .first()
     )
     if not left_photo or not right_photo:
-        raise HTTPException(status_code=404, detail=f"Photo IDs must belong to job {job.id}")
+        ownership_issues: list[str] = []
+        for side, pid, scoped_photo in (
+            ("left_photo_id", payload.left_photo_id, left_photo),
+            ("right_photo_id", payload.right_photo_id, right_photo),
+        ):
+            if scoped_photo is not None:
+                continue
+            owner = (
+                db.query(JobPhoto.id, JobPhoto.job_id, Job.project_id)
+                .join(Job, Job.id == JobPhoto.job_id)
+                .filter(JobPhoto.id == pid)
+                .first()
+            )
+            if owner is None:
+                ownership_issues.append(
+                    f"{side}={pid} not found in media-service DB"
+                )
+                continue
+            owner_project_id = str(owner.project_id)
+            owner_job_id = int(owner.job_id)
+            if owner_project_id != project_id:
+                ownership_issues.append(
+                    f"{side}={pid} belongs to project {owner_project_id} (job {owner_job_id}), "
+                    f"not requested project {project_id} (job {job.id})"
+                )
+            else:
+                ownership_issues.append(
+                    f"{side}={pid} belongs to job {owner_job_id} in project {project_id}, "
+                    f"but requested debug job is {job.id}"
+                )
+        raise HTTPException(status_code=422, detail="; ".join(ownership_issues))
+    lookup_seconds = time.perf_counter() - lookup_started_at
 
     try:
+        s3_started_at = time.perf_counter()
+        left_s3_started_at = time.perf_counter()
         left_image = s3_client.download_image(left_photo.s3_uri)
+        left_s3_seconds = time.perf_counter() - left_s3_started_at
+        right_s3_started_at = time.perf_counter()
         right_image = s3_client.download_image(right_photo.s3_uri)
+        right_s3_seconds = time.perf_counter() - right_s3_started_at
+        s3_total_seconds = time.perf_counter() - s3_started_at
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"Failed to load pair images: {err}") from err
 
     try:
+        matcher_started_at = time.perf_counter()
         num_matches, num_inliers, score, direction, diagnostics = match_image_pair(
             left_image,
             right_image,
@@ -717,6 +768,7 @@ async def debug_pair_geometry(
                 "full_diagnostics": True,
             },
         )
+        matcher_seconds = time.perf_counter() - matcher_started_at
     except Exception as err:
         message = str(err)
         logger.exception(
@@ -731,16 +783,23 @@ async def debug_pair_geometry(
         raise HTTPException(status_code=500, detail=f"Pair debug matcher failed: {err}") from err
     if not isinstance(diagnostics, dict):
         diagnostics = {}
+    timing_diagnostics = diagnostics.get("timing") if isinstance(diagnostics.get("timing"), dict) else {}
+    pair_model_seconds = float(timing_diagnostics.get("time_pair_total_s", 0.0) or 0.0)
+    pair_resize_seconds = float(timing_diagnostics.get("time_resize_s", 0.0) or 0.0)
+    pair_tensor_seconds = float(timing_diagnostics.get("time_tensor_transfer_s", 0.0) or 0.0)
+    pair_loftr_seconds = float(timing_diagnostics.get("time_loftr_s", 0.0) or 0.0)
+    pair_post_seconds = float(timing_diagnostics.get("time_postprocess_s", 0.0) or 0.0)
+    pair_f_seconds = float(timing_diagnostics.get("time_f_s", 0.0) or 0.0)
+    pair_h_seconds = float(timing_diagnostics.get("time_h_s", 0.0) or 0.0)
+    pair_scoring_seconds = float(timing_diagnostics.get("time_scoring_s", 0.0) or 0.0)
+    reverse_retry_seconds = float(timing_diagnostics.get("time_reverse_retry_s", 0.0) or 0.0)
+    postprocess_started_at = time.perf_counter()
 
     raw_points = diagnostics.get("raw_matches")
-    filter_match_sets = diagnostics.get("filter_match_sets")
-    filtered_points = diagnostics.get("filtered_matches")
     inlier_points = diagnostics.get("inlier_matches")
     raw_points_list = raw_points if isinstance(raw_points, list) else []
-    filtered_points_list = filtered_points if isinstance(filtered_points, list) else []
     inlier_points_list = inlier_points if isinstance(inlier_points, list) else []
     sampled_raw_points = _sample_points(raw_points_list, sample_limit)
-    sampled_filtered_points = _sample_points(filtered_points_list, sample_limit)
     sampled_inlier_points = _sample_points(inlier_points_list, sample_limit)
 
     sim = (
@@ -798,38 +857,13 @@ async def debug_pair_geometry(
             )
             for p in sampled_raw_points
         ],
-        filter_match_sets={
-            str(name): [
-                PairDebugPoint(
-                    x0=float(p.get("x0", 0.0)),
-                    y0=float(p.get("y0", 0.0)),
-                    x1=float(p.get("x1", 0.0)),
-                    y1=float(p.get("y1", 0.0)),
-                    dx=float(p.get("dx", 0.0)),
-                    dy=float(p.get("dy", 0.0)),
-                )
-                for p in _sample_points(points if isinstance(points, list) else [], sample_limit)
-            ]
-            for name, points in (filter_match_sets.items() if isinstance(filter_match_sets, dict) else [])
-        },
-        filtered_match_count=len(filtered_points_list),
-        filtered_matches=[
-            PairDebugPoint(
-                x0=float(p.get("x0", 0.0)),
-                y0=float(p.get("y0", 0.0)),
-                x1=float(p.get("x1", 0.0)),
-                y1=float(p.get("y1", 0.0)),
-                dx=float(p.get("dx", 0.0)),
-                dy=float(p.get("dy", 0.0)),
-            )
-            for p in sampled_filtered_points
-        ],
-        filtered_final_score=_safe_float(diagnostics.get("filtered_final_score")),
         threshold_trials=[t for t in (diagnostics.get("threshold_trials") or []) if isinstance(t, dict)],
         loftr_input_width=_safe_int(diagnostics.get("loftr_input_width")),
         loftr_input_height=_safe_int(diagnostics.get("loftr_input_height")),
         ransac_reproj_threshold=_safe_float(diagnostics.get("ransac_reproj_threshold")),
         num_matches=int(num_matches),
+        threshold_match_count=_safe_int(diagnostics.get("threshold_match_count")) or int(num_matches),
+        active_match_count=_safe_int(diagnostics.get("active_match_count")) or int(num_matches),
         num_inliers=int(num_inliers),
         geometric_score=float(score),
         direction_dx=_safe_float(direction[0]) if direction else None,
@@ -842,9 +876,8 @@ async def debug_pair_geometry(
         score_components={
             str(k): float(v) for k, v in (diagnostics.get("score_components") or {}).items() if v is not None
         },
+        timing={},
         oracle=(diagnostics.get("oracle") or {}) if isinstance(diagnostics.get("oracle"), dict) else {},
-        filter_config=(diagnostics.get("filter_config") or {}) if isinstance(diagnostics.get("filter_config"), dict) else {},
-        filter_scores=(diagnostics.get("filter_scores") or {}) if isinstance(diagnostics.get("filter_scores"), dict) else {},
         native_matching_scores={
             str(k): float(v) for k, v in (diagnostics.get("native_matching_scores") or {}).items() if v is not None
         },
@@ -899,6 +932,95 @@ async def debug_pair_geometry(
             for p in sampled_inlier_points
         ],
     )
+    response_build_seconds = time.perf_counter() - postprocess_started_at
+    request_total_seconds = time.perf_counter() - request_started_at
+    live_metrics.timing = {
+        "endpoint_total_ms": float(request_total_seconds * 1000.0),
+        "endpoint_lookup_ms": float(lookup_seconds * 1000.0),
+        "endpoint_s3_total_ms": float(s3_total_seconds * 1000.0),
+        "endpoint_s3_left_ms": float(left_s3_seconds * 1000.0),
+        "endpoint_s3_right_ms": float(right_s3_seconds * 1000.0),
+        "endpoint_matcher_ms": float(matcher_seconds * 1000.0),
+        "endpoint_response_build_ms": float(response_build_seconds * 1000.0),
+        "model_pair_ms": float(pair_model_seconds * 1000.0),
+        "model_load_ms": float((float(timing_diagnostics.get("time_model_load_s", 0.0) or 0.0)) * 1000.0),
+        "model_resize_ms": float(pair_resize_seconds * 1000.0),
+        "model_tensor_ms": float(pair_tensor_seconds * 1000.0),
+        "model_loftr_ms": float(pair_loftr_seconds * 1000.0),
+        "model_loftr_forward_main_ms": float((float(timing_diagnostics.get("time_loftr_forward_main_s", 0.0) or 0.0)) * 1000.0),
+        "model_loftr_forward_reverse_ms": float((float(timing_diagnostics.get("time_loftr_forward_reverse_s", 0.0) or 0.0)) * 1000.0),
+        "model_post_ms": float(pair_post_seconds * 1000.0),
+        "model_f_ms": float(pair_f_seconds * 1000.0),
+        "model_h_ms": float(pair_h_seconds * 1000.0),
+        "model_scoring_ms": float(pair_scoring_seconds * 1000.0),
+        "reverse_retry_ms": float(reverse_retry_seconds * 1000.0),
+        "reverse_pair_total_ms": float((float(timing_diagnostics.get("time_reverse_pair_total_s", 0.0) or 0.0)) * 1000.0),
+        "reverse_attempted": bool(timing_diagnostics.get("reverse_attempted", False)),
+        "reverse_selected": bool(timing_diagnostics.get("reverse_selected", False)),
+        "forward_pass_count": int(timing_diagnostics.get("forward_pass_count", 1) or 1),
+        "model_cache_hit": bool(timing_diagnostics.get("model_cache_hit", False)),
+        "model_device": str(timing_diagnostics.get("model_device", "n/a")),
+        "tensor_device": str(timing_diagnostics.get("tensor_device", "n/a")),
+        "cuda_available": bool(timing_diagnostics.get("cuda_available", False)),
+        "mps_available": bool(timing_diagnostics.get("mps_available", False)),
+        "preferred_device": str(timing_diagnostics.get("preferred_device", "n/a")),
+    }
+    logger.info(
+        "pair_debug_timing project=%s job=%s pair=%s<->%s total_ms=%.1f lookup_ms=%.1f s3_total_ms=%.1f s3_left_ms=%.1f s3_right_ms=%.1f matcher_ms=%.1f response_build_ms=%.1f model_pair_ms=%.1f model_load_ms=%.1f model_resize_ms=%.1f model_tensor_ms=%.1f model_loftr_ms=%.1f model_loftr_main_ms=%.1f model_loftr_reverse_ms=%.1f model_post_ms=%.1f model_f_ms=%.1f model_h_ms=%.1f model_scoring_ms=%.1f reverse_retry_ms=%.1f reverse_pair_total_ms=%.1f reverse_attempted=%s reverse_selected=%s forward_pass_count=%s model_cache_hit=%s model_device=%s tensor_device=%s cuda_available=%s mps_available=%s preferred_device=%s",
+        project_id,
+        job.id,
+        payload.left_photo_id,
+        payload.right_photo_id,
+        request_total_seconds * 1000.0,
+        lookup_seconds * 1000.0,
+        s3_total_seconds * 1000.0,
+        left_s3_seconds * 1000.0,
+        right_s3_seconds * 1000.0,
+        matcher_seconds * 1000.0,
+        response_build_seconds * 1000.0,
+        pair_model_seconds * 1000.0,
+        (float(timing_diagnostics.get("time_model_load_s", 0.0) or 0.0) * 1000.0),
+        pair_resize_seconds * 1000.0,
+        pair_tensor_seconds * 1000.0,
+        pair_loftr_seconds * 1000.0,
+        (float(timing_diagnostics.get("time_loftr_forward_main_s", 0.0) or 0.0) * 1000.0),
+        (float(timing_diagnostics.get("time_loftr_forward_reverse_s", 0.0) or 0.0) * 1000.0),
+        pair_post_seconds * 1000.0,
+        pair_f_seconds * 1000.0,
+        pair_h_seconds * 1000.0,
+        pair_scoring_seconds * 1000.0,
+        reverse_retry_seconds * 1000.0,
+        (float(timing_diagnostics.get("time_reverse_pair_total_s", 0.0) or 0.0) * 1000.0),
+        str(bool(timing_diagnostics.get("reverse_attempted", False))),
+        str(bool(timing_diagnostics.get("reverse_selected", False))),
+        str(int(timing_diagnostics.get("forward_pass_count", 1) or 1)),
+        str(bool(timing_diagnostics.get("model_cache_hit", False))),
+        str(timing_diagnostics.get("model_device", "n/a")),
+        str(timing_diagnostics.get("tensor_device", "n/a")),
+        str(timing_diagnostics.get("cuda_available", "n/a")),
+        str(timing_diagnostics.get("mps_available", "n/a")),
+        str(timing_diagnostics.get("preferred_device", "n/a")),
+    )
+    slow_threshold_s = 2.0
+    if request_total_seconds >= slow_threshold_s:
+        stage_breakdown = {
+            "lookup": lookup_seconds,
+            "s3_total": s3_total_seconds,
+            "matcher_total": matcher_seconds,
+            "response_build": response_build_seconds,
+        }
+        dominant_stage = max(stage_breakdown, key=stage_breakdown.get)
+        logger.warning(
+            "pair_debug_slow project=%s job=%s pair=%s<->%s total_ms=%.1f dominant_stage=%s dominant_ms=%.1f threshold_ms=%.1f",
+            project_id,
+            job.id,
+            payload.left_photo_id,
+            payload.right_photo_id,
+            request_total_seconds * 1000.0,
+            dominant_stage,
+            stage_breakdown[dominant_stage] * 1000.0,
+            slow_threshold_s * 1000.0,
+        )
 
     return PairDebugResponse(
         project_id=project_id,

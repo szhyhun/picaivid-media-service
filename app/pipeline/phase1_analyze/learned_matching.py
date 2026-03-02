@@ -18,8 +18,6 @@ Stage 3 (selective SfM): Optional COLMAP
 This keeps 90% of compute small while getting high-quality results.
 """
 import logging
-import io
-import base64
 import time
 from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any
 from collections import defaultdict
@@ -43,6 +41,22 @@ logger = logging.getLogger(__name__)
 # DINOv2 model singleton
 _dinov2_model = None
 _dinov2_transform = None
+_native_preprocessed_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+_native_device_tensor_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+# Performance controls for production matcher path.
+DINO_BATCH_SIZE = 16
+MAX_NATIVE_IMAGE_CACHE_ENTRIES = 512
+
+
+def _preferred_torch_device() -> torch.device:
+    """Choose fastest available backend: CUDA -> MPS -> CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and bool(mps_backend.is_available()):
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def _load_dinov2():
@@ -87,7 +101,7 @@ def _load_dinov2():
                 **model_kwargs,
             )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = _preferred_torch_device()
         _dinov2_model = _dinov2_model.to(device)
         _dinov2_model.eval()
 
@@ -118,24 +132,34 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
         )
 
     device = next(model.parameters()).device
-    embeddings = []
+    embeddings: List[np.ndarray] = []
+    batch_size = max(1, int(DINO_BATCH_SIZE))
+    t_start = time.perf_counter()
 
     with torch.no_grad():
-        for img in images:
-            # Ensure RGB
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-
-            # Process image
-            inputs = transform(img, return_tensors="pt")
+        for batch_start in range(0, len(images), batch_size):
+            batch_images = []
+            for img in images[batch_start: batch_start + batch_size]:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                batch_images.append(img)
+            inputs = transform(batch_images, return_tensors="pt")
             inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            # Get CLS token embedding
             outputs = model(**inputs)
-            embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-            embeddings.append(embedding[0])
+            batch_embeddings = outputs.last_hidden_state[:, 0, :].detach().cpu().numpy()
+            for row in batch_embeddings:
+                embeddings.append(np.asarray(row, dtype=np.float32))
 
-    return np.array(embeddings, dtype=np.float32)
+    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+    logger.info(
+        "DINOv2 embedding timing: photos=%s batch_size=%s total_ms=%.1f avg_ms=%.2f device=%s",
+        len(images),
+        batch_size,
+        elapsed_ms,
+        elapsed_ms / max(1, len(images)),
+        str(device),
+    )
+    return np.asarray(embeddings, dtype=np.float32)
 
 
 def cluster_by_dinov2(
@@ -235,12 +259,16 @@ def cluster_by_dinov2(
 MIN_MATCHES_FOR_OVERLAP = 10      # Minimum matches before geometric verification
 MIN_INLIERS_FOR_OVERLAP = 15      # Minimum inliers for pixel-level overlap (raised from 6 to avoid weak false positives)
 MIN_INLIERS_FOR_DIRECTION = 3     # Lower threshold - just enough to compute direction vector
-RANSAC_REPROJ_THRESHOLD = 1.5     # Tight reprojection threshold (pixels)
+RANSAC_REPROJ_THRESHOLD = 3.0     # Wider threshold for indoor wide-angle real-estate pairs
 OVERLAP_THRESHOLD = 0.15          # Minimum score to connect photos
 MIN_GEOMETRIC_SCORE_FOR_EDGE = 0.30
 LOW_SCORE_MOTION_COHERENCE_MIN = 0.08
 LOW_SCORE_SEGMENT_STRENGTH_MIN = 0.10
-FUNDAMENTAL_SAMPSON_THRESHOLD = 0.9  # Extra strict epipolar residual filter (pixels)
+FUNDAMENTAL_SAMPSON_THRESHOLD = 3.0  # Relaxed epipolar residual filter (pixels)
+FUNDAMENTAL_RANSAC_CONFIDENCE = 0.995
+ENABLE_FUNDAMENTAL_SAMPSON_REFINEMENT = False
+PLANAR_DEGENERACY_MIN_F_H_RATIO = 0.40
+PLANAR_DEGENERACY_MAX_F_INLIERS = 25
 ALLOW_HOMOGRAPHY_FALLBACK = False  # Fundamental geometry is preferred for parallax transitions.
 MIN_HOMOGRAPHY_FALLBACK_INLIERS = 30
 
@@ -269,26 +297,27 @@ LOFTR_OUTDOOR_FALLBACK_MIN_INLIERS = 12  # Run outdoor checkpoint only when indo
 DEFAULT_LOFTR_INPUT_SIZE = (960, 720)  # width, height
 DEFAULT_PRODUCTION_MATCHER = "loftr_kornia_indoor_native"
 LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.20
-LOFTR_FILTER_LOCAL_WINDOW = 15
-LOFTR_FILTER_MIN_GRAD = 0.08
-LOFTR_FILTER_MIN_STD = 0.07
-LOFTR_FILTER_SKY_TOP_MAX_Y = 0.48
-LOFTR_FILTER_CEILING_TOP_MAX_Y = 0.40
-LOFTR_FILTER_FLOOR_BOTTOM_MIN_Y = 0.62
-LOFTR_FILTER_WALL_MIN_Y = 0.18
-LOFTR_FILTER_WALL_MAX_Y = 0.85
-LOFTR_FILTER_LOW_SAT = 0.22
-LOFTR_FILTER_BRIGHT = 0.55
-LOFTR_FILTER_FINAL_KEEP_WEIGHT = 0.30
-# Low kept-count should not look strong even if confidence mean is high.
-LOFTR_FILTER_KEEP_COUNT_ZERO = 60
-LOFTR_FILTER_KEEP_COUNT_TARGET = 240
 NATIVE_SCORE_COUNT_ZERO = 80
 NATIVE_SCORE_COUNT_TARGET = 260
-NATIVE_EDGE_MIN_MATCHES = 160
-NATIVE_EDGE_MIN_INLIERS = 35
-NATIVE_EDGE_MIN_MEAN = 0.64
-NATIVE_EDGE_MIN_MEDIAN = 0.63
+NATIVE_EDGE_MIN_MATCHES = 40
+NATIVE_EDGE_MIN_INLIERS = 20
+NATIVE_EDGE_MIN_INLIER_RATIO = 0.25
+NATIVE_EDGE_MIN_OVERLAP_RATIO = 0.12
+NATIVE_EDGE_MIN_MEAN = 0.55
+NATIVE_EDGE_MIN_MEDIAN = 0.54
+ROBUST_SUPPORT_INLIER_ZERO = 12
+ROBUST_SUPPORT_INLIER_FULL = 40
+ROBUST_SUPPORT_OVERLAP_ZERO = 0.08
+ROBUST_SUPPORT_OVERLAP_FULL = 0.25
+ROBUST_SUPPORT_MIN_FACTOR = 0.20
+ROBUST_RATIO_DENOMINATOR_MIN = 60
+ROBUST_SCORE_MIN_INLIERS = 20
+ROBUST_SCORE_MIN_ACTIVE_MATCHES = 40
+ROBUST_OVERLAP_MIN_INLIERS_FOR_H = 30
+ROBUST_OVERLAP_MIN_INLIER_RATIO_FOR_H = 0.25
+FINAL_GATE_MIN_INLIERS = 20
+FINAL_GATE_MIN_INLIER_RATIO = 0.20
+FINAL_GATE_MIN_OVERLAP_RATIO = 0.10
 NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac"}
 # If native forward pass is weak, retry reverse orientation and keep the stronger result.
 # This stabilizes pair-debug and clustering against directional LoFTR asymmetry.
@@ -342,6 +371,30 @@ def _refine_fundamental_inliers_sampson(
 
     p0 = points0[mask].astype(np.float64)
     p1 = points1[mask].astype(np.float64)
+    sampson = _compute_fundamental_sampson_errors(p0, p1, f)
+    if sampson.size == 0:
+        return mask
+    refined_local = sampson <= float(threshold * threshold)
+
+    refined = np.zeros_like(mask, dtype=bool)
+    refined_indices = np.where(mask)[0]
+    refined[refined_indices] = refined_local
+    return refined
+
+
+def _compute_fundamental_sampson_errors(
+    points0: np.ndarray,
+    points1: np.ndarray,
+    fundamental: np.ndarray | None,
+) -> np.ndarray:
+    f = np.asarray(fundamental, dtype=np.float64) if fundamental is not None else None
+    if f is None or f.shape != (3, 3) or not np.isfinite(f).all():
+        return np.empty((0,), dtype=np.float64)
+    p0 = np.asarray(points0, dtype=np.float64)
+    p1 = np.asarray(points1, dtype=np.float64)
+    if p0.shape[0] == 0 or p0.shape[0] != p1.shape[0]:
+        return np.empty((0,), dtype=np.float64)
+
     ones = np.ones((p0.shape[0], 1), dtype=np.float64)
     x0 = np.hstack([p0, ones])  # Nx3
     x1 = np.hstack([p1, ones])  # Nx3
@@ -356,13 +409,7 @@ def _refine_fundamental_inliers_sampson(
         + np.square(ftx1[:, 1])
         + 1e-12
     )
-    sampson = numer / denom
-    refined_local = sampson <= float(threshold * threshold)
-
-    refined = np.zeros_like(mask, dtype=bool)
-    refined_indices = np.where(mask)[0]
-    refined[refined_indices] = refined_local
-    return refined
+    return numer / denom
 
 
 def _compute_gradient_magnitude(image_gray: np.ndarray) -> np.ndarray:
@@ -461,17 +508,18 @@ def _estimate_geometric_inliers(
                 points1,
                 method,
                 float(reproj_threshold),
-                0.999,
+                float(FUNDAMENTAL_RANSAC_CONFIDENCE),
             )
             inlier_mask = _safe_inlier_mask(mask, len(points0))
             if inlier_mask is None:
                 continue
-            inlier_mask = _refine_fundamental_inliers_sampson(
-                points0=points0,
-                points1=points1,
-                fundamental=fundamental,
-                inlier_mask=inlier_mask,
-            )
+            if ENABLE_FUNDAMENTAL_SAMPSON_REFINEMENT:
+                inlier_mask = _refine_fundamental_inliers_sampson(
+                    points0=points0,
+                    points1=points1,
+                    fundamental=fundamental,
+                    inlier_mask=inlier_mask,
+                )
             count = int(inlier_mask.sum())
             if count > best_fundamental_count:
                 best_fundamental_mask = inlier_mask
@@ -482,6 +530,21 @@ def _estimate_geometric_inliers(
 
     # Fundamental inliers are preferred for real camera-motion consistency.
     if best_fundamental_mask is not None and best_fundamental_count > 0:
+        # Detect planar degeneracy: H fits far better than F while F support is small.
+        h_method = cv2.USAC_MAGSAC if hasattr(cv2, "USAC_MAGSAC") else cv2.RANSAC
+        try:
+            _, mask_h = cv2.findHomography(points0, points1, h_method, float(homography_reproj_threshold))
+            inlier_mask_h = _safe_inlier_mask(mask_h, len(points0))
+            if inlier_mask_h is not None:
+                count_h = int(inlier_mask_h.sum())
+                if (
+                    count_h > 0
+                    and best_fundamental_count <= int(PLANAR_DEGENERACY_MAX_F_INLIERS)
+                    and (float(best_fundamental_count) / float(count_h)) < float(PLANAR_DEGENERACY_MIN_F_H_RATIO)
+                ):
+                    return None, "none_planar_degenerate"
+        except cv2.error:
+            pass
         return best_fundamental_mask, best_fundamental_model
 
     # Homography fallback (optional, strict) for nearly-planar scenes.
@@ -538,42 +601,53 @@ def _resize_by_longest_side_and_pad(
     }
 
 
-def _resize_rgb_by_longest_side_and_pad(
-    image_rgb: np.ndarray,
+def _maybe_trim_native_caches() -> None:
+    if len(_native_preprocessed_cache) > MAX_NATIVE_IMAGE_CACHE_ENTRIES:
+        _native_preprocessed_cache.clear()
+    if len(_native_device_tensor_cache) > (MAX_NATIVE_IMAGE_CACHE_ENTRIES * 2):
+        _native_device_tensor_cache.clear()
+
+
+def _get_native_preprocessed_entry(
+    image: Image.Image,
     target_long_side: int,
-    multiple: int = 8,
-) -> Tuple[np.ndarray, Dict[str, int]]:
-    """RGB variant of longest-side resize + right/bottom padding."""
-    h0, w0 = image_rgb.shape[:2]
-    if h0 <= 0 or w0 <= 0:
-        return image_rgb, {"content_w": max(1, w0), "content_h": max(1, h0), "pad_w": 0, "pad_h": 0}
+) -> Dict[str, Any]:
+    cache_key = (id(image), int(target_long_side))
+    entry = _native_preprocessed_cache.get(cache_key)
+    if entry is None:
+        image_gray = np.array(image.convert("L"), dtype=np.float32) / 255.0
+        gray_resized, meta = _resize_by_longest_side_and_pad(
+            image_gray,
+            target_long_side=target_long_side,
+            multiple=8,
+        )
+        entry = {
+            "gray_resized": gray_resized,
+            "meta": meta,
+        }
+        _native_preprocessed_cache[cache_key] = entry
+        _maybe_trim_native_caches()
+    return entry
 
-    long_side = max(h0, w0)
-    target = max(64, int(target_long_side))
-    scale = float(target) / float(long_side)
 
-    new_w = max(1, int(round(w0 * scale)))
-    new_h = max(1, int(round(h0 * scale)))
-    interp = cv2.INTER_LINEAR if scale >= 1.0 else cv2.INTER_AREA
-    resized = cv2.resize(image_rgb, (new_w, new_h), interpolation=interp)
+def _get_cached_native_tensor(
+    image: Image.Image,
+    gray_resized: np.ndarray,
+    target_long_side: int,
+    device: torch.device,
+) -> torch.Tensor:
+    device_key = str(device)
+    cache_key = (id(image), int(target_long_side), device_key)
+    cached = _native_device_tensor_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
-    pad_w = (multiple - (new_w % multiple)) % multiple
-    pad_h = (multiple - (new_h % multiple)) % multiple
-    padded = cv2.copyMakeBorder(
-        resized,
-        0,
-        int(pad_h),
-        0,
-        int(pad_w),
-        borderType=cv2.BORDER_CONSTANT,
-        value=(0, 0, 0),
-    )
-    return padded, {
-        "content_w": int(new_w),
-        "content_h": int(new_h),
-        "pad_w": int(pad_w),
-        "pad_h": int(pad_h),
-    }
+    tensor = torch.from_numpy(gray_resized).unsqueeze(0).unsqueeze(0)
+    if tensor.device != device:
+        tensor = tensor.to(device, non_blocking=True)
+    _native_device_tensor_cache[cache_key] = tensor
+    _maybe_trim_native_caches()
+    return tensor
 
 
 def _compute_segment_scores(
@@ -656,6 +730,7 @@ def _compute_transition_geometry_components(
             "inlier_ratio_denominator": 0.0,
             "inlier_ratio_term": 0.0,
             "inlier_volume_bonus": 0.0,
+            "inlier_volume_target": 0.0,
             "spread_area0": 0.0,
             "spread_area1": 0.0,
             "spread_bonus": 0.0,
@@ -675,7 +750,9 @@ def _compute_transition_geometry_components(
     zero_point = float(np.clip(inlier_ratio_zero_point, 0.0, 0.99))
     full_point = float(np.clip(inlier_ratio_full_point, zero_point + 1e-6, 1.0))
     inlier_ratio_term = float(np.clip((inlier_ratio - zero_point) / (full_point - zero_point), 0.0, 1.0))
-    inlier_volume_bonus = min(1.0, float(num_inliers) / 140.0)
+    # Scale volume target with the active (non-low-texture) pool so exclusions do not penalize score.
+    inlier_volume_target = float(np.clip(0.60 * float(ratio_den), 40.0, 140.0))
+    inlier_volume_bonus = min(1.0, float(num_inliers) / max(1.0, inlier_volume_target))
 
     area0 = _normalized_convex_hull_area(inlier_points0, width=width0, height=height0)
     area1 = _normalized_convex_hull_area(inlier_points1, width=width1, height=height1)
@@ -723,6 +800,7 @@ def _compute_transition_geometry_components(
         "inlier_ratio_zero_point": float(zero_point),
         "inlier_ratio_full_point": float(full_point),
         "inlier_volume_bonus": float(inlier_volume_bonus),
+        "inlier_volume_target": float(inlier_volume_target),
         "spread_area0": float(area0),
         "spread_area1": float(area1),
         "spread_bonus": float(spread_bonus),
@@ -761,6 +839,141 @@ def _compute_transition_geometry_score(
         segment_scores=segment_scores,
     )
     return float(components["final_score"])
+
+
+def _compute_robust_overlap_components(
+    inlier_ratio: float,
+    overlap_ratio: float,
+    median_epipolar_error: float,
+    f_inliers: int,
+) -> Dict[str, float]:
+    ratio_term = float(np.clip(inlier_ratio, 0.0, 1.0))
+    overlap_term = float(np.clip(overlap_ratio, 0.0, 1.0))
+    error_term = float(np.clip(1.0 - (float(median_epipolar_error) / 5.0), 0.0, 1.0))
+    inlier_term = float(np.clip(float(f_inliers) / 100.0, 0.0, 1.0))
+    base_score = float(0.45 * ratio_term + 0.40 * overlap_term + 0.10 * error_term + 0.05 * inlier_term)
+    # Small-support pairs can show inflated ratio/error metrics; damp robust score
+    # unless both inlier support and overlap support are meaningful.
+    inlier_support = float(
+        np.clip(
+            (float(f_inliers) - float(ROBUST_SUPPORT_INLIER_ZERO))
+            / max(1e-6, float(ROBUST_SUPPORT_INLIER_FULL - ROBUST_SUPPORT_INLIER_ZERO)),
+            0.0,
+            1.0,
+        )
+    )
+    overlap_support = float(
+        np.clip(
+            (float(overlap_ratio) - float(ROBUST_SUPPORT_OVERLAP_ZERO))
+            / max(1e-6, float(ROBUST_SUPPORT_OVERLAP_FULL - ROBUST_SUPPORT_OVERLAP_ZERO)),
+            0.0,
+            1.0,
+        )
+    )
+    support_multiplier = float(
+        float(ROBUST_SUPPORT_MIN_FACTOR)
+        + (1.0 - float(ROBUST_SUPPORT_MIN_FACTOR)) * inlier_support
+    )
+    overlap_multiplier = float(
+        float(ROBUST_SUPPORT_MIN_FACTOR)
+        + (1.0 - float(ROBUST_SUPPORT_MIN_FACTOR)) * overlap_support
+    )
+    combined_support = float(np.sqrt(max(0.0, support_multiplier * overlap_multiplier)))
+    final_score = float(np.clip(base_score * combined_support, 0.0, 1.0))
+    return {
+        "base_score": float(base_score),
+        "inlier_support": float(inlier_support),
+        "overlap_support": float(overlap_support),
+        "inlier_support_zero": float(ROBUST_SUPPORT_INLIER_ZERO),
+        "inlier_support_full": float(ROBUST_SUPPORT_INLIER_FULL),
+        "overlap_support_zero": float(ROBUST_SUPPORT_OVERLAP_ZERO),
+        "overlap_support_full": float(ROBUST_SUPPORT_OVERLAP_FULL),
+        "support_multiplier": float(support_multiplier),
+        "overlap_multiplier": float(overlap_multiplier),
+        "combined_support_multiplier": float(combined_support),
+        "final_score": float(final_score),
+    }
+
+
+def _compute_robust_overlap_score(
+    inlier_ratio: float,
+    overlap_ratio: float,
+    median_epipolar_error: float,
+    f_inliers: int,
+) -> float:
+    return float(
+        _compute_robust_overlap_components(
+            inlier_ratio=inlier_ratio,
+            overlap_ratio=overlap_ratio,
+            median_epipolar_error=median_epipolar_error,
+            f_inliers=f_inliers,
+        )["final_score"]
+    )
+
+
+def _estimate_homography(
+    points0: np.ndarray,
+    points1: np.ndarray,
+    reproj_threshold: float = 3.0,
+) -> Tuple[np.ndarray | None, np.ndarray | None]:
+    if points0.shape[0] < 4 or points1.shape[0] < 4 or points0.shape[0] != points1.shape[0]:
+        return None, None
+    h_method = cv2.USAC_MAGSAC if hasattr(cv2, "USAC_MAGSAC") else cv2.RANSAC
+    try:
+        homography, mask = cv2.findHomography(
+            points0,
+            points1,
+            h_method,
+            float(reproj_threshold),
+            confidence=float(FUNDAMENTAL_RANSAC_CONFIDENCE),
+        )
+    except cv2.error:
+        return None, None
+    inlier_mask = _safe_inlier_mask(mask, len(points0))
+    if homography is None or inlier_mask is None:
+        return None, None
+    return np.asarray(homography, dtype=np.float64), inlier_mask
+
+
+def _compute_homography_overlap_ratio(
+    homography_0_to_1: np.ndarray,
+    width0: int,
+    height0: int,
+    width1: int,
+    height1: int,
+) -> Tuple[float, float, float]:
+    if homography_0_to_1 is None or homography_0_to_1.shape != (3, 3):
+        return 0.0, 0.0, 0.0
+
+    mask0 = np.ones((max(1, int(height0)), max(1, int(width0))), dtype=np.uint8)
+    warped_0_to_1 = cv2.warpPerspective(
+        mask0,
+        homography_0_to_1,
+        (max(1, int(width1)), max(1, int(height1))),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    overlap_0_to_1 = float(np.mean(warped_0_to_1 > 0))
+
+    overlap_1_to_0 = 0.0
+    try:
+        homography_1_to_0 = np.linalg.inv(homography_0_to_1)
+        mask1 = np.ones((max(1, int(height1)), max(1, int(width1))), dtype=np.uint8)
+        warped_1_to_0 = cv2.warpPerspective(
+            mask1,
+            homography_1_to_0,
+            (max(1, int(width0)), max(1, int(height0))),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        overlap_1_to_0 = float(np.mean(warped_1_to_0 > 0))
+    except (np.linalg.LinAlgError, cv2.error):
+        overlap_1_to_0 = 0.0
+
+    symmetric_overlap = float(min(overlap_0_to_1, overlap_1_to_0))
+    return symmetric_overlap, overlap_0_to_1, overlap_1_to_0
 
 
 def _sample_normalized_matches(
@@ -885,44 +1098,190 @@ def strict_geometry_edge_gate(
     - geometry quality score
     """
     if num_matches is None or num_inliers is None:
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            0.0,
+            0.0,
+            "no",
+            float(geometric_score) if geometric_score is not None else 0.0,
+            "missing_counts",
+        )
         return False
-    if num_matches < NATIVE_EDGE_MIN_MATCHES:
+
+    inlier_ratio = float(num_inliers) / max(1.0, float(num_matches))
+    overlap_ratio = 0.0
+    robust_valid = False
+    combined_score = float(geometric_score) if geometric_score is not None else 0.0
+    score_components: Dict[str, Any] = {}
+    if isinstance(diagnostics, dict):
+        score_components = diagnostics.get("score_components")
+        if isinstance(score_components, dict):
+            inlier_ratio = float(score_components.get("inlier_ratio", inlier_ratio) or inlier_ratio)
+            overlap_ratio = float(
+                score_components.get(
+                    "overlap_ratio",
+                    score_components.get("robust_coverage", overlap_ratio),
+                )
+                or overlap_ratio
+            )
+            robust_valid = bool(int(score_components.get("robust_score_valid", 0) or 0))
+            combined_score = float(score_components.get("combined_score", combined_score) or combined_score)
+
+    # Final geometric safety gate (hard reject).
+    if int(num_inliers) < int(FINAL_GATE_MIN_INLIERS):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "final_gate_inliers",
+        )
         return False
+    if inlier_ratio < float(FINAL_GATE_MIN_INLIER_RATIO):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "final_gate_inlier_ratio",
+        )
+        return False
+    if overlap_ratio < float(FINAL_GATE_MIN_OVERLAP_RATIO):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "final_gate_overlap_ratio",
+        )
+        return False
+
     required_inliers = max(int(min_inliers_required), int(NATIVE_EDGE_MIN_INLIERS))
     if num_inliers < required_inliers:
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "min_inliers_required",
+        )
+        return False
+    if inlier_ratio < float(NATIVE_EDGE_MIN_INLIER_RATIO):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "native_inlier_ratio",
+        )
+        return False
+    if overlap_ratio < float(NATIVE_EDGE_MIN_OVERLAP_RATIO):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "native_overlap_ratio",
+        )
         return False
     if not geometry_quality_gate(geometric_score, diagnostics):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "geometry_quality_gate",
+        )
         return False
     if not isinstance(diagnostics, dict):
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            "missing_diagnostics",
+        )
         return False
 
     geom_model = str(diagnostics.get("geometry_model") or "").strip().lower()
     if geom_model not in NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS:
+        logger.info(
+            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+            "combined_score=%.3f reason=%s",
+            num_inliers,
+            inlier_ratio,
+            overlap_ratio,
+            "yes" if robust_valid else "no",
+            combined_score,
+            f"geometry_model:{geom_model or 'none'}",
+        )
         return False
 
-    native_scores = diagnostics.get("native_matching_scores")
-    filter_scores = diagnostics.get("filter_scores")
-    score_mean = 0.0
-    score_median = 0.0
-
-    if isinstance(filter_scores, dict):
-        combined = filter_scores.get("combined")
-        if isinstance(combined, dict):
-            score_mean = float(combined.get("removed_score_mean", 0.0) or 0.0)
-            score_median = float(combined.get("removed_score_median", 0.0) or 0.0)
-
-    # Fallback for lightweight diagnostics (or missing filter stats).
-    if score_mean <= 0.0 or score_median <= 0.0:
-        if not isinstance(native_scores, dict):
-            return False
-        score_mean = float(native_scores.get("mean", 0.0) or 0.0)
-        score_median = float(native_scores.get("median", 0.0) or 0.0)
-
-    if score_mean < NATIVE_EDGE_MIN_MEAN:
-        return False
-    if score_median < NATIVE_EDGE_MIN_MEDIAN:
-        return False
+    logger.info(
+        "    strict_gate decision=accept num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
+        "combined_score=%.3f reason=%s",
+        num_inliers,
+        inlier_ratio,
+        overlap_ratio,
+        "yes" if robust_valid else "no",
+        combined_score,
+        "passed",
+    )
     return True
+
+
+def _extract_pair_runtime_metrics(
+    diagnostics: Dict[str, Any] | None,
+    fallback_pair_time_s: float,
+) -> Dict[str, float]:
+    timing = diagnostics.get("timing") if isinstance(diagnostics, dict) else None
+    if not isinstance(timing, dict):
+        return {
+            "time_pair_total_s": float(max(0.0, fallback_pair_time_s)),
+            "time_loftr_s": 0.0,
+            "time_resize_s": 0.0,
+            "time_tensor_transfer_s": 0.0,
+            "time_postprocess_s": 0.0,
+            "time_f_s": 0.0,
+            "time_h_s": 0.0,
+            "time_scoring_s": 0.0,
+        }
+    return {
+        "time_pair_total_s": float(timing.get("time_pair_total_s", fallback_pair_time_s) or fallback_pair_time_s),
+        "time_loftr_s": float(timing.get("time_loftr_s", 0.0) or 0.0),
+        "time_resize_s": float(timing.get("time_resize_s", 0.0) or 0.0),
+        "time_tensor_transfer_s": float(timing.get("time_tensor_transfer_s", 0.0) or 0.0),
+        "time_postprocess_s": float(timing.get("time_postprocess_s", 0.0) or 0.0),
+        "time_f_s": float(timing.get("time_f_s", 0.0) or 0.0),
+        "time_h_s": float(timing.get("time_h_s", 0.0) or 0.0),
+        "time_scoring_s": float(timing.get("time_scoring_s", 0.0) or 0.0),
+    }
 
 
 def rooms_are_different(room1: str, room2: str) -> bool:
@@ -1901,7 +2260,7 @@ def _load_kornia_oracle_ransac():
     return _kornia_oracle_ransac
 
 
-def _compute_homography_overlap_ratio(
+def _compute_homography_overlap_ratio_convex(
     homography: np.ndarray,
     width: int,
     height: int,
@@ -1972,7 +2331,7 @@ def _evaluate_kornia_oracle(
 
         kornia_inliers = int(inlier_mask.sum())
         kornia_inlier_ratio = float(kornia_inliers / max(1, len(inlier_points0)))
-        overlap_ratio = _compute_homography_overlap_ratio(homography, width=width, height=height)
+        overlap_ratio = _compute_homography_overlap_ratio_convex(homography, width=width, height=height)
         side_overlap = max(
             float(segment_scores.get("cross_left_to_right", 0.0)),
             float(segment_scores.get("cross_right_to_left", 0.0)),
@@ -2064,7 +2423,7 @@ def _load_loftr_checkpoint(checkpoint: str):
     if checkpoint in _loftr_matchers:
         return _loftr_matchers[checkpoint]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _preferred_torch_device()
     from kornia.feature import LoFTR
 
     matcher = LoFTR(pretrained=checkpoint)
@@ -2125,381 +2484,6 @@ def _matching_score_summary(scores: np.ndarray) -> Dict[str, float]:
     }
 
 
-def _sample_scalar_map_at_points(map_image: np.ndarray, points: np.ndarray) -> np.ndarray:
-    if points.size == 0:
-        return np.empty((0,), dtype=np.float32)
-    h, w = map_image.shape[:2]
-    if h <= 0 or w <= 0:
-        return np.zeros((len(points),), dtype=np.float32)
-    xs = np.clip(np.rint(points[:, 0]).astype(np.int32), 0, w - 1)
-    ys = np.clip(np.rint(points[:, 1]).astype(np.int32), 0, h - 1)
-    return np.ascontiguousarray(map_image[ys, xs], dtype=np.float32)
-
-
-def _local_std_map(image_gray: np.ndarray, window: int = LOFTR_FILTER_LOCAL_WINDOW) -> np.ndarray:
-    k = max(3, int(window) | 1)
-    mean = cv2.boxFilter(image_gray, ddepth=-1, ksize=(k, k), normalize=True)
-    mean_sq = cv2.boxFilter(image_gray * image_gray, ddepth=-1, ksize=(k, k), normalize=True)
-    var = np.maximum(mean_sq - mean * mean, 0.0)
-    std = np.sqrt(var)
-    vmax = float(std.max()) if std.size > 0 else 0.0
-    if vmax > 1e-6:
-        std = std / vmax
-    return np.ascontiguousarray(std, dtype=np.float32)
-
-
-def _filter_metric(
-    scores: np.ndarray,
-    keep_mask: np.ndarray,
-    base_mask: np.ndarray | None = None,
-) -> Dict[str, float]:
-    total = int(scores.size)
-    if total == 0:
-        return {
-            "kept_count": 0.0,
-            "removed_count": 0.0,
-            "excluded_count": 0.0,
-            "active_total": 0.0,
-            "kept_ratio": 0.0,
-            "kept_score_mean": 0.0,
-            "kept_score_median": 0.0,
-            "removed_score_mean": 0.0,
-            "removed_score_median": 0.0,
-            "kept_count_term": 0.0,
-            "final_score": 0.0,
-        }
-
-    keep = np.asarray(keep_mask, dtype=bool)
-    if keep.shape[0] != total:
-        keep = np.ones((total,), dtype=bool)
-
-    if base_mask is None:
-        active = np.ones((total,), dtype=bool)
-    else:
-        active = np.asarray(base_mask, dtype=bool)
-        if active.shape[0] != total:
-            active = np.ones((total,), dtype=bool)
-
-    keep_active = keep & active
-    removed_active = (~keep) & active
-    active_total = int(active.sum())
-    excluded_count = int(total - active_total)
-    kept_count = int(keep_active.sum())
-    removed_count = int(removed_active.sum())
-
-    if active_total <= 0:
-        return {
-            "kept_count": 0.0,
-            "removed_count": 0.0,
-            "excluded_count": float(excluded_count),
-            "active_total": 0.0,
-            "kept_ratio": 0.0,
-            "kept_score_mean": 0.0,
-            "kept_score_median": 0.0,
-            "removed_score_mean": 0.0,
-            "removed_score_median": 0.0,
-            "kept_count_term": 0.0,
-            "final_score": 0.0,
-        }
-
-    kept_ratio = float(kept_count / max(1, active_total))
-    kept_score_mean = float(np.mean(scores[keep_active])) if kept_count > 0 else 0.0
-    kept_score_median = float(np.median(scores[keep_active])) if kept_count > 0 else 0.0
-    removed_score_mean = float(np.mean(scores[removed_active])) if removed_count > 0 else 0.0
-    removed_score_median = float(np.median(scores[removed_active])) if removed_count > 0 else 0.0
-
-    # Scale count targets by active population so neutral exclusions (e.g. low texture)
-    # do not penalize the final score.
-    active_scale = float(active_total / max(1, total))
-    count_zero = float(LOFTR_FILTER_KEEP_COUNT_ZERO) * active_scale
-    count_target = float(max(LOFTR_FILTER_KEEP_COUNT_TARGET * active_scale, count_zero + 1.0))
-    kept_count_term = float(np.clip((float(kept_count) - count_zero) / (count_target - count_zero), 0.0, 1.0))
-    final_score = float(
-        kept_score_mean
-        * ((1.0 - LOFTR_FILTER_FINAL_KEEP_WEIGHT) + LOFTR_FILTER_FINAL_KEEP_WEIGHT * kept_ratio)
-        * (0.30 + 0.70 * kept_count_term)
-    )
-    return {
-        "kept_count": float(kept_count),
-        "removed_count": float(removed_count),
-        "excluded_count": float(excluded_count),
-        "active_total": float(active_total),
-        "kept_ratio": float(kept_ratio),
-        "kept_score_mean": float(kept_score_mean),
-        "kept_score_median": float(kept_score_median),
-        "removed_score_mean": float(removed_score_mean),
-        "removed_score_median": float(removed_score_median),
-        "kept_count_term": float(kept_count_term),
-        "final_score": float(final_score),
-    }
-
-
-def _analyze_loftr_match_filters(
-    points0: np.ndarray,
-    points1: np.ndarray,
-    scores: np.ndarray,
-    image0_gray: np.ndarray,
-    image1_gray: np.ndarray,
-    image0_rgb: np.ndarray | None = None,
-    image1_rgb: np.ndarray | None = None,
-) -> Dict[str, Any]:
-    """Compute per-filter mask rejection and score summaries for LoFTR debug."""
-    n = int(min(len(points0), len(points1), len(scores)))
-    if n <= 0:
-        return {
-            "config": {
-                "local_window": float(LOFTR_FILTER_LOCAL_WINDOW),
-                "min_grad_norm": float(LOFTR_FILTER_MIN_GRAD),
-                "min_local_std_norm": float(LOFTR_FILTER_MIN_STD),
-                "final_keep_weight": float(LOFTR_FILTER_FINAL_KEEP_WEIGHT),
-            },
-            "scores": {"combined": _filter_metric(np.empty((0,), dtype=np.float32), np.empty((0,), dtype=bool))},
-            "filtered_keep_mask": np.empty((0,), dtype=bool),
-            "reject_masks": {},
-        }
-
-    points0 = np.ascontiguousarray(points0[:n], dtype=np.float32)
-    points1 = np.ascontiguousarray(points1[:n], dtype=np.float32)
-    scores = np.ascontiguousarray(scores[:n], dtype=np.float32)
-    h0, w0 = image0_gray.shape[:2]
-    h1, w1 = image1_gray.shape[:2]
-
-    grad0 = _compute_gradient_magnitude(image0_gray)
-    grad1 = _compute_gradient_magnitude(image1_gray)
-    g0_max = float(grad0.max()) if grad0.size > 0 else 0.0
-    g1_max = float(grad1.max()) if grad1.size > 0 else 0.0
-    if g0_max > 1e-6:
-        grad0 = grad0 / g0_max
-    if g1_max > 1e-6:
-        grad1 = grad1 / g1_max
-    std0 = _local_std_map(image0_gray)
-    std1 = _local_std_map(image1_gray)
-
-    p_grad0 = _sample_scalar_map_at_points(grad0, points0)
-    p_grad1 = _sample_scalar_map_at_points(grad1, points1)
-    p_std0 = _sample_scalar_map_at_points(std0, points0)
-    p_std1 = _sample_scalar_map_at_points(std1, points1)
-
-    y0n = np.clip(points0[:, 1] / max(1.0, float(h0)), 0.0, 1.0)
-    y1n = np.clip(points1[:, 1] / max(1.0, float(h1)), 0.0, 1.0)
-
-    sat0 = np.zeros((n,), dtype=np.float32)
-    sat1 = np.zeros((n,), dtype=np.float32)
-    val0 = np.zeros((n,), dtype=np.float32)
-    val1 = np.zeros((n,), dtype=np.float32)
-    blue_dom0 = np.zeros((n,), dtype=np.float32)
-    blue_dom1 = np.zeros((n,), dtype=np.float32)
-    has_rgb = image0_rgb is not None and image1_rgb is not None
-    if has_rgb:
-        hsv0 = cv2.cvtColor(np.asarray(image0_rgb, dtype=np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-        hsv1 = cv2.cvtColor(np.asarray(image1_rgb, dtype=np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-        sat0_map = hsv0[:, :, 1] / 255.0
-        sat1_map = hsv1[:, :, 1] / 255.0
-        val0_map = hsv0[:, :, 2] / 255.0
-        val1_map = hsv1[:, :, 2] / 255.0
-        rgb0 = np.asarray(image0_rgb, dtype=np.float32) / 255.0
-        rgb1 = np.asarray(image1_rgb, dtype=np.float32) / 255.0
-        blue_dom0_map = rgb0[:, :, 2] - np.maximum(rgb0[:, :, 0], rgb0[:, :, 1])
-        blue_dom1_map = rgb1[:, :, 2] - np.maximum(rgb1[:, :, 0], rgb1[:, :, 1])
-
-        sat0 = _sample_scalar_map_at_points(sat0_map, points0)
-        sat1 = _sample_scalar_map_at_points(sat1_map, points1)
-        val0 = _sample_scalar_map_at_points(val0_map, points0)
-        val1 = _sample_scalar_map_at_points(val1_map, points1)
-        blue_dom0 = _sample_scalar_map_at_points(blue_dom0_map, points0)
-        blue_dom1 = _sample_scalar_map_at_points(blue_dom1_map, points1)
-
-    low_texture_pair = (p_grad0 < LOFTR_FILTER_MIN_GRAD) & (p_grad1 < LOFTR_FILTER_MIN_GRAD)
-    low_variance_pair = (p_std0 < LOFTR_FILTER_MIN_STD) & (p_std1 < LOFTR_FILTER_MIN_STD)
-
-    sky_pair = np.zeros((n,), dtype=bool)
-    ceiling_pair = np.zeros((n,), dtype=bool)
-    floor_pair = np.zeros((n,), dtype=bool)
-    wall_pair = np.zeros((n,), dtype=bool)
-    if has_rgb:
-        sky0 = (
-            (y0n <= LOFTR_FILTER_SKY_TOP_MAX_Y)
-            & (val0 > 0.35)
-            & ((blue_dom0 > 0.08) | ((sat0 < 0.12) & (val0 > 0.78)))
-        )
-        sky1 = (
-            (y1n <= LOFTR_FILTER_SKY_TOP_MAX_Y)
-            & (val1 > 0.35)
-            & ((blue_dom1 > 0.08) | ((sat1 < 0.12) & (val1 > 0.78)))
-        )
-        sky_pair = sky0 & sky1
-
-        ceiling0 = (
-            (y0n <= LOFTR_FILTER_CEILING_TOP_MAX_Y)
-            & (sat0 < LOFTR_FILTER_LOW_SAT)
-            & (val0 > LOFTR_FILTER_BRIGHT)
-            & (p_grad0 < 0.10)
-            & (p_std0 < 0.10)
-        )
-        ceiling1 = (
-            (y1n <= LOFTR_FILTER_CEILING_TOP_MAX_Y)
-            & (sat1 < LOFTR_FILTER_LOW_SAT)
-            & (val1 > LOFTR_FILTER_BRIGHT)
-            & (p_grad1 < 0.10)
-            & (p_std1 < 0.10)
-        )
-        ceiling_pair = ceiling0 & ceiling1
-
-        floor0 = (
-            (y0n >= LOFTR_FILTER_FLOOR_BOTTOM_MIN_Y)
-            & (sat0 < LOFTR_FILTER_LOW_SAT)
-            & (p_grad0 < 0.11)
-            & (p_std0 < 0.11)
-        )
-        floor1 = (
-            (y1n >= LOFTR_FILTER_FLOOR_BOTTOM_MIN_Y)
-            & (sat1 < LOFTR_FILTER_LOW_SAT)
-            & (p_grad1 < 0.11)
-            & (p_std1 < 0.11)
-        )
-        floor_pair = floor0 & floor1
-
-        wall0 = (
-            (y0n >= LOFTR_FILTER_WALL_MIN_Y)
-            & (y0n <= LOFTR_FILTER_WALL_MAX_Y)
-            & (sat0 < LOFTR_FILTER_LOW_SAT)
-            & (p_grad0 < 0.09)
-            & (p_std0 < 0.09)
-        )
-        wall1 = (
-            (y1n >= LOFTR_FILTER_WALL_MIN_Y)
-            & (y1n <= LOFTR_FILTER_WALL_MAX_Y)
-            & (sat1 < LOFTR_FILTER_LOW_SAT)
-            & (p_grad1 < 0.09)
-            & (p_std1 < 0.09)
-        )
-        wall_pair = wall0 & wall1
-
-    weak_detail_pair = low_texture_pair & low_variance_pair
-
-    reject_masks: Dict[str, np.ndarray] = {
-        "low_texture_pair": low_texture_pair,
-        "low_variance_pair": low_variance_pair,
-        "weak_detail_pair": weak_detail_pair,
-        "sky_pair": sky_pair,
-        "ceiling_pair": ceiling_pair,
-        "floor_pair": floor_pair,
-        "wall_pair": wall_pair,
-    }
-    # Keep low_texture/low_variance as diagnostics only.
-    # Treat only clearly risky regions as hard rejections in "combined".
-    hard_reject_keys = {
-        "weak_detail_pair",
-        "sky_pair",
-        "ceiling_pair",
-        "floor_pair",
-        "wall_pair",
-    }
-    combined_reject = np.zeros((n,), dtype=bool)
-    score_table: Dict[str, Dict[str, float]] = {}
-    for key, reject_mask in reject_masks.items():
-        single_keep = ~reject_mask
-        score_table[key] = _filter_metric(scores, single_keep)
-        if key in hard_reject_keys:
-            combined_reject |= reject_mask
-    combined_base = ~low_texture_pair
-    combined_keep = (~combined_reject) & combined_base
-    # Combined metric is evaluated only on non-low-texture population.
-    score_table["combined"] = _filter_metric(scores, combined_keep, base_mask=combined_base)
-
-    return {
-        "config": {
-            "local_window": float(LOFTR_FILTER_LOCAL_WINDOW),
-            "min_grad_norm": float(LOFTR_FILTER_MIN_GRAD),
-            "min_local_std_norm": float(LOFTR_FILTER_MIN_STD),
-            "sky_top_max_y": float(LOFTR_FILTER_SKY_TOP_MAX_Y),
-            "ceiling_top_max_y": float(LOFTR_FILTER_CEILING_TOP_MAX_Y),
-            "floor_bottom_min_y": float(LOFTR_FILTER_FLOOR_BOTTOM_MIN_Y),
-            "wall_min_y": float(LOFTR_FILTER_WALL_MIN_Y),
-            "wall_max_y": float(LOFTR_FILTER_WALL_MAX_Y),
-            "low_saturation_max": float(LOFTR_FILTER_LOW_SAT),
-            "bright_min_value": float(LOFTR_FILTER_BRIGHT),
-            "final_keep_weight": float(LOFTR_FILTER_FINAL_KEEP_WEIGHT),
-            "uses_color_masks": bool(has_rgb),
-            "combined_hard_reject_keys": sorted(hard_reject_keys),
-        },
-        "scores": score_table,
-        "filtered_keep_mask": combined_keep,
-        "reject_masks": reject_masks,
-    }
-
-
-def _build_filter_match_sets(
-    points0: np.ndarray,
-    points1: np.ndarray,
-    width0: int,
-    height0: int,
-    width1: int,
-    height1: int,
-    filter_analysis: Dict[str, Any],
-) -> Dict[str, List[Dict[str, float]]]:
-    """Build normalized point overlays for each filter mode."""
-    result: Dict[str, List[Dict[str, float]]] = {}
-    result["loftr"] = _sample_normalized_matches(
-        points0=points0,
-        points1=points1,
-        width0=width0,
-        height0=height0,
-        width1=width1,
-        height1=height1,
-        max_points=5000,
-    )
-
-    n = int(len(points0))
-    keep_mask = np.asarray(filter_analysis.get("filtered_keep_mask", np.empty((0,), dtype=bool)), dtype=bool)
-    if keep_mask.shape[0] != n:
-        keep_mask = np.ones((n,), dtype=bool)
-    result["combined"] = _sample_normalized_matches(
-        points0=points0[keep_mask] if n > 0 else np.empty((0, 2), dtype=np.float32),
-        points1=points1[keep_mask] if n > 0 else np.empty((0, 2), dtype=np.float32),
-        width0=width0,
-        height0=height0,
-        width1=width1,
-        height1=height1,
-        max_points=5000,
-    )
-
-    reject_masks = filter_analysis.get("reject_masks")
-    if isinstance(reject_masks, dict):
-        for name, mask in reject_masks.items():
-            mask_arr = np.asarray(mask, dtype=bool)
-            if mask_arr.shape[0] != n:
-                continue
-            result[str(name)] = _sample_normalized_matches(
-                points0=points0[mask_arr] if n > 0 else np.empty((0, 2), dtype=np.float32),
-                points1=points1[mask_arr] if n > 0 else np.empty((0, 2), dtype=np.float32),
-                width0=width0,
-                height0=height0,
-                width1=width1,
-                height1=height1,
-                max_points=5000,
-            )
-    return result
-
-
-def _encode_debug_image_data_url(image: Image.Image, max_width: int = 1800) -> str | None:
-    if image is None:
-        return None
-    try:
-        preview = image.copy()
-        if preview.width > max_width and preview.width > 0:
-            scale = float(max_width / float(preview.width))
-            new_h = max(1, int(preview.height * scale))
-            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
-            preview = preview.resize((max_width, new_h), resampling)
-        buffer = io.BytesIO()
-        preview.save(buffer, format="JPEG", quality=88, optimize=True)
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        return f"data:image/jpeg;base64,{encoded}"
-    except Exception:
-        return None
-
-
 def _extract_loftr_points_and_scores(correspondences: Dict[str, Any] | None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not isinstance(correspondences, dict):
         return (
@@ -2545,10 +2529,6 @@ def _build_native_loftr_diagnostics(
     height1: int,
     input_w: int | None,
     input_h: int | None,
-    image0_gray: np.ndarray,
-    image1_gray: np.ndarray,
-    image0_rgb: np.ndarray | None = None,
-    image1_rgb: np.ndarray | None = None,
     full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     raw_count = int(len(points0))
@@ -2557,42 +2537,16 @@ def _build_native_loftr_diagnostics(
     conf_points1 = points1[conf_mask] if raw_count > 0 else np.empty((0, 2), dtype=np.float32)
     conf_scores = scores[conf_mask] if raw_count > 0 else np.empty((0,), dtype=np.float32)
     kept_count = int(len(conf_points0))
-    native_score_summary = _matching_score_summary(conf_scores)
+    native_threshold_summary = _matching_score_summary(conf_scores)
     native_raw_summary = _matching_score_summary(scores)
-    # Always compute filter scores so strict gating can use removed-score stats.
-    # In non-debug flow image*_rgb is None, so only grayscale-based filters are active.
-    filter_analysis = _analyze_loftr_match_filters(
-        points0=conf_points0,
-        points1=conf_points1,
-        scores=conf_scores,
-        image0_gray=image0_gray,
-        image1_gray=image1_gray,
-        image0_rgb=image0_rgb,
-        image1_rgb=image1_rgb,
-    )
-    filter_keep_mask = np.asarray(filter_analysis.get("filtered_keep_mask", np.empty((0,), dtype=bool)), dtype=bool)
-    if filter_keep_mask.shape[0] != kept_count:
-        filter_keep_mask = np.ones((kept_count,), dtype=bool)
-    filter_combined = filter_analysis.get("scores", {}).get("combined", {})
-    filtered_final_score = float(filter_combined.get("final_score", 0.0) or 0.0)
-    inlier_ratio_denominator = int(round(float(filter_combined.get("active_total", kept_count) or kept_count)))
+    active_points0 = conf_points0
+    active_points1 = conf_points1
+    active_scores = conf_scores
+    active_count = int(len(active_points0))
+    native_score_summary = _matching_score_summary(active_scores)
+    inlier_ratio_denominator = int(max(ROBUST_RATIO_DENOMINATOR_MIN, active_count))
     if inlier_ratio_denominator <= 0:
-        inlier_ratio_denominator = int(max(1, kept_count))
-    filtered_points0 = conf_points0[filter_keep_mask] if kept_count > 0 else conf_points0
-    filtered_points1 = conf_points1[filter_keep_mask] if kept_count > 0 else conf_points1
-    if full_diagnostics:
-        filter_match_sets = _build_filter_match_sets(
-            points0=conf_points0,
-            points1=conf_points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            filter_analysis=filter_analysis,
-        )
-    else:
-        filter_match_sets = {}
-
+        inlier_ratio_denominator = int(max(ROBUST_RATIO_DENOMINATOR_MIN, kept_count))
     inlier_points0 = np.empty((0, 2), dtype=np.float32)
     inlier_points1 = np.empty((0, 2), dtype=np.float32)
     geometry_model = "none"
@@ -2607,7 +2561,7 @@ def _build_native_loftr_diagnostics(
         height1=height1,
     )
     score_components = _compute_transition_geometry_components(
-        num_matches=kept_count,
+        num_matches=active_count,
         num_inliers=0,
         inlier_points0=inlier_points0,
         inlier_points1=inlier_points1,
@@ -2621,19 +2575,30 @@ def _build_native_loftr_diagnostics(
         inlier_ratio_denominator=inlier_ratio_denominator,
     )
     geometric_score = 0.0
+    robust_overlap_score = 0.0
+    overlap_ratio = 0.0
+    overlap_ratio_0_to_1 = 0.0
+    overlap_ratio_1_to_0 = 0.0
+    median_epipolar_error = 5.0
+    overlap_centroid_x0 = 0.0
+    overlap_centroid_x1 = 0.0
+    fundamental_seconds = 0.0
+    homography_seconds = 0.0
 
-    if kept_count >= 8:
+    if active_count >= 8:
+        f_started_at = time.perf_counter()
         inlier_mask, geometry_model = _estimate_geometric_inliers(
-            conf_points0,
-            conf_points1,
+            active_points0,
+            active_points1,
             reproj_threshold=RANSAC_REPROJ_THRESHOLD,
         )
+        fundamental_seconds += (time.perf_counter() - f_started_at)
         if inlier_mask is not None:
             num_inliers = int(inlier_mask.sum())
             if num_inliers > 0:
-                inlier_points0 = conf_points0[inlier_mask]
-                inlier_points1 = conf_points1[inlier_mask]
-                direction = compute_direction_vector(conf_points0, conf_points1, inlier_mask)
+                inlier_points0 = active_points0[inlier_mask]
+                inlier_points1 = active_points1[inlier_mask]
+                direction = compute_direction_vector(active_points0, active_points1, inlier_mask)
                 segment_scores = _compute_segment_scores(
                     inlier_points0,
                     inlier_points1,
@@ -2643,7 +2608,7 @@ def _build_native_loftr_diagnostics(
                     height1=height1,
                 )
                 score_components = _compute_transition_geometry_components(
-                    num_matches=kept_count,
+                    num_matches=active_count,
                     num_inliers=num_inliers,
                     inlier_points0=inlier_points0,
                     inlier_points1=inlier_points1,
@@ -2657,28 +2622,136 @@ def _build_native_loftr_diagnostics(
                     inlier_ratio_denominator=inlier_ratio_denominator,
                 )
                 geometric_score = float(score_components.get("final_score", 0.0) or 0.0)
+                overlap_centroid_x0 = float(np.mean(inlier_points0[:, 0]) / max(1.0, float(width0)))
+                overlap_centroid_x1 = float(np.mean(inlier_points1[:, 0]) / max(1.0, float(width1)))
+                f_inlier_ratio_active = float(num_inliers) / max(1.0, float(active_count))
+                if (
+                    num_inliers >= int(ROBUST_OVERLAP_MIN_INLIERS_FOR_H)
+                    and f_inlier_ratio_active >= float(ROBUST_OVERLAP_MIN_INLIER_RATIO_FOR_H)
+                ):
+                    # Estimate homography on F-inliers only, then compute symmetric overlap mask ratio.
+                    h_started_at = time.perf_counter()
+                    h_from_f, _ = _estimate_homography(inlier_points0, inlier_points1, reproj_threshold=3.0)
+                    if h_from_f is not None:
+                        overlap_ratio, overlap_ratio_0_to_1, overlap_ratio_1_to_0 = _compute_homography_overlap_ratio(
+                            h_from_f,
+                            width0=width0,
+                            height0=height0,
+                            width1=width1,
+                            height1=height1,
+                        )
+                    homography_seconds += (time.perf_counter() - h_started_at)
 
-    count_zero = float(NATIVE_SCORE_COUNT_ZERO)
-    count_target = float(max(NATIVE_SCORE_COUNT_TARGET, NATIVE_SCORE_COUNT_ZERO + 1))
-    match_count_term = float(np.clip((float(kept_count) - count_zero) / (count_target - count_zero), 0.0, 1.0))
-    combined_score = float(geometric_score * (0.30 + 0.70 * match_count_term))
+    scoring_started_at = time.perf_counter()
+    inlier_ratio_for_overlap = float(score_components.get("inlier_ratio", 0.0) or 0.0)
+    robust_coverage = float(overlap_ratio)
+    if (
+        geometry_model in {"fundamental_magsac", "fundamental_ransac"}
+        and int(num_inliers) >= 8
+        and inlier_points0.shape[0] >= 8
+        and inlier_points1.shape[0] >= 8
+    ):
+        try:
+            fundamental_refit, _ = cv2.findFundamentalMat(
+                inlier_points0,
+                inlier_points1,
+                cv2.FM_8POINT,
+            )
+            sampson_errors = _compute_fundamental_sampson_errors(
+                inlier_points0,
+                inlier_points1,
+                fundamental_refit,
+            )
+            if sampson_errors.size > 0:
+                median_epipolar_error = float(np.median(np.sqrt(np.maximum(0.0, sampson_errors))))
+        except cv2.error:
+            median_epipolar_error = 5.0
+    robust_components = _compute_robust_overlap_components(
+        inlier_ratio=inlier_ratio_for_overlap,
+        overlap_ratio=robust_coverage,
+        median_epipolar_error=median_epipolar_error,
+        f_inliers=int(num_inliers),
+    )
+    robust_score_valid = bool(
+        int(num_inliers) >= int(ROBUST_SCORE_MIN_INLIERS)
+        and int(active_count) >= int(ROBUST_SCORE_MIN_ACTIVE_MATCHES)
+    )
+    robust_overlap_score_raw = float(robust_components.get("final_score", 0.0) or 0.0)
+    # Smooth small-support penalty: medium-low inlier counts should not remain high-scoring.
+    if int(num_inliers) < 40:
+        robust_overlap_score_raw *= max(0.0, float(num_inliers) / 40.0)
+    robust_overlap_score = float(robust_overlap_score_raw) if robust_score_valid else 0.0
+    transition_overlap_score = float(geometric_score)
+    geometric_score = float(robust_overlap_score)
+    overlap_centroid_shift_x = float(overlap_centroid_x1 - overlap_centroid_x0)
+    overlap_side_code0 = -1.0 if overlap_centroid_x0 < 0.4 else (1.0 if overlap_centroid_x0 > 0.6 else 0.0)
+    overlap_side_code1 = -1.0 if overlap_centroid_x1 < 0.4 else (1.0 if overlap_centroid_x1 > 0.6 else 0.0)
+
+    # Count calibration operates on the confidence-thresholded active set.
+    active_count_for_count_term = int(max(1, inlier_ratio_denominator))
+    count_zero = float(np.clip(float(NATIVE_SCORE_COUNT_ZERO), 0.0, max(0.0, float(active_count_for_count_term - 1))))
+    count_target = float(
+        np.clip(float(NATIVE_SCORE_COUNT_TARGET), count_zero + 1.0, float(max(1, active_count_for_count_term)))
+    )
+    match_count_term = float(
+        np.clip((float(active_count_for_count_term) - count_zero) / (count_target - count_zero), 0.0, 1.0)
+    )
+    if robust_score_valid:
+        combined_score = float(geometric_score * (0.30 + 0.70 * match_count_term))
+    else:
+        combined_score = float(transition_overlap_score * 0.5)
+    scoring_seconds = time.perf_counter() - scoring_started_at
     score_components = dict(score_components or {})
+    score_components["match_count_source"] = float(active_count_for_count_term)
+    score_components["match_count_zero"] = float(count_zero)
+    score_components["match_count_target"] = float(count_target)
     score_components["match_count_term"] = float(match_count_term)
+    score_components["transition_overlap_score"] = float(transition_overlap_score)
+    score_components["robust_overlap_score"] = float(robust_overlap_score)
+    score_components["robust_overlap_score_raw"] = float(robust_overlap_score_raw)
+    score_components["robust_small_support_factor"] = float(min(1.0, max(0.0, float(num_inliers) / 40.0)))
+    score_components["robust_score_valid"] = 1.0 if robust_score_valid else 0.0
+    score_components["robust_score_min_inliers"] = float(ROBUST_SCORE_MIN_INLIERS)
+    score_components["robust_score_min_active_matches"] = float(ROBUST_SCORE_MIN_ACTIVE_MATCHES)
+    score_components["robust_base_score"] = float(robust_components.get("base_score", 0.0) or 0.0)
+    score_components["robust_inlier_support"] = float(robust_components.get("inlier_support", 0.0) or 0.0)
+    score_components["robust_overlap_support"] = float(robust_components.get("overlap_support", 0.0) or 0.0)
+    score_components["robust_support_multiplier"] = float(
+        robust_components.get("support_multiplier", 0.0) or 0.0
+    )
+    score_components["robust_overlap_multiplier"] = float(
+        robust_components.get("overlap_multiplier", 0.0) or 0.0
+    )
+    score_components["robust_combined_support_multiplier"] = float(
+        robust_components.get("combined_support_multiplier", 0.0) or 0.0
+    )
+    score_components["robust_inlier_support_zero"] = float(
+        robust_components.get("inlier_support_zero", 0.0) or 0.0
+    )
+    score_components["robust_inlier_support_full"] = float(
+        robust_components.get("inlier_support_full", 0.0) or 0.0
+    )
+    score_components["robust_overlap_support_zero"] = float(
+        robust_components.get("overlap_support_zero", 0.0) or 0.0
+    )
+    score_components["robust_overlap_support_full"] = float(
+        robust_components.get("overlap_support_full", 0.0) or 0.0
+    )
+    score_components["overlap_ratio"] = float(overlap_ratio)
+    score_components["overlap_ratio_0_to_1"] = float(overlap_ratio_0_to_1)
+    score_components["overlap_ratio_1_to_0"] = float(overlap_ratio_1_to_0)
+    score_components["robust_coverage"] = float(robust_coverage)
+    score_components["overlap_centroid_x0"] = float(overlap_centroid_x0)
+    score_components["overlap_centroid_x1"] = float(overlap_centroid_x1)
+    score_components["overlap_centroid_shift_x"] = float(overlap_centroid_shift_x)
+    score_components["overlap_side_code0"] = float(overlap_side_code0)
+    score_components["overlap_side_code1"] = float(overlap_side_code1)
+    score_components["median_epipolar_error"] = float(median_epipolar_error)
     score_components["combined_score"] = float(combined_score)
-
     if full_diagnostics:
         raw_matches_payload = _sample_normalized_matches(
             points0=points0,
             points1=points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        )
-        filtered_matches_payload = _sample_normalized_matches(
-            points0=filtered_points0,
-            points1=filtered_points1,
             width0=width0,
             height0=height0,
             width1=width1,
@@ -2696,7 +2769,6 @@ def _build_native_loftr_diagnostics(
         )
     else:
         raw_matches_payload = []
-        filtered_matches_payload = []
         inlier_matches_payload = []
 
     diagnostics = {
@@ -2709,33 +2781,33 @@ def _build_native_loftr_diagnostics(
         "match_width": int(width0),
         "match_height": int(height0),
         "raw_correspondence_count": int(raw_count),
+        "threshold_match_count": int(kept_count),
+        "active_match_count": int(active_count),
         "threshold_trials": [
             {
                 "threshold": float(confidence_threshold),
                 "raw_matches": int(raw_count),
-                "num_matches": int(kept_count),
+                "num_matches": int(active_count),
+                "num_threshold_matches": int(kept_count),
+                "num_active_matches": int(inlier_ratio_denominator),
                 "num_inliers": int(num_inliers),
                 "score": float(combined_score),
                 "geometric_score": float(geometric_score),
+                "match_count_source": int(active_count_for_count_term),
+                "match_count_zero": float(count_zero),
+                "match_count_target": float(count_target),
                 "match_count_term": float(match_count_term),
                 "geometry_model": geometry_model,
                 "inlier_ratio_denominator": int(inlier_ratio_denominator),
                 "native_score_mean": float(native_score_summary["mean"]),
                 "native_score_median": float(native_score_summary["median"]),
                 "native_score_p95": float(native_score_summary["p95"]),
-                "filtered_final_score": float(filtered_final_score),
             }
         ],
         "loftr_input_width": int(input_w if input_w is not None else width0),
         "loftr_input_height": int(input_h if input_h is not None else height0),
         "ransac_reproj_threshold": float(RANSAC_REPROJ_THRESHOLD),
         "raw_matches": raw_matches_payload,
-        "filtered_match_count": int(len(filtered_points0)),
-        "filtered_matches": filtered_matches_payload,
-        "filtered_final_score": float(filtered_final_score),
-        "filter_config": filter_analysis.get("config", {}),
-        "filter_scores": filter_analysis.get("scores", {}),
-        "filter_match_sets": filter_match_sets,
         "inlier_match_count": int(num_inliers),
         "inlier_matches": inlier_matches_payload,
         "oracle": {
@@ -2745,12 +2817,18 @@ def _build_native_loftr_diagnostics(
             "decision": "native_no_oracle",
         },
         "native_matching_scores": native_score_summary,
+        "native_matching_scores_threshold": native_threshold_summary,
         "native_matching_scores_raw": native_raw_summary,
         "geometric_score": float(geometric_score),
         "combined_score": float(combined_score),
         "match_count_term": float(match_count_term),
+        "timing": {
+            "time_f_s": float(fundamental_seconds),
+            "time_h_s": float(homography_seconds),
+            "time_scoring_s": float(scoring_seconds),
+        },
     }
-    return kept_count, int(num_inliers), float(combined_score), direction, diagnostics
+    return active_count, int(num_inliers), float(combined_score), direction, diagnostics
 
 
 def _swap_normalized_match_points(points: Any) -> List[Dict[str, float]]:
@@ -2795,15 +2873,8 @@ def _reorient_reverse_native_diagnostics(diagnostics: Dict[str, Any] | None) -> 
     if not isinstance(diagnostics, dict):
         return {}
     out = dict(diagnostics)
-    for key in ("raw_matches", "filtered_matches", "inlier_matches"):
+    for key in ("raw_matches", "inlier_matches"):
         out[key] = _swap_normalized_match_points(out.get(key))
-
-    filter_sets = out.get("filter_match_sets")
-    if isinstance(filter_sets, dict):
-        swapped_sets: Dict[str, List[Dict[str, float]]] = {}
-        for name, points in filter_sets.items():
-            swapped_sets[str(name)] = _swap_normalized_match_points(points)
-        out["filter_match_sets"] = swapped_sets
 
     out["segment_scores"] = _swap_segment_scores(out.get("segment_scores"))
     out["reverse_orientation_selected"] = True
@@ -2846,11 +2917,60 @@ def _maybe_retry_reverse_native(
     if not _should_retry_reverse_native(num_matches, num_inliers, score):
         return forward_result
 
+    forward_timing = diagnostics.get("timing") if isinstance(diagnostics, dict) and isinstance(diagnostics.get("timing"), dict) else {}
+    reverse_started_at = time.perf_counter()
     rev_matches, rev_inliers, rev_score, rev_direction, rev_diag = run_fn(
         img1=img2,
         img2=img1,
         **run_kwargs,
     )
+    reverse_elapsed = time.perf_counter() - reverse_started_at
+    reverse_timing = rev_diag.get("timing") if isinstance(rev_diag, dict) and isinstance(rev_diag.get("timing"), dict) else {}
+    forward_pair_total = float(forward_timing.get("time_pair_total_s", 0.0) or 0.0)
+    reverse_pair_total = float(reverse_timing.get("time_pair_total_s", reverse_elapsed) or reverse_elapsed)
+    forward_loftr = float(forward_timing.get("time_loftr_s", 0.0) or 0.0)
+    reverse_loftr = float(reverse_timing.get("time_loftr_s", 0.0) or 0.0)
+
+    def _merged_timing(base_timing: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base_timing or {})
+        merged["reverse_attempted"] = True
+        merged["time_reverse_retry_s"] = float(reverse_elapsed)
+        merged["time_reverse_pair_total_s"] = float(reverse_pair_total)
+        merged["time_loftr_forward_main_s"] = float(forward_loftr)
+        merged["time_loftr_forward_reverse_s"] = float(reverse_loftr)
+        merged["forward_pass_count"] = 2
+        merged["time_model_load_s"] = float(
+            (float(forward_timing.get("time_model_load_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_model_load_s", 0.0) or 0.0))
+        )
+        merged["time_resize_s"] = float(
+            (float(forward_timing.get("time_resize_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_resize_s", 0.0) or 0.0))
+        )
+        merged["time_tensor_transfer_s"] = float(
+            (float(forward_timing.get("time_tensor_transfer_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_tensor_transfer_s", 0.0) or 0.0))
+        )
+        merged["time_loftr_s"] = float(forward_loftr + reverse_loftr)
+        merged["time_postprocess_s"] = float(
+            (float(forward_timing.get("time_postprocess_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_postprocess_s", 0.0) or 0.0))
+        )
+        merged["time_f_s"] = float(
+            (float(forward_timing.get("time_f_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_f_s", 0.0) or 0.0))
+        )
+        merged["time_h_s"] = float(
+            (float(forward_timing.get("time_h_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_h_s", 0.0) or 0.0))
+        )
+        merged["time_scoring_s"] = float(
+            (float(forward_timing.get("time_scoring_s", 0.0) or 0.0))
+            + (float(reverse_timing.get("time_scoring_s", 0.0) or 0.0))
+        )
+        merged["time_pair_total_s"] = float(forward_pair_total + reverse_pair_total)
+        return merged
+
     if not _is_better_native_result(
         (int(rev_matches), int(rev_inliers), float(rev_score)),
         (int(num_matches), int(num_inliers), float(score)),
@@ -2859,6 +2979,8 @@ def _maybe_retry_reverse_native(
             diagnostics = dict(diagnostics)
             diagnostics["reverse_retry_attempted"] = True
             diagnostics["reverse_retry_selected"] = False
+            diagnostics["timing"] = _merged_timing(forward_timing)
+            diagnostics["timing"]["reverse_selected"] = False
         return num_matches, num_inliers, score, direction, diagnostics
 
     adjusted_direction = (-float(rev_direction[0]), -float(rev_direction[1]))
@@ -2871,6 +2993,8 @@ def _maybe_retry_reverse_native(
     adjusted_diag["reverse_selected_matches"] = int(rev_matches)
     adjusted_diag["reverse_selected_inliers"] = int(rev_inliers)
     adjusted_diag["reverse_selected_score"] = float(rev_score)
+    adjusted_diag["timing"] = _merged_timing(reverse_timing)
+    adjusted_diag["timing"]["reverse_selected"] = True
     return int(rev_matches), int(rev_inliers), float(rev_score), adjusted_direction, adjusted_diag
 
 
@@ -2881,40 +3005,40 @@ def _match_loftr_kornia_indoor_native(
     full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     """Native Kornia LoFTR indoor debug path (no custom geometric scoring)."""
-    matcher = _load_loftr_checkpoint("indoor")
+    total_started_at = time.perf_counter()
+    checkpoint_name = "indoor"
+    cache_hit = checkpoint_name in _loftr_matchers
+    model_load_started_at = time.perf_counter()
+    matcher = _load_loftr_checkpoint(checkpoint_name)
+    model_load_seconds = time.perf_counter() - model_load_started_at
     device = next(matcher.parameters()).device
 
-    img1_gray = np.array(img1.convert("L"), dtype=np.float32) / 255.0
-    img2_gray = np.array(img2.convert("L"), dtype=np.float32) / 255.0
     target_long_side = max(64, int(max(DEFAULT_LOFTR_INPUT_SIZE)))
-    img1_resized, meta0 = _resize_by_longest_side_and_pad(img1_gray, target_long_side=target_long_side, multiple=8)
-    img2_resized, meta1 = _resize_by_longest_side_and_pad(img2_gray, target_long_side=target_long_side, multiple=8)
-    img1_rgb_resized: np.ndarray | None = None
-    img2_rgb_resized: np.ndarray | None = None
-    if full_diagnostics:
-        img1_rgb = np.array(img1.convert("RGB"), dtype=np.uint8)
-        img2_rgb = np.array(img2.convert("RGB"), dtype=np.uint8)
-        img1_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(
-            img1_rgb,
-            target_long_side=target_long_side,
-            multiple=8,
-        )
-        img2_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(
-            img2_rgb,
-            target_long_side=target_long_side,
-            multiple=8,
-        )
+    prep_started_at = time.perf_counter()
+    prep1 = _get_native_preprocessed_entry(img1, target_long_side=target_long_side)
+    prep2 = _get_native_preprocessed_entry(img2, target_long_side=target_long_side)
+    img1_resized = prep1["gray_resized"]
+    img2_resized = prep2["gray_resized"]
+    meta0 = prep1["meta"]
+    meta1 = prep2["meta"]
+    resize_seconds = time.perf_counter() - prep_started_at
 
-    tensor1 = torch.from_numpy(img1_resized).unsqueeze(0).unsqueeze(0).to(device)
-    tensor2 = torch.from_numpy(img2_resized).unsqueeze(0).unsqueeze(0).to(device)
+    tensor_transfer_started_at = time.perf_counter()
+    tensor1 = _get_cached_native_tensor(img1, img1_resized, target_long_side=target_long_side, device=device)
+    tensor2 = _get_cached_native_tensor(img2, img2_resized, target_long_side=target_long_side, device=device)
+    tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
+
+    loftr_started_at = time.perf_counter()
     batch = {"image0": tensor1, "image1": tensor2}
     with torch.no_grad():
         raw_output = matcher(batch)
         # ZJU LoFTR mutates batch in-place and returns None.
         correspondences = raw_output if isinstance(raw_output, dict) else batch
+    loftr_seconds = time.perf_counter() - loftr_started_at
 
     points0, points1, scores = _extract_loftr_points_and_scores(correspondences)
-    return _build_native_loftr_diagnostics(
+    diagnostics_started_at = time.perf_counter()
+    result = _build_native_loftr_diagnostics(
         matcher_name="loftr_kornia_indoor_native",
         checkpoint="kornia:indoor",
         confidence_threshold=float(confidence_threshold),
@@ -2927,12 +3051,34 @@ def _match_loftr_kornia_indoor_native(
         height1=int(meta1["content_h"]),
         input_w=int(meta0["content_w"] + meta0["pad_w"]),
         input_h=int(meta0["content_h"] + meta0["pad_h"]),
-        image0_gray=img1_resized,
-        image1_gray=img2_resized,
-        image0_rgb=img1_rgb_resized,
-        image1_rgb=img2_rgb_resized,
         full_diagnostics=full_diagnostics,
     )
+    diagnostics_seconds = time.perf_counter() - diagnostics_started_at
+    total_seconds = time.perf_counter() - total_started_at
+    num_matches, num_inliers, score, direction, diagnostics = result
+    timing_payload = {
+        "time_model_load_s": float(model_load_seconds),
+        "time_resize_s": float(resize_seconds),
+        "time_tensor_transfer_s": float(tensor_transfer_seconds),
+        "time_loftr_s": float(loftr_seconds),
+        "time_loftr_forward_main_s": float(loftr_seconds),
+        "time_loftr_forward_reverse_s": 0.0,
+        "time_postprocess_s": float(diagnostics_seconds),
+        "time_pair_total_s": float(total_seconds),
+        "time_reverse_pair_total_s": 0.0,
+        "forward_pass_count": 1,
+        "reverse_attempted": False,
+        "reverse_selected": False,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "mps_available": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        "preferred_device": str(_preferred_torch_device()),
+        "model_device": str(device),
+        "tensor_device": str(tensor1.device),
+        "model_cache_hit": bool(cache_hit),
+    }
+    if isinstance(diagnostics, dict):
+        diagnostics["timing"] = timing_payload
+    return int(num_matches), int(num_inliers), float(score), direction, diagnostics
 
 
 def _load_matcher():
@@ -3194,9 +3340,20 @@ def match_image_pair(
         When return_diagnostics=True, appends a diagnostics dict.
         direction_vector is (dx, dy) showing how content shifted from img1 to img2.
     """
-    # Normalize orientation so backend geometry uses same view as browser rendering.
-    img1 = ImageOps.exif_transpose(img1)
-    img2 = ImageOps.exif_transpose(img2)
+    # Normalize orientation only when EXIF indicates rotation.
+    # Avoid unconditional copies; they destroy image-object cache hit rate.
+    try:
+        orientation1 = int((img1.getexif() or {}).get(274, 1))
+    except Exception:
+        orientation1 = 1
+    try:
+        orientation2 = int((img2.getexif() or {}).get(274, 1))
+    except Exception:
+        orientation2 = 1
+    if orientation1 not in (0, 1):
+        img1 = ImageOps.exif_transpose(img1)
+    if orientation2 not in (0, 1):
+        img2 = ImageOps.exif_transpose(img2)
 
     options = debug_options or {}
     matcher_preference = str(options.get("matcher", "current")).strip().lower()
@@ -3254,9 +3411,6 @@ def _match_loftr(
     # Convert to grayscale tensors
     img1_gray = np.array(img1.convert("L"), dtype=np.float32) / 255.0
     img2_gray = np.array(img2.convert("L"), dtype=np.float32) / 255.0
-    img1_rgb = np.array(img1.convert("RGB"), dtype=np.uint8)
-    img2_rgb = np.array(img2.convert("RGB"), dtype=np.uint8)
-
     # Resize by longest side preserving aspect ratio, then pad to /8.
     target_long_side = max(64, int(max(input_size)))
     img1_resized, meta0 = _resize_by_longest_side_and_pad(
@@ -3266,16 +3420,6 @@ def _match_loftr(
     )
     img2_resized, meta1 = _resize_by_longest_side_and_pad(
         img2_gray,
-        target_long_side=target_long_side,
-        multiple=8,
-    )
-    img1_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(
-        img1_rgb,
-        target_long_side=target_long_side,
-        multiple=8,
-    )
-    img2_rgb_resized, _ = _resize_rgb_by_longest_side_and_pad(
-        img2_rgb,
         target_long_side=target_long_side,
         multiple=8,
     )
@@ -3326,22 +3470,6 @@ def _match_loftr(
     height1 = int(best_result.get("height1", int(meta1["content_h"])))
     inlier_points0 = np.ascontiguousarray(best_result.get("inlier_points0", np.empty((0, 2), dtype=np.float32)))
     inlier_points1 = np.ascontiguousarray(best_result.get("inlier_points1", np.empty((0, 2), dtype=np.float32)))
-    filter_analysis = _analyze_loftr_match_filters(
-        points0=raw_points0,
-        points1=raw_points1,
-        scores=matching_scores,
-        image0_gray=img1_resized,
-        image1_gray=img2_resized,
-        image0_rgb=img1_rgb_resized,
-        image1_rgb=img2_rgb_resized,
-    )
-    filter_keep_mask = np.asarray(filter_analysis.get("filtered_keep_mask", np.empty((0,), dtype=bool)), dtype=bool)
-    if filter_keep_mask.shape[0] != len(raw_points0):
-        filter_keep_mask = np.ones((len(raw_points0),), dtype=bool)
-    filtered_points0 = raw_points0[filter_keep_mask] if len(raw_points0) > 0 else np.empty((0, 2), dtype=np.float32)
-    filtered_points1 = raw_points1[filter_keep_mask] if len(raw_points0) > 0 else np.empty((0, 2), dtype=np.float32)
-    filter_combined = filter_analysis.get("scores", {}).get("combined", {})
-    filtered_final_score = float(filter_combined.get("final_score", 0.0) or 0.0)
     num_matches, num_inliers, score, direction, oracle_diag = _apply_kornia_oracle_to_match(
         num_matches=num_matches,
         num_inliers=num_inliers,
@@ -3377,20 +3505,6 @@ def _match_loftr(
             height1=height1,
             max_points=5000,
         ),
-        "filtered_match_count": int(len(filtered_points0)),
-        "filtered_matches": _sample_normalized_matches(
-            points0=filtered_points0,
-            points1=filtered_points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        ),
-        "filtered_final_score": float(filtered_final_score),
-        "filter_config": filter_analysis.get("config", {}),
-        "filter_scores": filter_analysis.get("scores", {}),
-        "filter_match_sets": filter_match_sets,
         "native_matching_scores": _matching_score_summary(matching_scores),
         "native_matching_scores_raw": _matching_score_summary(matching_scores),
         "inlier_match_count": int(num_inliers),
@@ -3868,6 +3982,7 @@ def cluster_photos_graph_based(
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
 
+    listing_started_at = time.perf_counter()
     n = len(images)
     logger.info(f"Graph-based clustering for {n} photos (k={k})")
 
@@ -3880,12 +3995,45 @@ def cluster_photos_graph_based(
             return clusters, {"duplicate_of_map": {}}
         return clusters
 
+    # Runtime environment snapshot (critical for performance diagnosis).
+    matcher = _load_loftr_checkpoint("indoor")
+    matcher_device = str(next(matcher.parameters()).device)
+    cuda_available = bool(torch.cuda.is_available())
+    mps_available = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    dino_device = str(next(_dinov2_model.parameters()).device) if _dinov2_model is not None else "not_loaded"
+    logger.info(
+        "Runtime device: cuda_available=%s mps_available=%s preferred_device=%s matcher_device=%s dino_device=%s",
+        cuda_available,
+        mps_available,
+        str(_preferred_torch_device()),
+        matcher_device,
+        dino_device,
+    )
+
+    # Aggregate timing metrics for structured performance reporting.
+    stage_timers: Dict[str, float] = {
+        "time_dino_total": 0.0,
+        "time_candidate_generation": 0.0,
+        "time_loftr_total": 0.0,
+        "time_f_total": 0.0,
+        "time_h_total": 0.0,
+        "time_scoring_total": 0.0,
+        "time_resize_total": 0.0,
+        "time_tensor_transfer_total": 0.0,
+        "time_postprocess_total": 0.0,
+    }
+    pair_timing_count = 0
+
     # -------------------------------------------------------------------------
     # Stage 1: Compute DINOv2 embeddings and build candidate graph
     # -------------------------------------------------------------------------
     logger.info("Stage 1: Computing DINOv2 embeddings...")
+    stage1_started_at = time.perf_counter()
     embeddings = compute_dinov2_embeddings(images)
     embeddings = normalize(embeddings)  # For cosine similarity
+    stage_timers["time_dino_total"] = time.perf_counter() - stage1_started_at
+    if _dinov2_model is not None:
+        logger.info("DINO runtime device after load: %s", str(next(_dinov2_model.parameters()).device))
 
     # Compute similarity matrix
     similarity = embeddings @ embeddings.T
@@ -3893,6 +4041,7 @@ def cluster_photos_graph_based(
     # -------------------------------------------------------------------------
     # Stage 1b: Build candidate pairs from DINOv2 top-K
     # -------------------------------------------------------------------------
+    stage1b1c_started_at = time.perf_counter()
     logger.info(f"Stage 1b: Building candidate graph (top-{k} per image)...")
     semantic_pairs = set()
     for i in range(n):
@@ -3913,6 +4062,7 @@ def cluster_photos_graph_based(
             if i + offset < n:
                 temporal_pairs.add((i, i + offset))
     logger.info(f"  Added {len(temporal_pairs)} temporal pairs")
+    stage_timers["time_candidate_generation"] = time.perf_counter() - stage1b1c_started_at
 
     # -------------------------------------------------------------------------
     # Stage 2a: Temporal pairs - require geometric verification unless very high semantic
@@ -3992,7 +4142,38 @@ def cluster_photos_graph_based(
                 return_diagnostics=True,
             )
             temporal_geo_checks += 1
-            temporal_geo_seconds += (time.perf_counter() - pair_started_at)
+            pair_elapsed = time.perf_counter() - pair_started_at
+            temporal_geo_seconds += pair_elapsed
+            pair_metrics = _extract_pair_runtime_metrics(diagnostics, fallback_pair_time_s=pair_elapsed)
+            stage_timers["time_loftr_total"] += pair_metrics["time_loftr_s"]
+            stage_timers["time_f_total"] += pair_metrics["time_f_s"]
+            stage_timers["time_h_total"] += pair_metrics["time_h_s"]
+            stage_timers["time_scoring_total"] += pair_metrics["time_scoring_s"]
+            stage_timers["time_resize_total"] += pair_metrics["time_resize_s"]
+            stage_timers["time_tensor_transfer_total"] += pair_metrics["time_tensor_transfer_s"]
+            stage_timers["time_postprocess_total"] += pair_metrics["time_postprocess_s"]
+            pair_timing_count += 1
+            overlap_ratio_dbg = None
+            inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
+            if isinstance(diagnostics, dict):
+                score_components = diagnostics.get("score_components")
+                if isinstance(score_components, dict):
+                    inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
+                    overlap_ratio_dbg = float(score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0)
+            logger.info(
+                "pair_timing phase=2a pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s",
+                photo_ids[i],
+                photo_ids[j],
+                pair_metrics["time_resize_s"] * 1000.0,
+                pair_metrics["time_tensor_transfer_s"] * 1000.0,
+                pair_metrics["time_loftr_s"] * 1000.0,
+                pair_metrics["time_f_s"] * 1000.0,
+                pair_metrics["time_h_s"] * 1000.0,
+                pair_metrics["time_scoring_s"] * 1000.0,
+                pair_metrics["time_pair_total_s"] * 1000.0,
+                inlier_ratio_dbg,
+                f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
+            )
 
             blended_score = None
             if strict_geometry_edge_gate(
@@ -4065,7 +4246,38 @@ def cluster_photos_graph_based(
                 return_diagnostics=True,
             )
             temporal_geo_checks += 1
-            temporal_geo_seconds += (time.perf_counter() - pair_started_at)
+            pair_elapsed = time.perf_counter() - pair_started_at
+            temporal_geo_seconds += pair_elapsed
+            pair_metrics = _extract_pair_runtime_metrics(diagnostics, fallback_pair_time_s=pair_elapsed)
+            stage_timers["time_loftr_total"] += pair_metrics["time_loftr_s"]
+            stage_timers["time_f_total"] += pair_metrics["time_f_s"]
+            stage_timers["time_h_total"] += pair_metrics["time_h_s"]
+            stage_timers["time_scoring_total"] += pair_metrics["time_scoring_s"]
+            stage_timers["time_resize_total"] += pair_metrics["time_resize_s"]
+            stage_timers["time_tensor_transfer_total"] += pair_metrics["time_tensor_transfer_s"]
+            stage_timers["time_postprocess_total"] += pair_metrics["time_postprocess_s"]
+            pair_timing_count += 1
+            overlap_ratio_dbg = None
+            inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
+            if isinstance(diagnostics, dict):
+                score_components = diagnostics.get("score_components")
+                if isinstance(score_components, dict):
+                    inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
+                    overlap_ratio_dbg = float(score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0)
+            logger.info(
+                "pair_timing phase=2a pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s",
+                photo_ids[i],
+                photo_ids[j],
+                pair_metrics["time_resize_s"] * 1000.0,
+                pair_metrics["time_tensor_transfer_s"] * 1000.0,
+                pair_metrics["time_loftr_s"] * 1000.0,
+                pair_metrics["time_f_s"] * 1000.0,
+                pair_metrics["time_h_s"] * 1000.0,
+                pair_metrics["time_scoring_s"] * 1000.0,
+                pair_metrics["time_pair_total_s"] * 1000.0,
+                inlier_ratio_dbg,
+                f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
+            )
 
             if strict_geometry_edge_gate(
                 num_matches=num_matches,
@@ -4285,6 +4497,9 @@ def cluster_photos_graph_based(
     geometric_pairs = semantic_pairs - temporal_pairs
     logger.info(f"Stage 2b: Geometric verification on {len(geometric_pairs)} non-temporal pairs...")
     geometric_matched = 0
+    stage2b_started_at = time.perf_counter()
+    stage2b_geo_checks = 0
+    stage2b_geo_seconds = 0.0
 
     skipped_low_semantic = 0
     skipped_cross_room = 0
@@ -4383,10 +4598,44 @@ def cluster_photos_graph_based(
         )
 
         diagnostics: Dict[str, Any] | None = None
+        pair_started_at = time.perf_counter()
         num_matches, num_inliers, score, direction, diagnostics = match_image_pair(
             images[i],
             images[j],
             return_diagnostics=True,
+        )
+        pair_elapsed = time.perf_counter() - pair_started_at
+        stage2b_geo_checks += 1
+        stage2b_geo_seconds += pair_elapsed
+        pair_metrics = _extract_pair_runtime_metrics(diagnostics, fallback_pair_time_s=pair_elapsed)
+        stage_timers["time_loftr_total"] += pair_metrics["time_loftr_s"]
+        stage_timers["time_f_total"] += pair_metrics["time_f_s"]
+        stage_timers["time_h_total"] += pair_metrics["time_h_s"]
+        stage_timers["time_scoring_total"] += pair_metrics["time_scoring_s"]
+        stage_timers["time_resize_total"] += pair_metrics["time_resize_s"]
+        stage_timers["time_tensor_transfer_total"] += pair_metrics["time_tensor_transfer_s"]
+        stage_timers["time_postprocess_total"] += pair_metrics["time_postprocess_s"]
+        pair_timing_count += 1
+        overlap_ratio_dbg = None
+        inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
+        if isinstance(diagnostics, dict):
+            score_components = diagnostics.get("score_components")
+            if isinstance(score_components, dict):
+                inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
+                overlap_ratio_dbg = float(score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0)
+        logger.info(
+            "pair_timing phase=2b pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s",
+            photo_ids[i],
+            photo_ids[j],
+            pair_metrics["time_resize_s"] * 1000.0,
+            pair_metrics["time_tensor_transfer_s"] * 1000.0,
+            pair_metrics["time_loftr_s"] * 1000.0,
+            pair_metrics["time_f_s"] * 1000.0,
+            pair_metrics["time_h_s"] * 1000.0,
+            pair_metrics["time_scoring_s"] * 1000.0,
+            pair_metrics["time_pair_total_s"] * 1000.0,
+            inlier_ratio_dbg,
+            f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
         )
 
         is_matched = strict_geometry_edge_gate(
@@ -4485,6 +4734,15 @@ def cluster_photos_graph_based(
         skipped_low_semantic,
         semantic_recovered,
     )
+    total_stage2b_seconds = time.perf_counter() - stage2b_started_at
+    avg_stage2b_geo_ms = (stage2b_geo_seconds / stage2b_geo_checks * 1000.0) if stage2b_geo_checks > 0 else 0.0
+    logger.info(
+        "Stage 2b timing: total=%.2fs, geo_checks=%s, geo_time=%.2fs, avg_geo=%.1fms",
+        total_stage2b_seconds,
+        stage2b_geo_checks,
+        stage2b_geo_seconds,
+        avg_stage2b_geo_ms,
+    )
     logger.info(f"Total edges: {temporal_matched + geometric_matched} "
                f"(temporal={temporal_matched}, geometric={geometric_matched})")
 
@@ -4580,6 +4838,34 @@ def cluster_photos_graph_based(
             logger.info("Marked %s photos as duplicates (kept as singleton clusters)", len(duplicate_of_map))
         else:
             logger.info("Removed %s obvious duplicates from final clustering output", len(duplicate_of_map))
+
+    total_listing_time = time.perf_counter() - listing_started_at
+    time_loftr_per_pair_avg = (
+        stage_timers["time_loftr_total"] / pair_timing_count
+        if pair_timing_count > 0
+        else 0.0
+    )
+    logger.info(
+        "PERF_SUMMARY job_id=%s photos=%s pairs_processed=%s time_dino_total=%.3fs "
+        "time_candidate_generation=%.3fs time_loftr_total=%.3fs time_loftr_per_pair_avg=%.3fs "
+        "time_f_total=%.3fs time_h_total=%.3fs time_scoring_total=%.3fs "
+        "time_resize_total=%.3fs time_tensor_transfer_total=%.3fs time_postprocess_total=%.3fs "
+        "total_listing_time=%.3fs",
+        job_id,
+        n,
+        pair_timing_count,
+        stage_timers["time_dino_total"],
+        stage_timers["time_candidate_generation"],
+        stage_timers["time_loftr_total"],
+        time_loftr_per_pair_avg,
+        stage_timers["time_f_total"],
+        stage_timers["time_h_total"],
+        stage_timers["time_scoring_total"],
+        stage_timers["time_resize_total"],
+        stage_timers["time_tensor_transfer_total"],
+        stage_timers["time_postprocess_total"],
+        total_listing_time,
+    )
 
     # Save similarity records to database if session provided
     if db_session is not None and job_id is not None and similarity_records:

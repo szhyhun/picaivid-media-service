@@ -36,10 +36,27 @@ Use `.env.example` as the source for all required keys.
 - Worker task (`python -m app.worker`)
 - Both point to same DB and queue
 
-## 5) Operational Checks
+## 5) GPU Runtime Requirements (Critical)
+
+LoFTR geometry is only fast enough in cloud when PyTorch runs on CUDA.
+
+- Run worker on GPU-backed instances (for clustering/analysis jobs)
+- If using pair-debug in production/staging, run API task on GPU too
+- Build container with CUDA-enabled PyTorch (not CPU-only wheel)
+- `WORKER_TYPE` does not select Torch backend; device is chosen by Torch runtime (`cuda -> mps -> cpu`)
+
+Expected log signals after deploy:
+
+- `Loaded LoFTR matcher (indoor) on cuda`
+- `pair_debug_timing ... model_device=cuda tensor_device=cuda cuda_available=True preferred_device=cuda`
+
+If logs show `model_device=cpu`, geometry inference will be much slower (seconds per pair).
+
+## 6) Operational Checks
 
 Before production rollout:
 - run a full job in staging
 - validate pair-debug endpoint for a known pair
+- check `pair_debug_timing` logs and confirm matcher backend is CUDA
 - compare clustering output against baseline (`scripts/baselines/README.md`)
 - confirm alarms/logging for failed jobs and worker crashes

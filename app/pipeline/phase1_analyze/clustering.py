@@ -13,7 +13,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from sklearn.cluster import DBSCAN
 from sqlalchemy.orm import Session
 
@@ -110,6 +110,10 @@ def _cluster_with_learned_matching(
                 img = s3_client.download_image(photo.s3_uri)
                 if preloaded_images is not None:
                     preloaded_images[photo.id] = img
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
             img = img.resize((512, 384), Image.Resampling.LANCZOS)
             images.append(img)
             photo_ids.append(photo.id)

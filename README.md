@@ -19,6 +19,14 @@ source venv/bin/activate
 python -m app.worker
 ```
 
+## Deployment Note (LoFTR Geometry)
+
+For cloud deployment, LoFTR must run on CUDA to keep pair-level geometry fast.
+Validate with logs:
+
+- `Loaded LoFTR matcher (indoor) on cuda`
+- `pair_debug_timing ... model_device=cuda ... preferred_device=cuda`
+
 ## Local Dependencies
 
 This service expects local infrastructure from `picaivid-rails/docker-compose.yml`:

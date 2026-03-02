@@ -32,9 +32,21 @@ For each checked pair (when available):
 ## Pair Debug Usage
 
 Use `/projects/:id/pair-debug` in React to inspect:
-- raw/filtered/inlier correspondences
+- raw/inlier correspondences
 - segment metrics and transition recommendation
-- score components and filter tables
+- score components and matcher timing
+
+## Runtime Performance Signals
+
+Use `pair_debug_timing` logs to validate backend and latency:
+
+- `model_device` / `tensor_device`
+- `cuda_available`
+- `preferred_device`
+- `model_loftr_ms` (dominant inference cost)
+
+For AWS deployment, production target is CUDA (`model_device=cuda`).
+If it shows CPU, pair-debug and geometry checks will be significantly slower.
 
 ## Regression Guard
 

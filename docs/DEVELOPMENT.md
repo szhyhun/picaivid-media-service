@@ -52,3 +52,15 @@ alembic upgrade head
 ```
 
 If clustering logic changed, run baseline comparison from `scripts/baselines/README.md`.
+
+## Pair-Debug Performance Check
+
+When testing pair-debug latency, use `pair_debug_timing` logs from media-service.
+Key fields:
+
+- `model_loftr_ms` (inference time)
+- `model_device`, `tensor_device`
+- `cuda_available`, `preferred_device`
+
+On local Mac, CPU or MPS may be used.
+On AWS production, target must be CUDA (`model_device=cuda`).

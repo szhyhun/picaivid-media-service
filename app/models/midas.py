@@ -10,12 +10,14 @@ For production:
 """
 import logging
 import os
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 from transformers import DPTForDepthEstimation, DPTImageProcessor
+from transformers.utils import logging as hf_logging
 
 from app.core.config import settings
 
@@ -61,6 +63,7 @@ class MiDaSModel:
         logger.info(f"Loading depth model: {MODEL_ID}")
         if OFFLINE_MODE:
             logger.info("Running in offline mode (using pre-cached models)")
+        load_started_at = time.perf_counter()
 
         # Determine device
         if torch.backends.mps.is_available():
@@ -74,6 +77,10 @@ class MiDaSModel:
             logger.info("Using CPU for depth estimation")
 
         try:
+            # Suppress verbose Hugging Face loading reports (missing/newly initialized keys)
+            # that are expected for this checkpoint/runtime combo and create noisy logs.
+            previous_hf_verbosity = hf_logging.get_verbosity()
+            hf_logging.set_verbosity_error()
             # In production (OFFLINE_MODE), use only local cached models
             # In development, allow downloading if not cached
             MiDaSModel._processor = DPTImageProcessor.from_pretrained(
@@ -86,17 +93,30 @@ class MiDaSModel:
                 cache_dir=str(HF_CACHE_DIR),
                 local_files_only=OFFLINE_MODE,
             )
+            hf_logging.set_verbosity(previous_hf_verbosity)
             MiDaSModel._model = MiDaSModel._model.to(MiDaSModel._device)
             MiDaSModel._model.eval()
             MiDaSModel._loaded = True
 
-            logger.info(f"Depth model loaded successfully from {MODEL_ID}")
+            logger.info(
+                "Depth model loaded successfully from %s on %s in %.2fs",
+                MODEL_ID,
+                MiDaSModel._device,
+                (time.perf_counter() - load_started_at),
+            )
         except Exception as e:
+            # Restore verbosity before retry/raise path.
+            try:
+                hf_logging.set_verbosity(previous_hf_verbosity)
+            except Exception:
+                pass
             logger.error(f"Failed to load depth model: {e}")
             if not OFFLINE_MODE:
                 # Try loading from local cache only as fallback
                 try:
                     logger.info("Attempting to load from local cache...")
+                    previous_hf_verbosity = hf_logging.get_verbosity()
+                    hf_logging.set_verbosity_error()
                     MiDaSModel._processor = DPTImageProcessor.from_pretrained(
                         MODEL_ID,
                         cache_dir=str(HF_CACHE_DIR),
@@ -107,11 +127,20 @@ class MiDaSModel:
                         cache_dir=str(HF_CACHE_DIR),
                         local_files_only=True,
                     )
+                    hf_logging.set_verbosity(previous_hf_verbosity)
                     MiDaSModel._model = MiDaSModel._model.to(MiDaSModel._device)
                     MiDaSModel._model.eval()
                     MiDaSModel._loaded = True
-                    logger.info("Depth model loaded from local cache")
+                    logger.info(
+                        "Depth model loaded from local cache on %s in %.2fs",
+                        MiDaSModel._device,
+                        (time.perf_counter() - load_started_at),
+                    )
                 except Exception as cache_error:
+                    try:
+                        hf_logging.set_verbosity(previous_hf_verbosity)
+                    except Exception:
+                        pass
                     logger.error(f"Failed to load from cache: {cache_error}")
                     raise
             else:
