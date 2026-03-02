@@ -294,9 +294,9 @@ FUNDAMENTAL_SAMPSON_THRESHOLD = 3.0  # Relaxed epipolar residual filter (pixels)
 FUNDAMENTAL_RANSAC_CONFIDENCE = 0.995
 ENABLE_FUNDAMENTAL_SAMPSON_REFINEMENT = False
 
-# Room label mismatch - only skip non-adjacent photos with different rooms
-# For ADJACENT photos (temporal_dist=1), trust geometry even if room labels differ
-# (ML room labels are often wrong, but adjacent photos are usually same room)
+# Room label mismatch controls.
+# Strict mode blocks cross-room pairs entirely (including adjacent photos).
+STRICT_ROOM_LABEL_BLOCK = True
 MIN_INLIERS_CROSS_ROOM = 30       # Require 30+ inliers for non-adjacent cross-room pairs
 MIN_INLIERS_CROSS_ROOM_ADJACENT = 15  # Lower threshold for adjacent photos (ML often mislabels)
 CROSS_ROOM_ADJ_LOW_SEMANTIC = 0.20  # Very low semantic for adjacent cross-room is suspicious
@@ -869,54 +869,20 @@ def accepts_very_far_pair(position_gap: int, sem_sim: float, num_inliers: int, s
 
 
 def blend_geometric_semantic_score(geometric_score: float, semantic_score: float) -> float:
-    """Blend geometry + semantic affinity while keeping geometry dominant."""
+    """Return final edge weight for accepted pairs.
+
+    Production geometry-only mode uses pure geometric score.
+    Semantic affinity remains candidate retrieval only.
+    """
     geo = float(np.clip(geometric_score, 0.0, 1.0))
+    if GEOMETRY_ONLY_CLUSTER_MEMBERSHIP:
+        return geo
     sem = float(np.clip(semantic_score, 0.0, 1.0))
     w_geo = max(0.0, float(GEOMETRIC_SCORE_WEIGHT))
     w_sem = max(0.0, float(SEMANTIC_SCORE_WEIGHT))
     if (w_geo + w_sem) <= 1e-8:
         return geo
     return float(np.clip(((w_geo * geo) + (w_sem * sem)) / (w_geo + w_sem), 0.0, 1.0))
-
-
-def geometry_quality_gate(
-    geometric_score: float | None,
-    diagnostics: Dict[str, Any] | None,
-    min_score: float = MIN_GEOMETRIC_SCORE_FOR_EDGE,
-) -> bool:
-    """Accept only geometry with sufficient quality, not inlier count alone."""
-    if geometric_score is None:
-        return False
-    score = float(geometric_score)
-    if score < min_score:
-        return False
-
-    if not isinstance(diagnostics, dict):
-        return True
-
-    score_components = diagnostics.get("score_components")
-    if not isinstance(score_components, dict):
-        return True
-
-    motion = float(score_components.get("motion_coherence", 0.0) or 0.0)
-    segment_strength = float(score_components.get("segment_strength", 0.0) or 0.0)
-    inlier_ratio = float(score_components.get("inlier_ratio", 0.0) or 0.0)
-    overlap_ratio = float(
-        score_components.get(
-            "overlap_ratio",
-            score_components.get("robust_coverage", 0.0),
-        )
-        or 0.0
-    )
-
-    # Low-mid scores are fragile on repetitive textures; require stronger structure/motion.
-    if score < 0.40 and motion < LOW_SCORE_MOTION_COHERENCE_MIN and segment_strength < LOW_SCORE_SEGMENT_STRENGTH_MIN:
-        # Allow strong geometric support pairs even when motion vector coherence is weak
-        # (e.g., wider-angle same-room views where inlier motions fan out).
-        if inlier_ratio >= NATIVE_EDGE_MIN_INLIER_RATIO and overlap_ratio >= NATIVE_EDGE_MIN_OVERLAP_RATIO:
-            return True
-        return False
-    return True
 
 
 def strict_geometry_edge_gate(
@@ -1035,18 +1001,6 @@ def strict_geometry_edge_gate(
             "yes" if robust_valid else "no",
             combined_score,
             "native_overlap_ratio",
-        )
-        return False
-    if not geometry_quality_gate(geometric_score, diagnostics):
-        logger.info(
-            "    strict_gate decision=reject num_inliers=%s inlier_ratio=%.3f overlap_ratio=%.3f robust_valid=%s "
-            "combined_score=%.3f reason=%s",
-            num_inliers,
-            inlier_ratio,
-            overlap_ratio,
-            "yes" if robust_valid else "no",
-            combined_score,
-            "geometry_quality_gate",
         )
         return False
     if not isinstance(diagnostics, dict):
@@ -1297,6 +1251,8 @@ COMPONENT_CROSS_LABEL_DIST2_MIN = settings.COMPONENT_CROSS_LABEL_DIST2_MIN
 DUPLICATE_SIMILARITY_THRESHOLD = 0.97  # Conservative dedup to avoid dropping transition-valuable near-duplicates
 DUPLICATE_GEOMETRIC_SEMANTIC_THRESHOLD = 0.95  # Allow slightly lower semantic threshold when geometry is near-identical
 DUPLICATE_GEOMETRIC_OVERLAP_THRESHOLD = 0.90  # Require very high overlap score for geometric-backed dedupe
+PRE_PIPELINE_DUPLICATE_SIMILARITY_THRESHOLD = 0.95  # Pre-graph prune for obvious duplicates
+PRE_PIPELINE_DUPLICATE_MAX_GAP = 4  # Keep dedupe local in sequence to avoid dropping valid alternate viewpoints
 KEEP_DUPLICATE_SINGLETON_CLUSTERS = not settings.DELETE_OBVIOUS_DUPLICATES
 SPLIT_LONG_GAP_DECAY = 0.25  # Prefer cutting oversized clusters at large capture-order jumps
 
@@ -1410,6 +1366,113 @@ def is_mutual_top_semantic_neighbor(i: int, j: int, similarity: np.ndarray, top_
     sorted_i = [idx for idx in np.argsort(-similarity[i]) if idx != i][:top_k]
     sorted_j = [idx for idx in np.argsort(-similarity[j]) if idx != j][:top_k]
     return (j in sorted_i) and (i in sorted_j)
+
+
+def _prefilter_obvious_room_duplicates(
+    images: List[Image.Image],
+    photo_ids: List[int],
+    room_labels: List[str] | None,
+    embeddings: np.ndarray,
+    similarity: np.ndarray,
+    similarity_records: List[Dict[str, object]],
+    similarity_threshold: float = PRE_PIPELINE_DUPLICATE_SIMILARITY_THRESHOLD,
+    max_gap: int = PRE_PIPELINE_DUPLICATE_MAX_GAP,
+) -> Tuple[
+    List[Image.Image],
+    List[int],
+    List[str] | None,
+    np.ndarray,
+    np.ndarray,
+    Dict[int, int],
+]:
+    """Drop obvious near-identical photos before candidate pair generation.
+
+    Only dedupes when both photos have the same known room label to avoid
+    suppressing valid transitions across mislabeled or unknown rooms.
+    """
+    n = len(photo_ids)
+    if n <= 1:
+        return images, photo_ids, room_labels, embeddings, similarity, {}
+
+    keep_mask = np.ones(n, dtype=bool)
+    duplicate_of_map: Dict[int, int] = {}
+    threshold = float(similarity_threshold)
+    gap_limit = max(1, int(max_gap))
+
+    for i in range(n):
+        if not bool(keep_mask[i]):
+            continue
+        room_i = room_labels[i] if room_labels is not None and i < len(room_labels) else None
+        room_i_norm = normalize_room_label(room_i)
+        if not room_i_norm or room_i_norm == "unknown":
+            continue
+
+        max_j = min(n, i + gap_limit + 1)
+        for j in range(i + 1, max_j):
+            if not bool(keep_mask[j]):
+                continue
+            room_j = room_labels[j] if room_labels is not None and j < len(room_labels) else None
+            room_j_norm = normalize_room_label(room_j)
+            if not room_j_norm or room_j_norm == "unknown":
+                continue
+            if room_i_norm != room_j_norm:
+                continue
+
+            sem_sim = float(similarity[i, j])
+            if sem_sim < threshold:
+                continue
+
+            # Keep earlier photo as canonical, remove later obvious duplicate.
+            keep_mask[j] = False
+            duplicate_of_map[int(photo_ids[j])] = int(photo_ids[i])
+            _append_similarity_record(
+                similarity_records=similarity_records,
+                photo_ids=photo_ids,
+                left_idx=i,
+                right_idx=j,
+                pair_source="pre_dedup_obvious",
+                dinov2_similarity=sem_sim,
+                is_connected=False,
+            )
+            logger.info(
+                "Pre-dedup obvious duplicate %s -> %s (room=%s, sem=%.3f, gap=%s)",
+                photo_ids[j],
+                photo_ids[i],
+                room_i_norm,
+                sem_sim,
+                (j - i),
+            )
+
+    if not duplicate_of_map:
+        return images, photo_ids, room_labels, embeddings, similarity, {}
+
+    kept_indices = [idx for idx in range(n) if bool(keep_mask[idx])]
+    filtered_images = [images[idx] for idx in kept_indices]
+    filtered_photo_ids = [int(photo_ids[idx]) for idx in kept_indices]
+    filtered_room_labels = (
+        [room_labels[idx] for idx in kept_indices]
+        if room_labels is not None
+        else None
+    )
+    filtered_embeddings = embeddings[kept_indices]
+    filtered_similarity = similarity[np.ix_(kept_indices, kept_indices)]
+
+    logger.info(
+        "Pre-dedup summary: %s -> %s photos (removed=%s, threshold=%.2f, max_gap=%s)",
+        n,
+        len(filtered_photo_ids),
+        len(duplicate_of_map),
+        threshold,
+        gap_limit,
+    )
+    return (
+        filtered_images,
+        filtered_photo_ids,
+        filtered_room_labels,
+        filtered_embeddings,
+        filtered_similarity,
+        duplicate_of_map,
+    )
 
 
 def order_cluster_for_transitions(
@@ -2744,9 +2807,28 @@ def _reorient_reverse_native_diagnostics(diagnostics: Dict[str, Any] | None) -> 
     return out
 
 
-def _should_retry_reverse_native(num_matches: int, num_inliers: int, score: float) -> bool:
+def _should_retry_reverse_native(
+    num_matches: int,
+    num_inliers: int,
+    score: float,
+    diagnostics: Dict[str, Any] | None = None,
+) -> bool:
     if not NATIVE_REVERSE_RETRY_ENABLED:
         return False
+    # If forward pass already satisfies strict production gate, skip reverse retry.
+    # Reverse should be a rescue path for weak/fragile forward pairs only.
+    try:
+        if strict_geometry_edge_gate(
+            num_matches=int(num_matches),
+            num_inliers=int(num_inliers),
+            geometric_score=float(score),
+            diagnostics=diagnostics if isinstance(diagnostics, dict) else None,
+            min_inliers_required=int(NATIVE_EDGE_MIN_INLIERS),
+        ):
+            return False
+    except Exception:
+        # Never let retry-guard diagnostics issues break matching flow.
+        pass
     if float(score) >= float(NATIVE_REVERSE_RETRY_SCORE_THRESHOLD):
         return False
     return (
@@ -2777,7 +2859,7 @@ def _maybe_retry_reverse_native(
     run_kwargs: Dict[str, Any],
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     num_matches, num_inliers, score, direction, diagnostics = forward_result
-    if not _should_retry_reverse_native(num_matches, num_inliers, score):
+    if not _should_retry_reverse_native(num_matches, num_inliers, score, diagnostics=diagnostics):
         return forward_result
 
     forward_timing = diagnostics.get("timing") if isinstance(diagnostics, dict) and isinstance(diagnostics.get("timing"), dict) else {}
@@ -3396,6 +3478,42 @@ def cluster_photos_graph_based(
 
     # Compute similarity matrix
     similarity = embeddings @ embeddings.T
+    pre_pipeline_duplicate_of_map: Dict[int, int] = {}
+
+    # -------------------------------------------------------------------------
+    # Stage 1a: Pre-pipeline duplicate pruning (same-room, obvious 95%+ matches)
+    # -------------------------------------------------------------------------
+    if room_labels is not None and len(room_labels) == n:
+        (
+            images,
+            photo_ids,
+            room_labels,
+            embeddings,
+            similarity,
+            pre_pipeline_duplicate_of_map,
+        ) = _prefilter_obvious_room_duplicates(
+            images=images,
+            photo_ids=photo_ids,
+            room_labels=room_labels,
+            embeddings=embeddings,
+            similarity=similarity,
+            similarity_records=similarity_records,
+        )
+        n = len(photo_ids)
+        if n <= 1:
+            clusters = [photo_ids] if photo_ids else []
+            if return_metadata:
+                return clusters, {
+                    "duplicate_of_map": pre_pipeline_duplicate_of_map,
+                    "duplicates_dropped": not KEEP_DUPLICATE_SINGLETON_CLUSTERS,
+                }
+            return clusters
+    else:
+        logger.info(
+            "Pre-dedup skipped: room_labels unavailable or mismatched length (labels=%s, photos=%s)",
+            len(room_labels) if room_labels is not None else None,
+            n,
+        )
 
     # -------------------------------------------------------------------------
     # Stage 1b: Build candidate pairs from DINOv2 top-K
@@ -3446,12 +3564,19 @@ def cluster_photos_graph_based(
         room_j = room_labels[j] if room_labels else None
         is_cross_room = rooms_are_different(room_i, room_j)
 
-        # For NON-ADJACENT cross-room pairs (temporal_dist > 1), skip entirely
-        # But for ADJACENT photos (temporal_dist = 1), DO geometric verification
-        # because ML room labels are often wrong for adjacent photos
-        if is_cross_room and temporal_dist > 1:
-            logger.info(f"  Temporal {photo_ids[i]} <-> {photo_ids[j]}: "
-                       f"SKIP - different rooms ({room_i} vs {room_j}), dist={temporal_dist}")
+        # In strict room mode, block cross-room temporal pairs entirely.
+        # Non-strict mode keeps the legacy behavior (skip only non-adjacent cross-room pairs).
+        if is_cross_room and (STRICT_ROOM_LABEL_BLOCK or temporal_dist > 1):
+            if STRICT_ROOM_LABEL_BLOCK:
+                logger.info(
+                    f"  Temporal {photo_ids[i]} <-> {photo_ids[j]}: "
+                    f"SKIP - strict room block ({room_i} vs {room_j}), dist={temporal_dist}"
+                )
+            else:
+                logger.info(
+                    f"  Temporal {photo_ids[i]} <-> {photo_ids[j]}: "
+                    f"SKIP - different rooms ({room_i} vs {room_j}), dist={temporal_dist}"
+                )
             _append_similarity_record(
                 similarity_records=similarity_records,
                 photo_ids=photo_ids,
@@ -3679,7 +3804,7 @@ def cluster_photos_graph_based(
                             "yes" if same_label_trust else ("high-confidence" if sem_sim >= HIGH_CONFIDENCE_NEIGHBOR_TRUST else "no"),
                         )
             # Cross-room adjacent semantic recovery (disabled in geometry-only mode)
-            elif (not GEOMETRY_ONLY_CLUSTER_MEMBERSHIP) and temporal_dist == 1 and is_cross_room:
+            elif (not GEOMETRY_ONLY_CLUSTER_MEMBERSHIP) and (not STRICT_ROOM_LABEL_BLOCK) and temporal_dist == 1 and is_cross_room:
                 compatible_families = rooms_allow_adjacent_semantic_bridge(room_i, room_j)
                 local_support = has_local_semantic_support(i, j, similarity)
                 mutual_top = is_mutual_top_semantic_neighbor(i, j, similarity, top_k=CROSS_ROOM_RECOVERY_TOPK)
@@ -4107,7 +4232,7 @@ def cluster_photos_graph_based(
     logger.info(f"Stage 5: Deduplicating and splitting clusters (max {max_cluster_size} photos each)...")
 
     final_clusters = []
-    duplicate_of_map: Dict[int, int] = {}
+    duplicate_of_map: Dict[int, int] = dict(pre_pipeline_duplicate_of_map)
     for cluster in ordered_clusters:
         # Deduplicate obvious same-angle shots.
         split_clusters, cluster_duplicate_map = deduplicate_and_split_cluster(

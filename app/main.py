@@ -26,7 +26,6 @@ from app.schemas.clip import (
 from app.pipeline.orchestrator import PipelineOrchestrator
 from app.pipeline.phase1_analyze.learned_matching import (
     match_image_pair,
-    geometry_quality_gate,
     NATIVE_EDGE_MIN_INLIERS,
     NATIVE_EDGE_MIN_INLIER_RATIO,
     NATIVE_EDGE_MIN_OVERLAP_RATIO,
@@ -121,7 +120,6 @@ def _build_pair_debug_strict_gate(
         ("min_inliers_required", int(num_inliers or 0) >= required_inliers),
         ("native_inlier_ratio", float(inlier_ratio) >= float(NATIVE_EDGE_MIN_INLIER_RATIO)),
         ("native_overlap_ratio", float(overlap_ratio) >= float(NATIVE_EDGE_MIN_OVERLAP_RATIO)),
-        ("geometry_quality_gate", bool(geometry_quality_gate(geometric_score, diagnostics))),
         ("has_diagnostics", has_diagnostics),
         ("geometry_model_allowed", geometry_model in NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS),
     ]
