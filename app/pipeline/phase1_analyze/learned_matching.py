@@ -129,6 +129,7 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
         )
 
     device = next(model.parameters()).device
+    fell_back_from_mps = False
     embeddings: List[np.ndarray] = []
     batch_size = max(1, int(DINO_BATCH_SIZE))
     t_start = time.perf_counter()
@@ -142,7 +143,31 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
                 batch_images.append(img)
             inputs = transform(batch_images, return_tensors="pt")
             inputs = {k: v.to(device) for k, v in inputs.items()}
-            outputs = model(**inputs)
+            try:
+                outputs = model(**inputs)
+            except (RuntimeError, NotImplementedError) as err:
+                err_msg = str(err)
+                # Some torch/transformers ops (e.g. upsample_bicubic2d) can fail on MPS.
+                # Fall back to CPU for DINO only, while keeping LoFTR on preferred device.
+                is_mps_op_gap = (
+                    str(device) == "mps"
+                    and (
+                        "upsample_bicubic2d" in err_msg
+                        or "MPS backend" in err_msg
+                        or "not currently implemented for the MPS" in err_msg
+                    )
+                )
+                if not is_mps_op_gap:
+                    raise
+                logger.warning(
+                    "DINOv2 MPS op unsupported, falling back to CPU for embeddings: %s",
+                    err_msg.splitlines()[0] if err_msg else "unknown",
+                )
+                model = model.to(torch.device("cpu"))
+                device = torch.device("cpu")
+                fell_back_from_mps = True
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                outputs = model(**inputs)
             batch_embeddings = outputs.last_hidden_state[:, 0, :].detach().cpu().numpy()
             for row in batch_embeddings:
                 embeddings.append(np.asarray(row, dtype=np.float32))
@@ -154,7 +179,7 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
         batch_size,
         elapsed_ms,
         elapsed_ms / max(1, len(images)),
-        str(device),
+        f"{device}{' (fallback from mps)' if fell_back_from_mps else ''}",
     )
     return np.asarray(embeddings, dtype=np.float32)
 
@@ -289,11 +314,9 @@ MIN_INLIERS_VERY_FAR = 35              # Enforce stronger geometry for very-far 
 MIN_SCORE_VERY_FAR = 0.45              # Reject weak-overlap scores for very-far pairs
 
 # Adaptive geometric matching thresholds
-LOFTR_CONFIDENCE_LEVELS = (0.10,)
-LOFTR_OUTDOOR_FALLBACK_MIN_INLIERS = 12  # Run outdoor checkpoint only when indoor is weak
 DEFAULT_LOFTR_INPUT_SIZE = (960, 720)  # width, height
 DEFAULT_PRODUCTION_MATCHER = "loftr_kornia_indoor_native"
-LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.20
+LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.50
 NATIVE_SCORE_COUNT_ZERO = 80
 NATIVE_SCORE_COUNT_TARGET = 260
 NATIVE_EDGE_MIN_MATCHES = 40
@@ -1233,29 +1256,109 @@ def strict_geometry_edge_gate(
 def _extract_pair_runtime_metrics(
     diagnostics: Dict[str, Any] | None,
     fallback_pair_time_s: float,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     timing = diagnostics.get("timing") if isinstance(diagnostics, dict) else None
     if not isinstance(timing, dict):
         return {
             "time_pair_total_s": float(max(0.0, fallback_pair_time_s)),
             "time_loftr_s": 0.0,
+            "time_loftr_forward_main_s": 0.0,
+            "time_loftr_forward_reverse_s": 0.0,
             "time_resize_s": 0.0,
             "time_tensor_transfer_s": 0.0,
             "time_postprocess_s": 0.0,
             "time_f_s": 0.0,
             "time_h_s": 0.0,
             "time_scoring_s": 0.0,
+            "forward_pass_count": 1,
+            "reverse_attempted": False,
+            "reverse_selected": False,
+            "model_device": "n/a",
+            "tensor_device": "n/a",
         }
     return {
         "time_pair_total_s": float(timing.get("time_pair_total_s", fallback_pair_time_s) or fallback_pair_time_s),
         "time_loftr_s": float(timing.get("time_loftr_s", 0.0) or 0.0),
+        "time_loftr_forward_main_s": float(timing.get("time_loftr_forward_main_s", 0.0) or 0.0),
+        "time_loftr_forward_reverse_s": float(timing.get("time_loftr_forward_reverse_s", 0.0) or 0.0),
         "time_resize_s": float(timing.get("time_resize_s", 0.0) or 0.0),
         "time_tensor_transfer_s": float(timing.get("time_tensor_transfer_s", 0.0) or 0.0),
         "time_postprocess_s": float(timing.get("time_postprocess_s", 0.0) or 0.0),
         "time_f_s": float(timing.get("time_f_s", 0.0) or 0.0),
         "time_h_s": float(timing.get("time_h_s", 0.0) or 0.0),
         "time_scoring_s": float(timing.get("time_scoring_s", 0.0) or 0.0),
+        "forward_pass_count": int(timing.get("forward_pass_count", 1) or 1),
+        "reverse_attempted": bool(timing.get("reverse_attempted", False)),
+        "reverse_selected": bool(timing.get("reverse_selected", False)),
+        "model_device": str(timing.get("model_device", "n/a")),
+        "tensor_device": str(timing.get("tensor_device", "n/a")),
     }
+
+
+def _accumulate_pair_runtime(stage_timers: Dict[str, float], pair_metrics: Dict[str, Any]) -> None:
+    stage_timers["time_loftr_total"] += float(pair_metrics["time_loftr_s"])
+    stage_timers["time_f_total"] += float(pair_metrics["time_f_s"])
+    stage_timers["time_h_total"] += float(pair_metrics["time_h_s"])
+    stage_timers["time_scoring_total"] += float(pair_metrics["time_scoring_s"])
+    stage_timers["time_resize_total"] += float(pair_metrics["time_resize_s"])
+    stage_timers["time_tensor_transfer_total"] += float(pair_metrics["time_tensor_transfer_s"])
+    stage_timers["time_postprocess_total"] += float(pair_metrics["time_postprocess_s"])
+
+
+def _extract_pair_quality_debug_metrics(
+    num_matches: int,
+    num_inliers: int,
+    diagnostics: Dict[str, Any] | None,
+) -> Tuple[float, float | None]:
+    inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
+    overlap_ratio_dbg: float | None = None
+    if isinstance(diagnostics, dict):
+        score_components = diagnostics.get("score_components")
+        if isinstance(score_components, dict):
+            inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
+            overlap_ratio_dbg = float(
+                score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0
+            )
+    return inlier_ratio_dbg, overlap_ratio_dbg
+
+
+def _log_pair_timing(
+    phase: str,
+    left_photo_id: int,
+    right_photo_id: int,
+    pair_metrics: Dict[str, Any],
+    num_matches: int,
+    num_inliers: int,
+    diagnostics: Dict[str, Any] | None,
+) -> None:
+    inlier_ratio_dbg, overlap_ratio_dbg = _extract_pair_quality_debug_metrics(
+        num_matches=num_matches,
+        num_inliers=num_inliers,
+        diagnostics=diagnostics,
+    )
+    logger.info(
+        "pair_timing phase=%s pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f loFTR_main_ms=%.1f loFTR_reverse_ms=%.1f "
+        "F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s passes=%s reverse_attempted=%s reverse_selected=%s model_device=%s tensor_device=%s",
+        phase,
+        left_photo_id,
+        right_photo_id,
+        pair_metrics["time_resize_s"] * 1000.0,
+        pair_metrics["time_tensor_transfer_s"] * 1000.0,
+        pair_metrics["time_loftr_s"] * 1000.0,
+        pair_metrics["time_loftr_forward_main_s"] * 1000.0,
+        pair_metrics["time_loftr_forward_reverse_s"] * 1000.0,
+        pair_metrics["time_f_s"] * 1000.0,
+        pair_metrics["time_h_s"] * 1000.0,
+        pair_metrics["time_scoring_s"] * 1000.0,
+        pair_metrics["time_pair_total_s"] * 1000.0,
+        inlier_ratio_dbg,
+        f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
+        pair_metrics["forward_pass_count"],
+        "yes" if pair_metrics["reverse_attempted"] else "no",
+        "yes" if pair_metrics["reverse_selected"] else "no",
+        pair_metrics["model_device"],
+        pair_metrics["tensor_device"],
+    )
 
 
 def rooms_are_different(room1: str, room2: str) -> bool:
@@ -1314,10 +1417,6 @@ SERVICE_ROOM_RECOVERY_THRESHOLD = 0.66  # Slightly lower for bathroom<->laundry 
 CROSS_ROOM_RECOVERY_TOPK = 2       # Require mutual top-K semantic affinity for cross-room fallback
 EXTERIOR_LONG_GAP_SEMANTIC_TRUST = 0.78  # Recover long-gap exterior pairs when geometry fails
 EXTERIOR_LONG_GAP_MIN = 5          # Minimum sequence gap for long-gap exterior semantic recovery
-
-# ORB pre-filter thresholds (for performance - ORB is ~10x faster than LoFTR)
-ORB_QUICK_REJECT_INLIERS = 2      # If ORB finds ≤2 inliers, skip LoFTR (definitely no overlap)
-ORB_QUICK_ACCEPT_INLIERS = 15     # If ORB finds ≥15 inliers, skip LoFTR (definitely overlap)
 
 # Minimum DINOv2 similarity to even consider geometric verification
 # Filters out obviously unrelated photos (aerial vs interior = ~0.05)
@@ -2005,6 +2104,41 @@ def _build_pair_metrics_payload(diagnostics: Dict[str, Any] | None) -> Dict[str,
     return payload
 
 
+def _append_similarity_record(
+    similarity_records: List[Dict[str, object]],
+    photo_ids: List[int],
+    left_idx: int,
+    right_idx: int,
+    pair_source: str,
+    dinov2_similarity: float,
+    is_connected: bool,
+    geometric_matches: int | None = None,
+    geometric_inliers: int | None = None,
+    geometric_score: float | None = None,
+    direction: Tuple[float, float] = (0.0, 0.0),
+    diagnostics: Dict[str, Any] | None = None,
+) -> None:
+    direction_dx: float | None = None
+    direction_dy: float | None = None
+    if direction != (0.0, 0.0):
+        direction_dx = float(direction[0])
+        direction_dy = float(direction[1])
+
+    similarity_records.append({
+        "photo_a_id": photo_ids[min(left_idx, right_idx)],
+        "photo_b_id": photo_ids[max(left_idx, right_idx)],
+        "pair_source": _annotate_pair_source_with_oracle(pair_source, diagnostics),
+        "dinov2_similarity": float(dinov2_similarity),
+        "geometric_matches": geometric_matches,
+        "geometric_inliers": geometric_inliers,
+        "geometric_score": float(geometric_score) if geometric_score is not None else None,
+        "direction_dx": direction_dx,
+        "direction_dy": direction_dy,
+        "is_connected": 1 if is_connected else 0,
+        **_build_pair_metrics_payload(diagnostics),
+    })
+
+
 def enforce_transition_quality(
     ordered_clusters: List[List[int]],
     photo_ids: List[int],
@@ -2205,7 +2339,6 @@ def enforce_transition_quality(
 
 
 # LightGlue/LoFTR model singleton
-_matcher_type = None
 _loftr_matchers: Dict[str, Any] = {}
 _kornia_oracle_ransac = None
 
@@ -2395,7 +2528,23 @@ def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, A
 def _load_loftr_checkpoint(checkpoint: str):
     """Load and cache a specific LoFTR checkpoint."""
     if checkpoint in _loftr_matchers:
-        return _loftr_matchers[checkpoint]
+        matcher = _loftr_matchers[checkpoint]
+        preferred = _preferred_torch_device()
+        try:
+            current = next(matcher.parameters()).device
+        except Exception:
+            current = torch.device("cpu")
+        if str(current) != str(preferred):
+            matcher = matcher.to(preferred)
+            matcher.eval()
+            _loftr_matchers[checkpoint] = matcher
+            logger.info(
+                "Moved cached LoFTR matcher (%s) from %s to %s",
+                checkpoint,
+                current,
+                preferred,
+            )
+        return matcher
 
     device = _preferred_torch_device()
     from kornia.feature import LoFTR
@@ -3030,6 +3179,7 @@ def _match_loftr_kornia_indoor_native(
     diagnostics_seconds = time.perf_counter() - diagnostics_started_at
     total_seconds = time.perf_counter() - total_started_at
     num_matches, num_inliers, score, direction, diagnostics = result
+    inner_timing = diagnostics.get("timing") if isinstance(diagnostics, dict) and isinstance(diagnostics.get("timing"), dict) else {}
     timing_payload = {
         "time_model_load_s": float(model_load_seconds),
         "time_resize_s": float(resize_seconds),
@@ -3040,6 +3190,9 @@ def _match_loftr_kornia_indoor_native(
         "time_postprocess_s": float(diagnostics_seconds),
         "time_pair_total_s": float(total_seconds),
         "time_reverse_pair_total_s": 0.0,
+        "time_f_s": float(inner_timing.get("time_f_s", 0.0) or 0.0),
+        "time_h_s": float(inner_timing.get("time_h_s", 0.0) or 0.0),
+        "time_scoring_s": float(inner_timing.get("time_scoring_s", 0.0) or 0.0),
         "forward_pass_count": 1,
         "reverse_attempted": False,
         "reverse_selected": False,
@@ -3055,241 +3208,6 @@ def _match_loftr_kornia_indoor_native(
     return int(num_matches), int(num_inliers), float(score), direction, diagnostics
 
 
-def _load_matcher():
-    """Load learned feature matcher (lazy initialization)."""
-    global _matcher_type
-
-    # If matcher type was previously set to ORB fallback, keep it.
-    if _matcher_type == "orb":
-        return None, _matcher_type
-
-    # Prefer indoor LoFTR as primary; outdoor can be used as fallback in matching.
-    try:
-        matcher = _load_loftr_checkpoint("indoor_new")
-        _matcher_type = "loftr"
-        return matcher, _matcher_type
-    except Exception as indoor_err:
-        logger.debug("LoFTR indoor_new unavailable: %s", indoor_err)
-        try:
-            matcher = _load_loftr_checkpoint("outdoor")
-            _matcher_type = "loftr"
-            return matcher, _matcher_type
-        except Exception as outdoor_err:
-            logger.debug("LoFTR outdoor unavailable: %s", outdoor_err)
-
-    _matcher_type = "orb"
-    logger.info("Using ORB matcher (kornia LoFTR unavailable)")
-    return None, _matcher_type
-
-
-def _pick_better_match_result(
-    current_best: Optional[Dict[str, Any]],
-    candidate: Dict[str, Any],
-) -> Dict[str, Any]:
-    if current_best is None:
-        return candidate
-    # Prioritize geometric quality first; inlier count is secondary.
-    score_delta = float(candidate["score"]) - float(current_best["score"])
-    if score_delta > 0.02:
-        return candidate
-    if score_delta < -0.02:
-        return current_best
-    if candidate["num_inliers"] > current_best["num_inliers"]:
-        return candidate
-    if candidate["num_inliers"] < current_best["num_inliers"]:
-        return current_best
-    if candidate["score"] > current_best["score"]:
-        return candidate
-    if candidate["score"] < current_best["score"]:
-        return current_best
-    if candidate["num_matches"] > current_best["num_matches"]:
-        return candidate
-    return current_best
-
-
-def _run_loftr_with_thresholds(
-    matcher,
-    img1_resized: np.ndarray,
-    img2_resized: np.ndarray,
-    confidence_thresholds: Tuple[float, ...],
-    checkpoint: str,
-    content_w0: int,
-    content_h0: int,
-    content_w1: int,
-    content_h1: int,
-    reproj_threshold: float = RANSAC_REPROJ_THRESHOLD,
-) -> Dict[str, Any]:
-    """Run LoFTR once and evaluate adaptive confidence thresholds."""
-    device = next(matcher.parameters()).device
-    tensor1 = torch.from_numpy(img1_resized).unsqueeze(0).unsqueeze(0).to(device)
-    tensor2 = torch.from_numpy(img2_resized).unsqueeze(0).unsqueeze(0).to(device)
-
-    with torch.inference_mode():
-        correspondences = matcher({"image0": tensor1, "image1": tensor2})
-
-    mkpts0 = correspondences["keypoints0"].cpu().numpy()
-    mkpts1 = correspondences["keypoints1"].cpu().numpy()
-    confidence = correspondences["confidence"].cpu().numpy()
-    h0, w0 = img1_resized.shape[:2]
-    h1, w1 = img2_resized.shape[:2]
-    if ENABLE_PHOTOMETRIC_PREFILTER:
-        grad0 = _compute_gradient_magnitude(img1_resized)
-        grad1 = _compute_gradient_magnitude(img2_resized)
-        photometric_mask = _photometric_consistency_mask(
-            points0=mkpts0,
-            points1=mkpts1,
-            image0=img1_resized,
-            image1=img2_resized,
-            grad0=grad0,
-            grad1=grad1,
-        )
-    else:
-        photometric_mask = np.ones((len(confidence),), dtype=bool)
-    best_result: Optional[Dict[str, Any]] = None
-    threshold_trials: List[Dict[str, Any]] = []
-    for threshold in confidence_thresholds:
-        conf_mask = confidence > float(threshold)
-        raw_matches = int(conf_mask.sum())
-        conf_mask = conf_mask & photometric_mask
-        num_matches = int(conf_mask.sum())
-        trial: Dict[str, Any] = {
-            "threshold": float(threshold),
-            "raw_matches": int(raw_matches),
-            "num_matches": int(num_matches),
-            "num_inliers": 0,
-            "score": 0.0,
-            "geometry_model": "none",
-        }
-        if num_matches < 8:
-            threshold_trials.append(trial)
-            continue
-
-        points0 = np.ascontiguousarray(mkpts0[conf_mask], dtype=np.float32)
-        points1 = np.ascontiguousarray(mkpts1[conf_mask], dtype=np.float32)
-        match_scores = np.ascontiguousarray(confidence[conf_mask], dtype=np.float32)
-        if points0.shape[0] < 8 or points1.shape[0] < 8 or points0.shape[0] != points1.shape[0]:
-            threshold_trials.append(trial)
-            continue
-
-        inlier_mask, geom_model = _estimate_geometric_inliers(
-            points0,
-            points1,
-            reproj_threshold=reproj_threshold,
-        )
-        trial["geometry_model"] = geom_model
-        if inlier_mask is None:
-            threshold_trials.append(trial)
-            continue
-        num_inliers = int(inlier_mask.sum())
-        trial["num_inliers"] = int(num_inliers)
-        if num_inliers <= 0:
-            threshold_trials.append(trial)
-            continue
-
-        inlier_points0 = points0[inlier_mask]
-        inlier_points1 = points1[inlier_mask]
-        direction = compute_direction_vector(points0, points1, inlier_mask)
-        segment_scores = _compute_segment_scores(
-            inlier_points0,
-            inlier_points1,
-            width0=content_w0,
-            height0=content_h0,
-            width1=content_w1,
-            height1=content_h1,
-        )
-        score_components = _compute_transition_geometry_components(
-            num_matches=num_matches,
-            num_inliers=num_inliers,
-            inlier_points0=inlier_points0,
-            inlier_points1=inlier_points1,
-            width0=content_w0,
-            height0=content_h0,
-            width1=content_w1,
-            height1=content_h1,
-            segment_scores=segment_scores,
-        )
-        score = float(score_components["final_score"])
-        trial["score"] = float(score)
-        trial["native_score_mean"] = float(np.mean(match_scores)) if match_scores.size > 0 else 0.0
-        trial["native_score_median"] = float(np.median(match_scores)) if match_scores.size > 0 else 0.0
-        trial["native_score_p95"] = float(np.percentile(match_scores, 95)) if match_scores.size > 0 else 0.0
-        threshold_trials.append(trial)
-
-        candidate = {
-            "num_matches": num_matches,
-            "num_inliers": num_inliers,
-            "score": score,
-            "direction": direction,
-            "confidence_threshold": float(threshold),
-            "checkpoint": checkpoint,
-            "geometry_model": geom_model,
-            "segment_scores": segment_scores,
-            "score_components": score_components,
-            "raw_points0": points0,
-            "raw_points1": points1,
-            "matching_scores": match_scores,
-            "inlier_points0": inlier_points0,
-            "inlier_points1": inlier_points1,
-            "width0": int(content_w0),
-            "height0": int(content_h0),
-            "width1": int(content_w1),
-            "height1": int(content_h1),
-            "padded_width0": int(w0),
-            "padded_height0": int(h0),
-            "padded_width1": int(w1),
-            "padded_height1": int(h1),
-        }
-        best_result = _pick_better_match_result(best_result, candidate)
-
-    if best_result is None:
-        return {
-            "num_matches": 0,
-            "num_inliers": 0,
-            "score": 0.0,
-            "direction": (0.0, 0.0),
-            "confidence_threshold": None,
-            "checkpoint": checkpoint,
-            "geometry_model": "none",
-            "segment_scores": _compute_segment_scores(
-                np.empty((0, 2), dtype=np.float32),
-                np.empty((0, 2), dtype=np.float32),
-                width0=content_w0,
-                height0=content_h0,
-                width1=content_w1,
-                height1=content_h1,
-            ),
-            "score_components": _compute_transition_geometry_components(
-                num_matches=0,
-                num_inliers=0,
-                inlier_points0=np.empty((0, 2), dtype=np.float32),
-                inlier_points1=np.empty((0, 2), dtype=np.float32),
-                width0=content_w0,
-                height0=content_h0,
-                width1=content_w1,
-                height1=content_h1,
-                segment_scores={},
-            ),
-            "raw_points0": np.empty((0, 2), dtype=np.float32),
-            "raw_points1": np.empty((0, 2), dtype=np.float32),
-            "matching_scores": np.empty((0,), dtype=np.float32),
-            "inlier_points0": np.empty((0, 2), dtype=np.float32),
-            "inlier_points1": np.empty((0, 2), dtype=np.float32),
-            "width0": int(content_w0),
-            "height0": int(content_h0),
-            "width1": int(content_w1),
-            "height1": int(content_h1),
-            "padded_width0": int(w0),
-            "padded_height0": int(h0),
-            "padded_width1": int(w1),
-            "padded_height1": int(h1),
-            "raw_correspondence_count": int(len(confidence)),
-            "threshold_trials": threshold_trials,
-        }
-    best_result["raw_correspondence_count"] = int(len(confidence))
-    best_result["threshold_trials"] = threshold_trials
-    return best_result
-
-
 def match_image_pair(
     img1: Image.Image,
     img2: Image.Image,
@@ -3297,23 +3215,19 @@ def match_image_pair(
     return_diagnostics: bool = False,
     debug_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, int, float, Tuple[float, float]] | Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
-    """Match two images using learned features with ORB pre-filtering.
-
-    Performance optimization (optional): ORB is ~10x faster than LoFTR.
-    - If ORB shows ≤2 inliers → definitely no overlap, skip LoFTR
-    - If ORB shows ≥15 inliers → definitely overlap, use ORB result
-    - Otherwise → run LoFTR for accurate matching
+    """Match two images using the production native LoFTR pipeline.
 
     Args:
         img1: First PIL Image
         img2: Second PIL Image
-        use_orb_prefilter: Whether to use ORB as pre-filter (default True)
+        use_orb_prefilter: Deprecated compatibility flag (ignored).
 
     Returns:
         Tuple of (num_matches, num_inliers, overlap_score, direction_vector).
         When return_diagnostics=True, appends a diagnostics dict.
         direction_vector is (dx, dy) showing how content shifted from img1 to img2.
     """
+    _ = use_orb_prefilter  # compatibility-only; ORB path removed from production flow
     # Normalize orientation only when EXIF indicates rotation.
     # Avoid unconditional copies; they destroy image-object cache hit rate.
     try:
@@ -3369,358 +3283,6 @@ def match_image_pair(
     if return_diagnostics:
         return result
     return result[0], result[1], result[2], result[3]
-
-
-def _match_loftr(
-    matcher,
-    img1: Image.Image,
-    img2: Image.Image,
-    input_size: Tuple[int, int] = DEFAULT_LOFTR_INPUT_SIZE,
-    confidence_thresholds: Tuple[float, ...] = LOFTR_CONFIDENCE_LEVELS,
-    reproj_threshold: float = RANSAC_REPROJ_THRESHOLD,
-    enable_outdoor_fallback: bool = True,
-) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
-    """Match using LoFTR (learned dense matching)."""
-
-    # Convert to grayscale tensors
-    img1_gray = np.array(img1.convert("L"), dtype=np.float32) / 255.0
-    img2_gray = np.array(img2.convert("L"), dtype=np.float32) / 255.0
-    # Resize by longest side preserving aspect ratio, then pad to /8.
-    target_long_side = max(64, int(max(input_size)))
-    img1_resized, meta0 = _resize_by_longest_side_and_pad(
-        img1_gray,
-        target_long_side=target_long_side,
-        multiple=8,
-    )
-    img2_resized, meta1 = _resize_by_longest_side_and_pad(
-        img2_gray,
-        target_long_side=target_long_side,
-        multiple=8,
-    )
-    best_result = _run_loftr_with_thresholds(
-        matcher=matcher,
-        img1_resized=img1_resized,
-        img2_resized=img2_resized,
-        confidence_thresholds=confidence_thresholds,
-        checkpoint="indoor_new",
-        content_w0=int(meta0["content_w"]),
-        content_h0=int(meta0["content_h"]),
-        content_w1=int(meta1["content_w"]),
-        content_h1=int(meta1["content_h"]),
-        reproj_threshold=reproj_threshold,
-    )
-
-    # Fallback to outdoor checkpoint when indoor does not produce robust geometry.
-    if enable_outdoor_fallback and best_result["num_inliers"] < LOFTR_OUTDOOR_FALLBACK_MIN_INLIERS:
-        try:
-            outdoor_matcher = _load_loftr_checkpoint("outdoor")
-            outdoor_result = _run_loftr_with_thresholds(
-                matcher=outdoor_matcher,
-                img1_resized=img1_resized,
-                img2_resized=img2_resized,
-                confidence_thresholds=confidence_thresholds,
-                checkpoint="outdoor",
-                content_w0=int(meta0["content_w"]),
-                content_h0=int(meta0["content_h"]),
-                content_w1=int(meta1["content_w"]),
-                content_h1=int(meta1["content_h"]),
-                reproj_threshold=reproj_threshold,
-            )
-            best_result = _pick_better_match_result(best_result, outdoor_result)
-        except Exception as outdoor_err:
-            logger.debug("Outdoor LoFTR fallback unavailable: %s", outdoor_err)
-
-    num_matches = int(best_result["num_matches"])
-    num_inliers = int(best_result["num_inliers"])
-    score = float(best_result["score"])
-    direction = best_result["direction"]
-    segment_scores = best_result.get("segment_scores", {})
-    raw_points0 = np.ascontiguousarray(best_result.get("raw_points0", np.empty((0, 2), dtype=np.float32)))
-    raw_points1 = np.ascontiguousarray(best_result.get("raw_points1", np.empty((0, 2), dtype=np.float32)))
-    matching_scores = _as_score_vector(best_result.get("matching_scores"))
-    width0 = int(best_result.get("width0", int(meta0["content_w"])))
-    height0 = int(best_result.get("height0", int(meta0["content_h"])))
-    width1 = int(best_result.get("width1", int(meta1["content_w"])))
-    height1 = int(best_result.get("height1", int(meta1["content_h"])))
-    inlier_points0 = np.ascontiguousarray(best_result.get("inlier_points0", np.empty((0, 2), dtype=np.float32)))
-    inlier_points1 = np.ascontiguousarray(best_result.get("inlier_points1", np.empty((0, 2), dtype=np.float32)))
-    num_matches, num_inliers, score, direction, oracle_diag = _apply_kornia_oracle_to_match(
-        num_matches=num_matches,
-        num_inliers=num_inliers,
-        score=score,
-        direction=direction,
-        inlier_points0=inlier_points0,
-        inlier_points1=inlier_points1,
-        width=width0,
-        height=height0,
-        segment_scores=segment_scores,
-    )
-
-    diagnostics = {
-        "matcher": "loftr",
-        "checkpoint": best_result.get("checkpoint"),
-        "confidence_threshold": best_result.get("confidence_threshold"),
-        "geometry_model": best_result.get("geometry_model"),
-        "segment_scores": segment_scores,
-        "score_components": best_result.get("score_components"),
-        "match_width": width0,
-        "match_height": height0,
-        "raw_correspondence_count": int(best_result.get("raw_correspondence_count", 0)),
-        "threshold_trials": best_result.get("threshold_trials", []),
-        "loftr_input_width": int(best_result.get("padded_width0", img1_resized.shape[1])),
-        "loftr_input_height": int(best_result.get("padded_height0", img1_resized.shape[0])),
-        "ransac_reproj_threshold": float(reproj_threshold),
-        "raw_matches": _sample_normalized_matches(
-            points0=raw_points0,
-            points1=raw_points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        ),
-        "native_matching_scores": _matching_score_summary(matching_scores),
-        "native_matching_scores_raw": _matching_score_summary(matching_scores),
-        "inlier_match_count": int(num_inliers),
-        "inlier_matches": _sample_normalized_matches(
-            points0=inlier_points0,
-            points1=inlier_points1,
-            width0=width0,
-            height0=height0,
-            width1=width1,
-            height1=height1,
-            max_points=5000,
-        ),
-        "oracle": oracle_diag,
-    }
-
-    return (
-        num_matches,
-        num_inliers,
-        score,
-        direction,
-        diagnostics,
-    )
-
-
-def _match_orb(
-    img1: Image.Image,
-    img2: Image.Image,
-    reproj_threshold: float = RANSAC_REPROJ_THRESHOLD,
-) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
-    """Fallback ORB matching."""
-    img1_gray = np.array(img1.convert("L"))
-    img2_gray = np.array(img2.convert("L"))
-
-    orb = cv2.ORB_create(nfeatures=2000)
-
-    kp1, desc1 = orb.detectAndCompute(img1_gray, None)
-    kp2, desc2 = orb.detectAndCompute(img2_gray, None)
-
-    if desc1 is None or desc2 is None:
-        return 0, 0, 0.0, (0.0, 0.0), {"matcher": "orb", "segment_scores": {}}
-
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-    try:
-        matches = bf.knnMatch(desc1, desc2, k=2)
-    except cv2.error:
-        return 0, 0, 0.0, (0.0, 0.0), {"matcher": "orb", "segment_scores": {}}
-
-    # Lowe's ratio test
-    good_matches = []
-    for match_pair in matches:
-        if len(match_pair) == 2:
-            m, n = match_pair
-            if m.distance < 0.75 * n.distance:
-                good_matches.append(m)
-
-    num_matches = len(good_matches)
-
-    if num_matches < 8:
-        return num_matches, 0, 0.0, (0.0, 0.0), {"matcher": "orb", "segment_scores": {}}
-
-    src_pts = np.ascontiguousarray([kp1[m.queryIdx].pt for m in good_matches], dtype=np.float32)
-    dst_pts = np.ascontiguousarray([kp2[m.trainIdx].pt for m in good_matches], dtype=np.float32)
-
-    # Safety check
-    if src_pts.shape[0] < 8 or dst_pts.shape[0] < 8 or src_pts.shape[0] != dst_pts.shape[0]:
-        return num_matches, 0, 0.0, (0.0, 0.0), {"matcher": "orb", "segment_scores": {}}
-
-    mask, geom_model = _estimate_geometric_inliers(
-        src_pts,
-        dst_pts,
-        reproj_threshold=reproj_threshold,
-    )
-    if mask is None:
-        return num_matches, 0, 0.0, (0.0, 0.0), {"matcher": "orb", "segment_scores": {}}
-
-    num_inliers = int(mask.sum())
-    inlier_points0 = src_pts[mask]
-    inlier_points1 = dst_pts[mask]
-    direction = compute_direction_vector(src_pts, dst_pts, mask)
-    h0, w0 = img1_gray.shape[:2]
-    h1, w1 = img2_gray.shape[:2]
-    segment_scores = _compute_segment_scores(
-        inlier_points0,
-        inlier_points1,
-        width0=int(w0),
-        height0=int(h0),
-        width1=int(w1),
-        height1=int(h1),
-    )
-    score_components = _compute_transition_geometry_components(
-        num_matches=num_matches,
-        num_inliers=num_inliers,
-        inlier_points0=inlier_points0,
-        inlier_points1=inlier_points1,
-        width0=int(w0),
-        height0=int(h0),
-        width1=int(w1),
-        height1=int(h1),
-        segment_scores=segment_scores,
-    )
-    score = float(score_components["final_score"])
-    num_matches, num_inliers, score, direction, oracle_diag = _apply_kornia_oracle_to_match(
-        num_matches=num_matches,
-        num_inliers=num_inliers,
-        score=score,
-        direction=direction,
-        inlier_points0=inlier_points0,
-        inlier_points1=inlier_points1,
-        width=int(w0),
-        height=int(h0),
-        segment_scores=segment_scores,
-    )
-    diagnostics = {
-        "matcher": "orb",
-        "checkpoint": None,
-        "confidence_threshold": None,
-        "geometry_model": geom_model,
-        "segment_scores": segment_scores,
-        "score_components": score_components,
-        "match_width": int(w0),
-        "match_height": int(h0),
-        "raw_correspondence_count": int(num_matches),
-        "raw_matches": _sample_normalized_matches(
-            points0=src_pts,
-            points1=dst_pts,
-            width0=int(w0),
-            height0=int(h0),
-            width1=int(w1),
-            height1=int(h1),
-            max_points=5000,
-        ),
-        "inlier_match_count": int(num_inliers),
-        "inlier_matches": _sample_normalized_matches(
-            points0=inlier_points0,
-            points1=inlier_points1,
-            width0=int(w0),
-            height0=int(h0),
-            width1=int(w1),
-            height1=int(h1),
-            max_points=5000,
-        ),
-        "oracle": oracle_diag,
-    }
-    return num_matches, num_inliers, score, direction, diagnostics
-
-
-def compute_overlap_within_cluster(
-    images: List[Image.Image],
-    photo_ids: List[int],
-) -> np.ndarray:
-    """Compute pairwise overlap within a single DINOv2 cluster.
-
-    Args:
-        images: List of PIL Images in the cluster
-        photo_ids: List of photo IDs
-
-    Returns:
-        NxN overlap matrix
-    """
-    n = len(images)
-    if n <= 1:
-        return np.ones((n, n))
-
-    overlap_matrix = np.zeros((n, n))
-    np.fill_diagonal(overlap_matrix, 1.0)
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            num_matches, num_inliers, score, _ = match_image_pair(images[i], images[j])
-
-            if num_inliers >= MIN_INLIERS_FOR_OVERLAP:
-                overlap_matrix[i, j] = score
-                overlap_matrix[j, i] = score
-                logger.info(
-                    f"Overlap {photo_ids[i]} <-> {photo_ids[j]}: "
-                    f"{num_matches} matches -> {num_inliers} inliers, "
-                    f"score={score:.3f} ✓"
-                )
-            else:
-                logger.debug(
-                    f"No overlap {photo_ids[i]} <-> {photo_ids[j]}: "
-                    f"{num_matches} matches -> {num_inliers} inliers"
-                )
-
-    return overlap_matrix
-
-
-def split_cluster_by_overlap(
-    images: List[Image.Image],
-    photo_ids: List[int],
-    overlap_matrix: np.ndarray,
-) -> List[List[int]]:
-    """Split a DINOv2 cluster into sub-clusters by geometric overlap.
-
-    Uses single-linkage to build chains of overlapping photos.
-
-    Args:
-        images: List of images in the cluster
-        photo_ids: List of photo IDs
-        overlap_matrix: NxN overlap matrix
-
-    Returns:
-        List of photo ID lists (sub-clusters with verified overlap)
-    """
-    from scipy.cluster.hierarchy import linkage, fcluster
-    from scipy.spatial.distance import squareform
-
-    n = len(photo_ids)
-    if n <= 1:
-        return [photo_ids]
-
-    # Check if there's ANY significant overlap
-    has_overlap = (overlap_matrix > OVERLAP_THRESHOLD).sum() > n  # More than diagonal
-
-    if not has_overlap:
-        # No overlaps found - each photo is its own cluster
-        logger.debug(f"No geometric overlap found in cluster of {n} photos")
-        return [[pid] for pid in photo_ids]
-
-    # Convert to distance matrix
-    distance_matrix = 1.0 - np.clip(overlap_matrix, 0, 1)
-    np.fill_diagonal(distance_matrix, 0)
-
-    # Single-linkage clustering (builds chains)
-    condensed = squareform(distance_matrix, checks=False)
-    Z = linkage(condensed, method='single')
-
-    # Cut at threshold
-    distance_threshold = 1.0 - OVERLAP_THRESHOLD
-    labels = fcluster(Z, t=distance_threshold, criterion='distance')
-
-    # Group by label
-    clusters_dict = defaultdict(list)
-    for i, label in enumerate(labels):
-        clusters_dict[label].append(photo_ids[i])
-
-    sub_clusters = list(clusters_dict.values())
-
-    logger.info(f"Overlap clustering: {n} photos -> {len(sub_clusters)} sub-clusters")
-
-    return sub_clusters
-
 
 # ============================================================================
 # GRAPH-BASED CLUSTERING: DINOv2 proposes edges, geometry verifies
@@ -4067,19 +3629,15 @@ def cluster_photos_graph_based(
         if is_cross_room and temporal_dist > 1:
             logger.info(f"  Temporal {photo_ids[i]} <-> {photo_ids[j]}: "
                        f"SKIP - different rooms ({room_i} vs {room_j}), dist={temporal_dist}")
-            similarity_records.append({
-                "photo_a_id": photo_ids[min(i, j)],
-                "photo_b_id": photo_ids[max(i, j)],
-                "pair_source": "temporal_cross_room",
-                "dinov2_similarity": float(sem_sim),
-                "geometric_matches": None,
-                "geometric_inliers": None,
-                "geometric_score": None,
-                "direction_dx": None,
-                "direction_dy": None,
-                "is_connected": 0,
-                **_build_pair_metrics_payload(None),
-            })
+            _append_similarity_record(
+                similarity_records=similarity_records,
+                photo_ids=photo_ids,
+                left_idx=i,
+                right_idx=j,
+                pair_source="temporal_cross_room",
+                dinov2_similarity=float(sem_sim),
+                is_connected=False,
+            )
             continue
 
         room_info = f" [cross-room: {room_i}/{room_j}]" if is_cross_room else ""
@@ -4119,34 +3677,16 @@ def cluster_photos_graph_based(
             pair_elapsed = time.perf_counter() - pair_started_at
             temporal_geo_seconds += pair_elapsed
             pair_metrics = _extract_pair_runtime_metrics(diagnostics, fallback_pair_time_s=pair_elapsed)
-            stage_timers["time_loftr_total"] += pair_metrics["time_loftr_s"]
-            stage_timers["time_f_total"] += pair_metrics["time_f_s"]
-            stage_timers["time_h_total"] += pair_metrics["time_h_s"]
-            stage_timers["time_scoring_total"] += pair_metrics["time_scoring_s"]
-            stage_timers["time_resize_total"] += pair_metrics["time_resize_s"]
-            stage_timers["time_tensor_transfer_total"] += pair_metrics["time_tensor_transfer_s"]
-            stage_timers["time_postprocess_total"] += pair_metrics["time_postprocess_s"]
+            _accumulate_pair_runtime(stage_timers, pair_metrics)
             pair_timing_count += 1
-            overlap_ratio_dbg = None
-            inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
-            if isinstance(diagnostics, dict):
-                score_components = diagnostics.get("score_components")
-                if isinstance(score_components, dict):
-                    inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
-                    overlap_ratio_dbg = float(score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0)
-            logger.info(
-                "pair_timing phase=2a pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s",
-                photo_ids[i],
-                photo_ids[j],
-                pair_metrics["time_resize_s"] * 1000.0,
-                pair_metrics["time_tensor_transfer_s"] * 1000.0,
-                pair_metrics["time_loftr_s"] * 1000.0,
-                pair_metrics["time_f_s"] * 1000.0,
-                pair_metrics["time_h_s"] * 1000.0,
-                pair_metrics["time_scoring_s"] * 1000.0,
-                pair_metrics["time_pair_total_s"] * 1000.0,
-                inlier_ratio_dbg,
-                f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
+            _log_pair_timing(
+                phase="2a",
+                left_photo_id=photo_ids[i],
+                right_photo_id=photo_ids[j],
+                pair_metrics=pair_metrics,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                diagnostics=diagnostics,
             )
 
             blended_score = None
@@ -4223,34 +3763,16 @@ def cluster_photos_graph_based(
             pair_elapsed = time.perf_counter() - pair_started_at
             temporal_geo_seconds += pair_elapsed
             pair_metrics = _extract_pair_runtime_metrics(diagnostics, fallback_pair_time_s=pair_elapsed)
-            stage_timers["time_loftr_total"] += pair_metrics["time_loftr_s"]
-            stage_timers["time_f_total"] += pair_metrics["time_f_s"]
-            stage_timers["time_h_total"] += pair_metrics["time_h_s"]
-            stage_timers["time_scoring_total"] += pair_metrics["time_scoring_s"]
-            stage_timers["time_resize_total"] += pair_metrics["time_resize_s"]
-            stage_timers["time_tensor_transfer_total"] += pair_metrics["time_tensor_transfer_s"]
-            stage_timers["time_postprocess_total"] += pair_metrics["time_postprocess_s"]
+            _accumulate_pair_runtime(stage_timers, pair_metrics)
             pair_timing_count += 1
-            overlap_ratio_dbg = None
-            inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
-            if isinstance(diagnostics, dict):
-                score_components = diagnostics.get("score_components")
-                if isinstance(score_components, dict):
-                    inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
-                    overlap_ratio_dbg = float(score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0)
-            logger.info(
-                "pair_timing phase=2a pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s",
-                photo_ids[i],
-                photo_ids[j],
-                pair_metrics["time_resize_s"] * 1000.0,
-                pair_metrics["time_tensor_transfer_s"] * 1000.0,
-                pair_metrics["time_loftr_s"] * 1000.0,
-                pair_metrics["time_f_s"] * 1000.0,
-                pair_metrics["time_h_s"] * 1000.0,
-                pair_metrics["time_scoring_s"] * 1000.0,
-                pair_metrics["time_pair_total_s"] * 1000.0,
-                inlier_ratio_dbg,
-                f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
+            _log_pair_timing(
+                phase="2a",
+                left_photo_id=photo_ids[i],
+                right_photo_id=photo_ids[j],
+                pair_metrics=pair_metrics,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                diagnostics=diagnostics,
             )
 
             if strict_geometry_edge_gate(
@@ -4437,20 +3959,20 @@ def cluster_photos_graph_based(
 
         # Track for database storage
         pair_source = "both" if (i, j) in semantic_pairs else "temporal_window"
-        pair_source = _annotate_pair_source_with_oracle(pair_source, diagnostics)
-        similarity_records.append({
-            "photo_a_id": photo_ids[min(i, j)],
-            "photo_b_id": photo_ids[max(i, j)],
-            "pair_source": pair_source,
-            "dinov2_similarity": float(sem_sim),
-            "geometric_matches": num_matches,
-            "geometric_inliers": num_inliers,
-            "geometric_score": float(geo_score) if geo_score else None,
-            "direction_dx": float(direction[0]) if direction != (0.0, 0.0) else None,
-            "direction_dy": float(direction[1]) if direction != (0.0, 0.0) else None,
-            "is_connected": 1 if is_matched else 0,
-            **_build_pair_metrics_payload(diagnostics),
-        })
+        _append_similarity_record(
+            similarity_records=similarity_records,
+            photo_ids=photo_ids,
+            left_idx=i,
+            right_idx=j,
+            pair_source=pair_source,
+            dinov2_similarity=float(sem_sim),
+            geometric_matches=num_matches,
+            geometric_inliers=num_inliers,
+            geometric_score=float(geo_score) if geo_score is not None else None,
+            direction=direction,
+            is_connected=is_matched,
+            diagnostics=diagnostics,
+        )
 
     logger.info(f"Stage 2a: {temporal_matched}/{len(temporal_pairs)} temporal pairs matched "
                f"(semantic-only={temporal_semantic_only}, geometric={temporal_geometric})")
@@ -4490,19 +4012,15 @@ def cluster_photos_graph_based(
             logger.info(f"  [{idx+1}/{len(geometric_pairs)}] SKIP {photo_ids[i]} <-> {photo_ids[j]} "
                        f"(different rooms: {room_i} vs {room_j})")
             skipped_cross_room += 1
-            similarity_records.append({
-                "photo_a_id": photo_ids[min(i, j)],
-                "photo_b_id": photo_ids[max(i, j)],
-                "pair_source": "dinov2_topk_cross_room",
-                "dinov2_similarity": float(sem_sim),
-                "geometric_matches": None,
-                "geometric_inliers": None,
-                "geometric_score": None,
-                "direction_dx": None,
-                "direction_dy": None,
-                "is_connected": 0,
-                **_build_pair_metrics_payload(None),
-            })
+            _append_similarity_record(
+                similarity_records=similarity_records,
+                photo_ids=photo_ids,
+                left_idx=i,
+                right_idx=j,
+                pair_source="dinov2_topk_cross_room",
+                dinov2_similarity=float(sem_sim),
+                is_connected=False,
+            )
             continue
 
         # Skip pairs with very low semantic similarity (obviously unrelated)
@@ -4511,19 +4029,15 @@ def cluster_photos_graph_based(
                        f"(DINOv2 similarity={sem_sim:.3f} < {MIN_SEMANTIC_FOR_GEOMETRIC})")
             skipped_low_semantic += 1
             # Still record for database but mark as not matched
-            similarity_records.append({
-                "photo_a_id": photo_ids[min(i, j)],
-                "photo_b_id": photo_ids[max(i, j)],
-                "pair_source": "dinov2_topk_skipped",
-                "dinov2_similarity": float(sem_sim),
-                "geometric_matches": None,
-                "geometric_inliers": None,
-                "geometric_score": None,
-                "direction_dx": None,
-                "direction_dy": None,
-                "is_connected": 0,
-                **_build_pair_metrics_payload(None),
-            })
+            _append_similarity_record(
+                similarity_records=similarity_records,
+                photo_ids=photo_ids,
+                left_idx=i,
+                right_idx=j,
+                pair_source="dinov2_topk_skipped",
+                dinov2_similarity=float(sem_sim),
+                is_connected=False,
+            )
             continue
 
         # Photos far apart in sequence need stronger evidence to be connected
@@ -4538,19 +4052,15 @@ def cluster_photos_graph_based(
                     f"(very-far gap={position_gap}, semantic={sem_sim:.3f} < {MIN_SEMANTIC_FOR_VERY_FAR})"
                 )
                 skipped_low_semantic += 1
-                similarity_records.append({
-                    "photo_a_id": photo_ids[min(i, j)],
-                    "photo_b_id": photo_ids[max(i, j)],
-                    "pair_source": "dinov2_topk_skipped",
-                    "dinov2_similarity": float(sem_sim),
-                    "geometric_matches": None,
-                    "geometric_inliers": None,
-                    "geometric_score": None,
-                    "direction_dx": None,
-                    "direction_dy": None,
-                    "is_connected": 0,
-                    **_build_pair_metrics_payload(None),
-                })
+                _append_similarity_record(
+                    similarity_records=similarity_records,
+                    photo_ids=photo_ids,
+                    left_idx=i,
+                    right_idx=j,
+                    pair_source="dinov2_topk_skipped",
+                    dinov2_similarity=float(sem_sim),
+                    is_connected=False,
+                )
                 continue
         elif position_gap >= POSITION_GAP_THRESHOLD:
             min_inliers = MIN_INLIERS_FAR_APART
@@ -4582,34 +4092,16 @@ def cluster_photos_graph_based(
         stage2b_geo_checks += 1
         stage2b_geo_seconds += pair_elapsed
         pair_metrics = _extract_pair_runtime_metrics(diagnostics, fallback_pair_time_s=pair_elapsed)
-        stage_timers["time_loftr_total"] += pair_metrics["time_loftr_s"]
-        stage_timers["time_f_total"] += pair_metrics["time_f_s"]
-        stage_timers["time_h_total"] += pair_metrics["time_h_s"]
-        stage_timers["time_scoring_total"] += pair_metrics["time_scoring_s"]
-        stage_timers["time_resize_total"] += pair_metrics["time_resize_s"]
-        stage_timers["time_tensor_transfer_total"] += pair_metrics["time_tensor_transfer_s"]
-        stage_timers["time_postprocess_total"] += pair_metrics["time_postprocess_s"]
+        _accumulate_pair_runtime(stage_timers, pair_metrics)
         pair_timing_count += 1
-        overlap_ratio_dbg = None
-        inlier_ratio_dbg = float(num_inliers) / max(1.0, float(num_matches))
-        if isinstance(diagnostics, dict):
-            score_components = diagnostics.get("score_components")
-            if isinstance(score_components, dict):
-                inlier_ratio_dbg = float(score_components.get("inlier_ratio", inlier_ratio_dbg) or inlier_ratio_dbg)
-                overlap_ratio_dbg = float(score_components.get("overlap_ratio", score_components.get("robust_coverage", 0.0)) or 0.0)
-        logger.info(
-            "pair_timing phase=2b pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s",
-            photo_ids[i],
-            photo_ids[j],
-            pair_metrics["time_resize_s"] * 1000.0,
-            pair_metrics["time_tensor_transfer_s"] * 1000.0,
-            pair_metrics["time_loftr_s"] * 1000.0,
-            pair_metrics["time_f_s"] * 1000.0,
-            pair_metrics["time_h_s"] * 1000.0,
-            pair_metrics["time_scoring_s"] * 1000.0,
-            pair_metrics["time_pair_total_s"] * 1000.0,
-            inlier_ratio_dbg,
-            f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
+        _log_pair_timing(
+            phase="2b",
+            left_photo_id=photo_ids[i],
+            right_photo_id=photo_ids[j],
+            pair_metrics=pair_metrics,
+            num_matches=num_matches,
+            num_inliers=num_inliers,
+            diagnostics=diagnostics,
         )
 
         is_matched = strict_geometry_edge_gate(
@@ -4648,10 +4140,12 @@ def cluster_photos_graph_based(
                 dir_str,
             )
         else:
+            room_i_norm = normalize_room_label(room_i)
+            room_j_norm = normalize_room_label(room_j)
             same_room_label = (
-                normalize_room_label(room_i) != ""
-                and normalize_room_label(room_i) != "unknown"
-                and normalize_room_label(room_i) == normalize_room_label(room_j)
+                room_i_norm != ""
+                and room_i_norm != "unknown"
+                and room_i_norm == room_j_norm
             )
             exterior_pair = is_exterior_like(room_i) and is_exterior_like(room_j)
             if (
@@ -4686,19 +4180,20 @@ def cluster_photos_graph_based(
                     logger.info(f"    ✗ No match: {num_matches} matches, {num_inliers} inliers < {effective_min_inliers}")
 
         # Track for database storage
-        similarity_records.append({
-            "photo_a_id": photo_ids[min(i, j)],
-            "photo_b_id": photo_ids[max(i, j)],
-            "pair_source": _annotate_pair_source_with_oracle(pair_source, diagnostics),
-            "dinov2_similarity": float(sem_sim),
-            "geometric_matches": num_matches,
-            "geometric_inliers": num_inliers,
-            "geometric_score": float(score) if score else None,
-            "direction_dx": float(direction[0]) if direction != (0.0, 0.0) else None,
-            "direction_dy": float(direction[1]) if direction != (0.0, 0.0) else None,
-            "is_connected": 1 if is_matched else 0,
-            **_build_pair_metrics_payload(diagnostics),
-        })
+        _append_similarity_record(
+            similarity_records=similarity_records,
+            photo_ids=photo_ids,
+            left_idx=i,
+            right_idx=j,
+            pair_source=pair_source,
+            dinov2_similarity=float(sem_sim),
+            geometric_matches=num_matches,
+            geometric_inliers=num_inliers,
+            geometric_score=float(score) if score is not None else None,
+            direction=direction,
+            is_connected=is_matched,
+            diagnostics=diagnostics,
+        )
 
     logger.info(
         "Stage 2b: %s/%s non-temporal pairs matched (%s cross-room, %s low-semantic, %s semantic recoveries)",
