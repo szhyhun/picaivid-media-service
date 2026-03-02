@@ -289,10 +289,6 @@ LOW_SCORE_SEGMENT_STRENGTH_MIN = 0.10
 FUNDAMENTAL_SAMPSON_THRESHOLD = 3.0  # Relaxed epipolar residual filter (pixels)
 FUNDAMENTAL_RANSAC_CONFIDENCE = 0.995
 ENABLE_FUNDAMENTAL_SAMPSON_REFINEMENT = False
-PLANAR_DEGENERACY_MIN_F_H_RATIO = 0.40
-PLANAR_DEGENERACY_MAX_F_INLIERS = 25
-ALLOW_HOMOGRAPHY_FALLBACK = False  # Fundamental geometry is preferred for parallax transitions.
-MIN_HOMOGRAPHY_FALLBACK_INLIERS = 30
 
 # Room label mismatch - only skip non-adjacent photos with different rooms
 # For ADJACENT photos (temporal_dist=1), trust geometry even if room labels differ
@@ -316,7 +312,7 @@ MIN_SCORE_VERY_FAR = 0.45              # Reject weak-overlap scores for very-far
 # Adaptive geometric matching thresholds
 DEFAULT_LOFTR_INPUT_SIZE = (960, 720)  # width, height
 DEFAULT_PRODUCTION_MATCHER = "loftr_kornia_indoor_native"
-LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.50
+LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.20
 NATIVE_SCORE_COUNT_ZERO = 80
 NATIVE_SCORE_COUNT_TARGET = 260
 NATIVE_EDGE_MIN_MATCHES = 40
@@ -333,8 +329,6 @@ ROBUST_SUPPORT_MIN_FACTOR = 0.20
 ROBUST_RATIO_DENOMINATOR_MIN = 60
 ROBUST_SCORE_MIN_INLIERS = 20
 ROBUST_SCORE_MIN_ACTIVE_MATCHES = 40
-ROBUST_OVERLAP_MIN_INLIERS_FOR_H = 30
-ROBUST_OVERLAP_MIN_INLIER_RATIO_FOR_H = 0.25
 FINAL_GATE_MIN_INLIERS = 20
 FINAL_GATE_MIN_INLIER_RATIO = 0.20
 FINAL_GATE_MIN_OVERLAP_RATIO = 0.10
@@ -346,10 +340,6 @@ NATIVE_REVERSE_RETRY_MATCH_THRESHOLD = 120
 NATIVE_REVERSE_RETRY_INLIER_THRESHOLD = 25
 # Do not run reverse retry if forward geometry score is already acceptable.
 NATIVE_REVERSE_RETRY_SCORE_THRESHOLD = MIN_GEOMETRIC_SCORE_FOR_EDGE
-ENABLE_PHOTOMETRIC_PREFILTER = False
-PHOTOMETRIC_PATCH_RADIUS = 4
-PHOTOMETRIC_MIN_NCC = 0.55
-PHOTOMETRIC_MIN_GRAD = 0.02
 
 # Segment-aware overlap scoring (horizontal bands)
 SEGMENT_LEFT_START = 0.25   # Left transition band starts at 25% width
@@ -432,83 +422,10 @@ def _compute_fundamental_sampson_errors(
     return numer / denom
 
 
-def _compute_gradient_magnitude(image_gray: np.ndarray) -> np.ndarray:
-    gx = cv2.Sobel(image_gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(image_gray, cv2.CV_32F, 0, 1, ksize=3)
-    return cv2.magnitude(gx, gy)
-
-
-def _photometric_consistency_mask(
-    points0: np.ndarray,
-    points1: np.ndarray,
-    image0: np.ndarray,
-    image1: np.ndarray,
-    grad0: np.ndarray,
-    grad1: np.ndarray,
-    patch_radius: int = PHOTOMETRIC_PATCH_RADIUS,
-    min_ncc: float = PHOTOMETRIC_MIN_NCC,
-    min_grad: float = PHOTOMETRIC_MIN_GRAD,
-) -> np.ndarray:
-    """Keep correspondences that agree in local appearance (NCC) and texture."""
-    n = int(points0.shape[0])
-    if n <= 0:
-        return np.zeros((0,), dtype=bool)
-
-    h0, w0 = image0.shape[:2]
-    h1, w1 = image1.shape[:2]
-    kept = np.zeros((n,), dtype=bool)
-
-    for i in range(n):
-        x0, y0 = points0[i]
-        x1, y1 = points1[i]
-        xi0 = int(round(float(x0)))
-        yi0 = int(round(float(y0)))
-        xi1 = int(round(float(x1)))
-        yi1 = int(round(float(y1)))
-
-        if (
-            xi0 < patch_radius
-            or yi0 < patch_radius
-            or xi0 >= (w0 - patch_radius)
-            or yi0 >= (h0 - patch_radius)
-            or xi1 < patch_radius
-            or yi1 < patch_radius
-            or xi1 >= (w1 - patch_radius)
-            or yi1 >= (h1 - patch_radius)
-        ):
-            continue
-
-        if float(grad0[yi0, xi0]) < min_grad or float(grad1[yi1, xi1]) < min_grad:
-            continue
-
-        p0 = image0[
-            yi0 - patch_radius: yi0 + patch_radius + 1,
-            xi0 - patch_radius: xi0 + patch_radius + 1,
-        ].astype(np.float32)
-        p1 = image1[
-            yi1 - patch_radius: yi1 + patch_radius + 1,
-            xi1 - patch_radius: xi1 + patch_radius + 1,
-        ].astype(np.float32)
-
-        p0 = p0 - float(p0.mean())
-        p1 = p1 - float(p1.mean())
-        n0 = float(np.linalg.norm(p0))
-        n1 = float(np.linalg.norm(p1))
-        if n0 <= 1e-6 or n1 <= 1e-6:
-            continue
-
-        ncc = float((p0 * p1).sum() / (n0 * n1))
-        if ncc >= min_ncc:
-            kept[i] = True
-
-    return kept
-
-
 def _estimate_geometric_inliers(
     points0: np.ndarray,
     points1: np.ndarray,
     reproj_threshold: float = RANSAC_REPROJ_THRESHOLD,
-    homography_reproj_threshold: float = 3.0,
 ) -> Tuple[np.ndarray | None, str]:
     """Estimate inlier mask using robust geometry, preferring stronger consensus."""
     best_fundamental_mask = None
@@ -548,37 +465,9 @@ def _estimate_geometric_inliers(
         except cv2.error:
             continue
 
-    # Fundamental inliers are preferred for real camera-motion consistency.
     if best_fundamental_mask is not None and best_fundamental_count > 0:
-        # Detect planar degeneracy: H fits far better than F while F support is small.
-        h_method = cv2.USAC_MAGSAC if hasattr(cv2, "USAC_MAGSAC") else cv2.RANSAC
-        try:
-            _, mask_h = cv2.findHomography(points0, points1, h_method, float(homography_reproj_threshold))
-            inlier_mask_h = _safe_inlier_mask(mask_h, len(points0))
-            if inlier_mask_h is not None:
-                count_h = int(inlier_mask_h.sum())
-                if (
-                    count_h > 0
-                    and best_fundamental_count <= int(PLANAR_DEGENERACY_MAX_F_INLIERS)
-                    and (float(best_fundamental_count) / float(count_h)) < float(PLANAR_DEGENERACY_MIN_F_H_RATIO)
-                ):
-                    return None, "none_planar_degenerate"
-        except cv2.error:
-            pass
+        # Fundamental inliers are the only geometry source in production flow.
         return best_fundamental_mask, best_fundamental_model
-
-    # Homography fallback (optional, strict) for nearly-planar scenes.
-    if ALLOW_HOMOGRAPHY_FALLBACK:
-        h_method = cv2.USAC_MAGSAC if hasattr(cv2, "USAC_MAGSAC") else cv2.RANSAC
-        try:
-            _, mask_h = cv2.findHomography(points0, points1, h_method, float(homography_reproj_threshold))
-            inlier_mask_h = _safe_inlier_mask(mask_h, len(points0))
-            if inlier_mask_h is not None:
-                count_h = int(inlier_mask_h.sum())
-                if count_h >= MIN_HOMOGRAPHY_FALLBACK_INLIERS:
-                    return inlier_mask_h, "homography"
-        except cv2.error:
-            pass
 
     return None, "none"
 
@@ -908,71 +797,6 @@ def _compute_robust_overlap_score(
     )
 
 
-def _estimate_homography(
-    points0: np.ndarray,
-    points1: np.ndarray,
-    reproj_threshold: float = 3.0,
-) -> Tuple[np.ndarray | None, np.ndarray | None]:
-    if points0.shape[0] < 4 or points1.shape[0] < 4 or points0.shape[0] != points1.shape[0]:
-        return None, None
-    h_method = cv2.USAC_MAGSAC if hasattr(cv2, "USAC_MAGSAC") else cv2.RANSAC
-    try:
-        homography, mask = cv2.findHomography(
-            points0,
-            points1,
-            h_method,
-            float(reproj_threshold),
-            confidence=float(FUNDAMENTAL_RANSAC_CONFIDENCE),
-        )
-    except cv2.error:
-        return None, None
-    inlier_mask = _safe_inlier_mask(mask, len(points0))
-    if homography is None or inlier_mask is None:
-        return None, None
-    return np.asarray(homography, dtype=np.float64), inlier_mask
-
-
-def _compute_homography_overlap_ratio(
-    homography_0_to_1: np.ndarray,
-    width0: int,
-    height0: int,
-    width1: int,
-    height1: int,
-) -> Tuple[float, float, float]:
-    if homography_0_to_1 is None or homography_0_to_1.shape != (3, 3):
-        return 0.0, 0.0, 0.0
-
-    mask0 = np.ones((max(1, int(height0)), max(1, int(width0))), dtype=np.uint8)
-    warped_0_to_1 = cv2.warpPerspective(
-        mask0,
-        homography_0_to_1,
-        (max(1, int(width1)), max(1, int(height1))),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    overlap_0_to_1 = float(np.mean(warped_0_to_1 > 0))
-
-    overlap_1_to_0 = 0.0
-    try:
-        homography_1_to_0 = np.linalg.inv(homography_0_to_1)
-        mask1 = np.ones((max(1, int(height1)), max(1, int(width1))), dtype=np.uint8)
-        warped_1_to_0 = cv2.warpPerspective(
-            mask1,
-            homography_1_to_0,
-            (max(1, int(width0)), max(1, int(height0))),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        overlap_1_to_0 = float(np.mean(warped_1_to_0 > 0))
-    except (np.linalg.LinAlgError, cv2.error):
-        overlap_1_to_0 = 0.0
-
-    symmetric_overlap = float(min(overlap_0_to_1, overlap_1_to_0))
-    return symmetric_overlap, overlap_0_to_1, overlap_1_to_0
-
-
 def _sample_normalized_matches(
     points0: np.ndarray,
     points1: np.ndarray,
@@ -1072,9 +896,21 @@ def geometry_quality_gate(
 
     motion = float(score_components.get("motion_coherence", 0.0) or 0.0)
     segment_strength = float(score_components.get("segment_strength", 0.0) or 0.0)
+    inlier_ratio = float(score_components.get("inlier_ratio", 0.0) or 0.0)
+    overlap_ratio = float(
+        score_components.get(
+            "overlap_ratio",
+            score_components.get("robust_coverage", 0.0),
+        )
+        or 0.0
+    )
 
     # Low-mid scores are fragile on repetitive textures; require stronger structure/motion.
     if score < 0.40 and motion < LOW_SCORE_MOTION_COHERENCE_MIN and segment_strength < LOW_SCORE_SEGMENT_STRENGTH_MIN:
+        # Allow strong geometric support pairs even when motion vector coherence is weak
+        # (e.g., wider-angle same-room views where inlier motions fan out).
+        if inlier_ratio >= NATIVE_EDGE_MIN_INLIER_RATIO and overlap_ratio >= NATIVE_EDGE_MIN_OVERLAP_RATIO:
+            return True
         return False
     return True
 
@@ -1116,13 +952,9 @@ def strict_geometry_edge_gate(
         score_components = diagnostics.get("score_components")
         if isinstance(score_components, dict):
             inlier_ratio = float(score_components.get("inlier_ratio", inlier_ratio) or inlier_ratio)
-            overlap_ratio = float(
-                score_components.get(
-                    "overlap_ratio",
-                    score_components.get("robust_coverage", overlap_ratio),
-                )
-                or overlap_ratio
-            )
+            overlap_ratio_raw = float(score_components.get("overlap_ratio", 0.0) or 0.0)
+            overlap_ratio_cov = float(score_components.get("robust_coverage", 0.0) or 0.0)
+            overlap_ratio = max(overlap_ratio_raw, overlap_ratio_cov)
             robust_valid = bool(int(score_components.get("robust_score_valid", 0) or 0))
             combined_score = float(score_components.get("combined_score", combined_score) or combined_score)
 
@@ -2340,167 +2172,6 @@ def enforce_transition_quality(
 
 # LightGlue/LoFTR model singleton
 _loftr_matchers: Dict[str, Any] = {}
-_kornia_oracle_ransac = None
-
-
-def _normalized_oracle_mode() -> str:
-    mode = (settings.KORNIA_ORACLE_MODE or "off").strip().lower()
-    if mode not in {"off", "shadow", "gate"}:
-        logger.warning("Unknown KORNIA_ORACLE_MODE=%s (using off)", settings.KORNIA_ORACLE_MODE)
-        return "off"
-    return mode
-
-
-def _load_kornia_oracle_ransac():
-    global _kornia_oracle_ransac
-    if _kornia_oracle_ransac is not None:
-        return _kornia_oracle_ransac
-
-    from kornia.geometry.ransac import RANSAC
-
-    _kornia_oracle_ransac = RANSAC(
-        model_type="homography",
-        inl_th=float(settings.KORNIA_ORACLE_INLIER_THRESHOLD_PX),
-        max_iter=10,
-        confidence=0.999,
-    )
-    return _kornia_oracle_ransac
-
-
-def _compute_homography_overlap_ratio_convex(
-    homography: np.ndarray,
-    width: int,
-    height: int,
-) -> float:
-    if homography is None or homography.shape != (3, 3) or not np.isfinite(homography).all():
-        return 0.0
-
-    corners = np.array(
-        [
-            [0.0, 0.0],
-            [float(width - 1), 0.0],
-            [float(width - 1), float(height - 1)],
-            [0.0, float(height - 1)],
-        ],
-        dtype=np.float32,
-    )
-    projected = cv2.perspectiveTransform(corners.reshape(1, -1, 2), homography.astype(np.float32))[0]
-    target_rect = corners
-
-    # cv2.intersectConvexConvex returns (intersection_area, intersection_polygon)
-    try:
-        intersection_area, _ = cv2.intersectConvexConvex(projected, target_rect)
-    except cv2.error:
-        return 0.0
-
-    if not np.isfinite(intersection_area) or intersection_area <= 0.0:
-        return 0.0
-
-    frame_area = float(max(1, width * height))
-    return float(np.clip(float(intersection_area) / frame_area, 0.0, 1.0))
-
-
-def _evaluate_kornia_oracle(
-    inlier_points0: np.ndarray,
-    inlier_points1: np.ndarray,
-    width: int,
-    height: int,
-    segment_scores: Dict[str, float],
-) -> Dict[str, Any]:
-    mode = _normalized_oracle_mode()
-    if mode == "off":
-        return {
-            "mode": mode,
-            "evaluated": False,
-            "passed": True,
-            "decision": "disabled",
-        }
-
-    if len(inlier_points0) < 8 or len(inlier_points1) < 8:
-        passed = mode != "gate"
-        return {
-            "mode": mode,
-            "evaluated": False,
-            "passed": passed,
-            "decision": "insufficient_inliers",
-            "overlap_ratio": 0.0,
-            "side_overlap": 0.0,
-            "inlier_ratio": 0.0,
-        }
-
-    try:
-        ransac = _load_kornia_oracle_ransac()
-        pts0_t = torch.from_numpy(np.ascontiguousarray(inlier_points0, dtype=np.float32))
-        pts1_t = torch.from_numpy(np.ascontiguousarray(inlier_points1, dtype=np.float32))
-        homography_t, inlier_mask_t = ransac(pts0_t, pts1_t)
-        homography = homography_t.detach().cpu().numpy()
-        inlier_mask = inlier_mask_t.detach().cpu().numpy().astype(bool)
-
-        kornia_inliers = int(inlier_mask.sum())
-        kornia_inlier_ratio = float(kornia_inliers / max(1, len(inlier_points0)))
-        overlap_ratio = _compute_homography_overlap_ratio_convex(homography, width=width, height=height)
-        side_overlap = max(
-            float(segment_scores.get("cross_left_to_right", 0.0)),
-            float(segment_scores.get("cross_right_to_left", 0.0)),
-        )
-        center_overlap = float(segment_scores.get("cross_center_to_center", 0.0))
-        transition_overlap_ok = (
-            side_overlap >= float(settings.KORNIA_ORACLE_MIN_SIDE_OVERLAP)
-            or center_overlap >= float(settings.KORNIA_ORACLE_MIN_CENTER_OVERLAP)
-        )
-
-        passed = (
-            overlap_ratio >= float(settings.KORNIA_ORACLE_MIN_OVERLAP_RATIO)
-            and transition_overlap_ok
-            and kornia_inlier_ratio >= float(settings.KORNIA_ORACLE_MIN_INLIER_RATIO)
-        )
-
-        return {
-            "mode": mode,
-            "evaluated": True,
-            "passed": passed,
-            "decision": "pass" if passed else "reject",
-            "overlap_ratio": overlap_ratio,
-            "side_overlap": side_overlap,
-            "center_overlap": center_overlap,
-            "transition_overlap_ok": transition_overlap_ok,
-            "inlier_ratio": kornia_inlier_ratio,
-            "kornia_inliers": kornia_inliers,
-        }
-    except Exception as err:
-        logger.debug("Kornia oracle evaluation failed: %s", err)
-        return {
-            "mode": mode,
-            "evaluated": False,
-            "passed": True,  # fail-open to keep pipeline stable
-            "decision": "error_fail_open",
-            "error": str(err),
-        }
-
-
-def _apply_kornia_oracle_to_match(
-    num_matches: int,
-    num_inliers: int,
-    score: float,
-    direction: Tuple[float, float],
-    inlier_points0: np.ndarray,
-    inlier_points1: np.ndarray,
-    width: int,
-    height: int,
-    segment_scores: Dict[str, float],
-) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
-    oracle = _evaluate_kornia_oracle(
-        inlier_points0=inlier_points0,
-        inlier_points1=inlier_points1,
-        width=width,
-        height=height,
-        segment_scores=segment_scores,
-    )
-    mode = str(oracle.get("mode", "off"))
-
-    if mode == "gate" and not bool(oracle.get("passed", True)):
-        return num_matches, 0, 0.0, (0.0, 0.0), oracle
-    return num_matches, num_inliers, score, direction, oracle
 
 
 def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, Any] | None) -> str:
@@ -2527,6 +2198,19 @@ def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, A
 
 def _load_loftr_checkpoint(checkpoint: str):
     """Load and cache a specific LoFTR checkpoint."""
+    def _same_device(a: torch.device, b: torch.device) -> bool:
+        # On MPS, PyTorch may surface cached params as "mps:0" while preferred is "mps".
+        # Treat those as equivalent so we do not keep remapping the same model.
+        if a.type != b.type:
+            return False
+        if a.type in {"cpu", "mps"}:
+            return True
+        if a.type == "cuda":
+            if a.index is None or b.index is None:
+                return True
+            return a.index == b.index
+        return a == b
+
     if checkpoint in _loftr_matchers:
         matcher = _loftr_matchers[checkpoint]
         preferred = _preferred_torch_device()
@@ -2534,7 +2218,7 @@ def _load_loftr_checkpoint(checkpoint: str):
             current = next(matcher.parameters()).device
         except Exception:
             current = torch.device("cpu")
-        if str(current) != str(preferred):
+        if not _same_device(current, preferred):
             matcher = matcher.to(preferred)
             matcher.eval()
             _loftr_matchers[checkpoint] = matcher
@@ -2700,13 +2384,10 @@ def _build_native_loftr_diagnostics(
     geometric_score = 0.0
     robust_overlap_score = 0.0
     overlap_ratio = 0.0
-    overlap_ratio_0_to_1 = 0.0
-    overlap_ratio_1_to_0 = 0.0
     median_epipolar_error = 5.0
     overlap_centroid_x0 = 0.0
     overlap_centroid_x1 = 0.0
     fundamental_seconds = 0.0
-    homography_seconds = 0.0
 
     if active_count >= 8:
         f_started_at = time.perf_counter()
@@ -2747,26 +2428,16 @@ def _build_native_loftr_diagnostics(
                 geometric_score = float(score_components.get("final_score", 0.0) or 0.0)
                 overlap_centroid_x0 = float(np.mean(inlier_points0[:, 0]) / max(1.0, float(width0)))
                 overlap_centroid_x1 = float(np.mean(inlier_points1[:, 0]) / max(1.0, float(width1)))
-                f_inlier_ratio_active = float(num_inliers) / max(1.0, float(active_count))
-                if (
-                    num_inliers >= int(ROBUST_OVERLAP_MIN_INLIERS_FOR_H)
-                    and f_inlier_ratio_active >= float(ROBUST_OVERLAP_MIN_INLIER_RATIO_FOR_H)
-                ):
-                    # Estimate homography on F-inliers only, then compute symmetric overlap mask ratio.
-                    h_started_at = time.perf_counter()
-                    h_from_f, _ = _estimate_homography(inlier_points0, inlier_points1, reproj_threshold=3.0)
-                    if h_from_f is not None:
-                        overlap_ratio, overlap_ratio_0_to_1, overlap_ratio_1_to_0 = _compute_homography_overlap_ratio(
-                            h_from_f,
-                            width0=width0,
-                            height0=height0,
-                            width1=width1,
-                            height1=height1,
-                        )
-                    homography_seconds += (time.perf_counter() - h_started_at)
 
     scoring_started_at = time.perf_counter()
     inlier_ratio_for_overlap = float(score_components.get("inlier_ratio", 0.0) or 0.0)
+    convex_overlap_ratio = float(
+        min(
+            float(score_components.get("spread_area0", 0.0) or 0.0),
+            float(score_components.get("spread_area1", 0.0) or 0.0),
+        )
+    )
+    overlap_ratio = float(convex_overlap_ratio)
     robust_coverage = float(overlap_ratio)
     if (
         geometry_model in {"fundamental_magsac", "fundamental_ransac"}
@@ -2861,8 +2532,7 @@ def _build_native_loftr_diagnostics(
         robust_components.get("overlap_support_full", 0.0) or 0.0
     )
     score_components["overlap_ratio"] = float(overlap_ratio)
-    score_components["overlap_ratio_0_to_1"] = float(overlap_ratio_0_to_1)
-    score_components["overlap_ratio_1_to_0"] = float(overlap_ratio_1_to_0)
+    score_components["overlap_ratio_convex"] = float(convex_overlap_ratio)
     score_components["robust_coverage"] = float(robust_coverage)
     score_components["overlap_centroid_x0"] = float(overlap_centroid_x0)
     score_components["overlap_centroid_x1"] = float(overlap_centroid_x1)
@@ -2947,7 +2617,7 @@ def _build_native_loftr_diagnostics(
         "match_count_term": float(match_count_term),
         "timing": {
             "time_f_s": float(fundamental_seconds),
-            "time_h_s": float(homography_seconds),
+            "time_h_s": 0.0,
             "time_scoring_s": float(scoring_seconds),
         },
     }
@@ -3289,20 +2959,54 @@ def match_image_pair(
 # ============================================================================
 
 
-def _connected_nodes(edge_mask: np.ndarray, start_idx: int) -> set:
-    """Return connected node indices from start_idx using DFS over boolean edge mask."""
-    stack = [start_idx]
-    visited = set()
+def _connected_component_nodes(edge_mask: np.ndarray, start_idx: int) -> np.ndarray:
+    """Return sorted node indices in start_idx component using iterative DFS."""
+    n = edge_mask.shape[0]
+    if start_idx < 0 or start_idx >= n:
+        return np.empty((0,), dtype=np.int32)
+
+    visited = np.zeros((n,), dtype=bool)
+    stack = [int(start_idx)]
+    visited[start_idx] = True
     while stack:
         node = stack.pop()
-        if node in visited:
+        next_nodes = np.flatnonzero(edge_mask[node] & (~visited))
+        if next_nodes.size == 0:
             continue
-        visited.add(node)
-        neighbors = np.where(edge_mask[node])[0]
-        for nbr in neighbors:
-            if nbr not in visited:
-                stack.append(int(nbr))
-    return visited
+        visited[next_nodes] = True
+        stack.extend(int(idx) for idx in next_nodes)
+    return np.flatnonzero(visited).astype(np.int32, copy=False)
+
+
+def _find_undirected_bridge_edges(edge_mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Find bridge edges in an undirected graph represented by a boolean adjacency matrix."""
+    n = edge_mask.shape[0]
+    neighbors: List[List[int]] = [np.flatnonzero(edge_mask[i]).astype(np.int32).tolist() for i in range(n)]
+    disc = np.full((n,), -1, dtype=np.int32)
+    low = np.full((n,), -1, dtype=np.int32)
+    parent = np.full((n,), -1, dtype=np.int32)
+    bridges: List[Tuple[int, int]] = []
+    time_idx = 0
+
+    def dfs(node: int) -> None:
+        nonlocal time_idx
+        disc[node] = time_idx
+        low[node] = time_idx
+        time_idx += 1
+        for nbr in neighbors[node]:
+            if disc[nbr] == -1:
+                parent[nbr] = node
+                dfs(nbr)
+                low[node] = min(low[node], low[nbr])
+                if low[nbr] > disc[node]:
+                    bridges.append((min(node, nbr), max(node, nbr)))
+            elif nbr != parent[node]:
+                low[node] = min(low[node], disc[nbr])
+
+    for node in range(n):
+        if disc[node] == -1:
+            dfs(node)
+    return bridges
 
 
 def prune_weak_semantic_bridges(
@@ -3316,36 +3020,51 @@ def prune_weak_semantic_bridges(
     This reduces false merges caused by transitive chaining of weak temporal
     semantic edges (A-B and B-C) when A-C semantic support is weak.
     """
-    n = adjacency.shape[0]
     edge_mask = adjacency > OVERLAP_THRESHOLD
+    pass_idx = 0
+    total_pruned = 0
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if not edge_mask[i, j]:
-                continue
+    while True:
+        bridge_edges = _find_undirected_bridge_edges(edge_mask)
+        if not bridge_edges:
+            break
+
+        pruned_this_pass = 0
+        pass_idx += 1
+        for i, j in bridge_edges:
             if edge_has_geometry[i, j]:
                 continue
-
-            component = _connected_nodes(edge_mask, i)
-            if j not in component or len(component) < 3:
+            if not edge_mask[i, j]:
                 continue
 
-            # Temporarily remove candidate bridge and check whether it truly
-            # splits the component.
+            # Temporarily remove candidate bridge and evaluate cross-support.
             edge_mask[i, j] = False
             edge_mask[j, i] = False
 
-            comp_i = _connected_nodes(edge_mask, i)
-            if j in comp_i:
+            comp_i = _connected_component_nodes(edge_mask, i)
+            if comp_i.size == 0 or np.any(comp_i == j):
                 edge_mask[i, j] = True
                 edge_mask[j, i] = True
                 continue
-            comp_j = _connected_nodes(edge_mask, j)
 
-            max_cross_sem = max(similarity[a, b] for a in comp_i for b in comp_j)
+            comp_j = _connected_component_nodes(edge_mask, j)
+            if comp_j.size == 0:
+                edge_mask[i, j] = True
+                edge_mask[j, i] = True
+                continue
+
+            if (comp_i.size + comp_j.size) < 3:
+                edge_mask[i, j] = True
+                edge_mask[j, i] = True
+                continue
+
+            cross_block = similarity[np.ix_(comp_i, comp_j)]
+            max_cross_sem = float(np.max(cross_block)) if cross_block.size else 0.0
             if max_cross_sem < SEMANTIC_BRIDGE_SUPPORT_THRESHOLD:
                 adjacency[i, j] = 0.0
                 adjacency[j, i] = 0.0
+                pruned_this_pass += 1
+                total_pruned += 1
                 logger.info(
                     "Pruned semantic bridge %s <-> %s (max cross semantic=%.3f < %.2f)",
                     photo_ids[i],
@@ -3353,10 +3072,19 @@ def prune_weak_semantic_bridges(
                     max_cross_sem,
                     SEMANTIC_BRIDGE_SUPPORT_THRESHOLD,
                 )
-                # keep edge removed in edge_mask
+                # Keep edge removed in edge_mask.
             else:
                 edge_mask[i, j] = True
                 edge_mask[j, i] = True
+
+        if pruned_this_pass <= 0:
+            break
+        logger.info(
+            "Semantic-bridge prune pass %s removed %s edges (total=%s)",
+            pass_idx,
+            pruned_this_pass,
+            total_pruned,
+        )
 
 
 def build_component_edge_mask(

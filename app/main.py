@@ -24,7 +24,17 @@ from app.schemas.clip import (
     PairDebugLiveMetrics, PairDebugPoint,
 )
 from app.pipeline.orchestrator import PipelineOrchestrator
-from app.pipeline.phase1_analyze.learned_matching import match_image_pair
+from app.pipeline.phase1_analyze.learned_matching import (
+    match_image_pair,
+    geometry_quality_gate,
+    NATIVE_EDGE_MIN_INLIERS,
+    NATIVE_EDGE_MIN_INLIER_RATIO,
+    NATIVE_EDGE_MIN_OVERLAP_RATIO,
+    FINAL_GATE_MIN_INLIERS,
+    FINAL_GATE_MIN_INLIER_RATIO,
+    FINAL_GATE_MIN_OVERLAP_RATIO,
+    NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS,
+)
 
 # Setup logging
 setup_logging()
@@ -70,6 +80,82 @@ def _safe_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _build_pair_debug_strict_gate(
+    num_matches: int | None,
+    num_inliers: int | None,
+    geometric_score: float | None,
+    diagnostics: dict | None,
+    min_inliers_required: int = NATIVE_EDGE_MIN_INLIERS,
+) -> dict:
+    """Mirror strict production edge gate and return structured pass/fail diagnostics."""
+    score_components = diagnostics.get("score_components") if isinstance(diagnostics, dict) else {}
+    score_components = score_components if isinstance(score_components, dict) else {}
+
+    inlier_ratio = (
+        float(score_components.get("inlier_ratio"))
+        if score_components.get("inlier_ratio") is not None
+        else float(num_inliers or 0) / max(1.0, float(num_matches or 0))
+    )
+    overlap_ratio_raw = float(score_components.get("overlap_ratio", 0.0) or 0.0)
+    overlap_ratio_cov = float(score_components.get("robust_coverage", 0.0) or 0.0)
+    overlap_ratio = max(overlap_ratio_raw, overlap_ratio_cov)
+    robust_valid = bool(int(score_components.get("robust_score_valid", 0) or 0))
+    combined_score = float(
+        score_components.get(
+            "combined_score",
+            geometric_score if geometric_score is not None else 0.0,
+        )
+        or 0.0
+    )
+    geometry_model = str((diagnostics or {}).get("geometry_model") or "").strip().lower()
+    required_inliers = int(max(int(min_inliers_required), int(NATIVE_EDGE_MIN_INLIERS)))
+    has_diagnostics = isinstance(diagnostics, dict)
+
+    checks = [
+        ("has_counts", (num_matches is not None and num_inliers is not None)),
+        ("final_gate_inliers", int(num_inliers or 0) >= int(FINAL_GATE_MIN_INLIERS)),
+        ("final_gate_inlier_ratio", float(inlier_ratio) >= float(FINAL_GATE_MIN_INLIER_RATIO)),
+        ("final_gate_overlap_ratio", float(overlap_ratio) >= float(FINAL_GATE_MIN_OVERLAP_RATIO)),
+        ("min_inliers_required", int(num_inliers or 0) >= required_inliers),
+        ("native_inlier_ratio", float(inlier_ratio) >= float(NATIVE_EDGE_MIN_INLIER_RATIO)),
+        ("native_overlap_ratio", float(overlap_ratio) >= float(NATIVE_EDGE_MIN_OVERLAP_RATIO)),
+        ("geometry_quality_gate", bool(geometry_quality_gate(geometric_score, diagnostics))),
+        ("has_diagnostics", has_diagnostics),
+        ("geometry_model_allowed", geometry_model in NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS),
+    ]
+
+    fail_reason = "passed"
+    for reason, passed in checks:
+        if not passed:
+            fail_reason = reason
+            break
+
+    return {
+        "would_connect": fail_reason == "passed",
+        "reason": fail_reason,
+        "required": {
+            "min_inliers_required": required_inliers,
+            "final_gate_min_inliers": int(FINAL_GATE_MIN_INLIERS),
+            "final_gate_min_inlier_ratio": float(FINAL_GATE_MIN_INLIER_RATIO),
+            "final_gate_min_overlap_ratio": float(FINAL_GATE_MIN_OVERLAP_RATIO),
+            "native_min_inlier_ratio": float(NATIVE_EDGE_MIN_INLIER_RATIO),
+            "native_min_overlap_ratio": float(NATIVE_EDGE_MIN_OVERLAP_RATIO),
+            "allowed_geometry_models": sorted(NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS),
+        },
+        "actual": {
+            "num_matches": int(num_matches or 0),
+            "num_inliers": int(num_inliers or 0),
+            "inlier_ratio": float(inlier_ratio),
+            "overlap_ratio": float(overlap_ratio),
+            "combined_score": float(combined_score),
+            "geometric_score": float(geometric_score or 0.0),
+            "robust_score_valid": bool(robust_valid),
+            "geometry_model": geometry_model or "none",
+        },
+        "checks": {reason: bool(passed) for reason, passed in checks},
+    }
 
 
 def _direction_for_order(
@@ -839,6 +925,13 @@ async def debug_pair_geometry(
 
     left_key = _s3_key_from_uri(left_photo.s3_uri)
     right_key = _s3_key_from_uri(right_photo.s3_uri)
+    strict_gate = _build_pair_debug_strict_gate(
+        num_matches=num_matches,
+        num_inliers=num_inliers,
+        geometric_score=score,
+        diagnostics=diagnostics if isinstance(diagnostics, dict) else None,
+        min_inliers_required=NATIVE_EDGE_MIN_INLIERS,
+    )
 
     live_metrics = PairDebugLiveMetrics(
         matcher=str(diagnostics.get("matcher")) if diagnostics.get("matcher") is not None else None,
@@ -884,6 +977,7 @@ async def debug_pair_geometry(
         native_matching_scores_raw={
             str(k): float(v) for k, v in (diagnostics.get("native_matching_scores_raw") or {}).items() if v is not None
         },
+        strict_gate=strict_gate,
         zju_variant=(
             str(diagnostics.get("zju_variant"))
             if diagnostics.get("zju_variant") is not None

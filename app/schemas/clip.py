@@ -263,6 +263,7 @@ class PairDebugLiveMetrics(BaseModel):
     oracle: Dict[str, Any] = {}
     native_matching_scores: Dict[str, float] = {}
     native_matching_scores_raw: Dict[str, float] = {}
+    strict_gate: Dict[str, Any] = {}
     zju_variant: Optional[str] = None
     zju_loader: Optional[str] = None
     zju_checkpoint_path: Optional[str] = None
