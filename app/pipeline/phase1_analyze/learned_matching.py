@@ -41,12 +41,9 @@ logger = logging.getLogger(__name__)
 # DINOv2 model singleton
 _dinov2_model = None
 _dinov2_transform = None
-_native_preprocessed_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
-_native_device_tensor_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
 
 # Performance controls for production matcher path.
 DINO_BATCH_SIZE = 16
-MAX_NATIVE_IMAGE_CACHE_ENTRIES = 512
 
 
 def _preferred_torch_device() -> torch.device:
@@ -136,7 +133,7 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
     batch_size = max(1, int(DINO_BATCH_SIZE))
     t_start = time.perf_counter()
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_start in range(0, len(images), batch_size):
             batch_images = []
             for img in images[batch_start: batch_start + batch_size]:
@@ -601,52 +598,29 @@ def _resize_by_longest_side_and_pad(
     }
 
 
-def _maybe_trim_native_caches() -> None:
-    if len(_native_preprocessed_cache) > MAX_NATIVE_IMAGE_CACHE_ENTRIES:
-        _native_preprocessed_cache.clear()
-    if len(_native_device_tensor_cache) > (MAX_NATIVE_IMAGE_CACHE_ENTRIES * 2):
-        _native_device_tensor_cache.clear()
-
-
 def _get_native_preprocessed_entry(
     image: Image.Image,
     target_long_side: int,
 ) -> Dict[str, Any]:
-    cache_key = (id(image), int(target_long_side))
-    entry = _native_preprocessed_cache.get(cache_key)
-    if entry is None:
-        image_gray = np.array(image.convert("L"), dtype=np.float32) / 255.0
-        gray_resized, meta = _resize_by_longest_side_and_pad(
-            image_gray,
-            target_long_side=target_long_side,
-            multiple=8,
-        )
-        entry = {
-            "gray_resized": gray_resized,
-            "meta": meta,
-        }
-        _native_preprocessed_cache[cache_key] = entry
-        _maybe_trim_native_caches()
-    return entry
+    image_gray = np.array(image.convert("L"), dtype=np.float32) / 255.0
+    gray_resized, meta = _resize_by_longest_side_and_pad(
+        image_gray,
+        target_long_side=target_long_side,
+        multiple=8,
+    )
+    return {
+        "gray_resized": gray_resized,
+        "meta": meta,
+    }
 
 
-def _get_cached_native_tensor(
-    image: Image.Image,
+def _build_native_tensor(
     gray_resized: np.ndarray,
-    target_long_side: int,
     device: torch.device,
 ) -> torch.Tensor:
-    device_key = str(device)
-    cache_key = (id(image), int(target_long_side), device_key)
-    cached = _native_device_tensor_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
     tensor = torch.from_numpy(gray_resized).unsqueeze(0).unsqueeze(0)
     if tensor.device != device:
         tensor = tensor.to(device, non_blocking=True)
-    _native_device_tensor_cache[cache_key] = tensor
-    _maybe_trim_native_caches()
     return tensor
 
 
@@ -3024,13 +2998,13 @@ def _match_loftr_kornia_indoor_native(
     resize_seconds = time.perf_counter() - prep_started_at
 
     tensor_transfer_started_at = time.perf_counter()
-    tensor1 = _get_cached_native_tensor(img1, img1_resized, target_long_side=target_long_side, device=device)
-    tensor2 = _get_cached_native_tensor(img2, img2_resized, target_long_side=target_long_side, device=device)
+    tensor1 = _build_native_tensor(img1_resized, device=device)
+    tensor2 = _build_native_tensor(img2_resized, device=device)
     tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
 
     loftr_started_at = time.perf_counter()
     batch = {"image0": tensor1, "image1": tensor2}
-    with torch.no_grad():
+    with torch.inference_mode():
         raw_output = matcher(batch)
         # ZJU LoFTR mutates batch in-place and returns None.
         correspondences = raw_output if isinstance(raw_output, dict) else batch
@@ -3150,7 +3124,7 @@ def _run_loftr_with_thresholds(
     tensor1 = torch.from_numpy(img1_resized).unsqueeze(0).unsqueeze(0).to(device)
     tensor2 = torch.from_numpy(img2_resized).unsqueeze(0).unsqueeze(0).to(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         correspondences = matcher({"image0": tensor1, "image1": tensor2})
 
     mkpts0 = correspondences["keypoints0"].cpu().numpy()

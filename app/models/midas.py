@@ -167,7 +167,7 @@ class MiDaSModel:
         inputs = {k: v.to(MiDaSModel._device) for k, v in inputs.items()}
 
         # Estimate depth
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = MiDaSModel._model(**inputs)
             predicted_depth = outputs.predicted_depth
 
