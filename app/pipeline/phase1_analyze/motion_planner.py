@@ -11,6 +11,8 @@ LTX-2 Prompting Strategy:
 import logging
 from typing import List, Dict, Any, Tuple, Optional, TYPE_CHECKING
 
+import numpy as np
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db.models import RoomCluster, AnalysisResult
@@ -159,12 +161,23 @@ def plan_motion_for_cluster(
     """
     tier = cluster.confidence_tier or "low"
     allowed_motions = MOTION_TYPES.get(tier, MOTION_TYPES["low"])
+    ordered_photos = _ordered_cluster_photos(cluster, preloaded_photos)
 
     # Select recommended motion based on room type and tier
     recommended = _select_recommended_motion(cluster, allowed_motions)
+    inferred_motion, motion_guidance, matching_summary = _infer_motion_from_matching(
+        db=db,
+        job_id=int(cluster.job_id),
+        ordered_photos=ordered_photos,
+        allowed_motions=allowed_motions,
+    )
+    if inferred_motion:
+        recommended = inferred_motion
 
-    # Determine duration (minimum 2 seconds, max 4 seconds for cost control)
-    duration = min(4.0, max(2.0, MOTION_DURATIONS.get(recommended, 3.0)))
+    # Duration policy:
+    # - Single-photo clusters: 1-2s
+    # - Multi-photo clusters: up to 4s
+    duration = _compute_duration_seconds(cluster, recommended)
 
     # Determine model recommendation
     # SFM-eligible clusters get more advanced motion capabilities
@@ -180,6 +193,8 @@ def plan_motion_for_cluster(
 
     # Generate LTX-2 prompt template
     prompt_template = _generate_prompt_template(cluster, tier, recommended)
+    if motion_guidance:
+        prompt_template = f"{prompt_template}\n\n{motion_guidance}"
 
     # Get LTX-2 parameters
     ltx2_params = LTX2_PARAMS.get(tier, LTX2_PARAMS["low"])
@@ -200,6 +215,9 @@ def plan_motion_for_cluster(
             "depth_variance": cluster.depth_variance,
             "image_count": cluster.image_count,
             "sfm_eligible": cluster.sfm_eligible,
+            "matching_inferred_motion": inferred_motion,
+            "matching_motion_guidance": motion_guidance,
+            "matching_summary": matching_summary,
         },
     )
 
@@ -211,13 +229,15 @@ def plan_motion_for_cluster(
     cluster.recommended_duration = duration
 
     # Select hero photo for cluster
-    _select_hero_photo(cluster, photos=preloaded_photos)
+    _select_hero_photo(cluster, photos=ordered_photos)
 
     db.commit()
 
     logger.info(
         f"Planned motion for cluster {cluster.id}: "
-        f"{recommended} ({tier} tier, {duration}s, {model_recommendation})"
+        f"{recommended} ({tier} tier, {duration}s, {model_recommendation}, "
+        f"verified_transitions={matching_summary.get('verified_transitions', 0)}/"
+        f"{matching_summary.get('total_transitions', 0)})"
     )
 
     return result
@@ -307,7 +327,7 @@ def get_prompt_for_motion(
     params = LTX2_PARAMS.get(tier, LTX2_PARAMS["low"]).copy()
 
     # Add common parameters
-    params["duration"] = min(4.0, max(2.0, MOTION_DURATIONS.get(motion, 3.0)))
+    params["duration"] = _compute_duration_seconds(cluster, motion)
     params["fps"] = 24
     params["resolution"] = "720p"  # Generate at 720p, upscale later
 
@@ -368,6 +388,165 @@ def _select_recommended_motion(cluster: RoomCluster, allowed_motions: List[str])
             return motion
 
     return allowed_motions[0] if allowed_motions else "static"
+
+
+def _compute_duration_seconds(cluster: RoomCluster, motion: str) -> float:
+    """Compute recommended shot duration using sequencing constraints."""
+    base = float(MOTION_DURATIONS.get(motion, 3.0))
+    image_count = int(cluster.image_count or 1)
+
+    if image_count <= 1:
+        # Single-photo clusters should be short.
+        # Map base motion duration into [1.0, 2.0] while preserving relative pacing.
+        single = 1.0 + max(0.0, min(1.0, (base - 2.0) / 2.0))
+        return float(np.clip(single, 1.0, 2.0))
+
+    # Multi-photo clusters can run longer for transitions, but never exceed 4s.
+    return float(np.clip(base, 2.0, 4.0))
+
+
+def _ordered_cluster_photos(
+    cluster: RoomCluster,
+    preloaded_photos: Optional[List["JobPhoto"]],
+) -> List["JobPhoto"]:
+    source = preloaded_photos if preloaded_photos is not None else list(cluster.photos or [])
+    return sorted(source, key=lambda p: (p.cluster_order if p.cluster_order is not None else 10**9, p.id))
+
+
+def _motion_from_direction(
+    dx: float,
+    dy: float,
+    allowed_motions: List[str],
+) -> str | None:
+    abs_dx = abs(dx)
+    abs_dy = abs(dy)
+    if max(abs_dx, abs_dy) < 0.08:
+        return None
+
+    # DB direction is content shift; camera motion is opposite.
+    if abs_dx >= abs_dy:
+        if dx > 0:
+            for m in ("orbit", "pan_left", "subtle_pan"):
+                if m in allowed_motions:
+                    return m
+        else:
+            for m in ("orbit", "pan_right", "subtle_pan"):
+                if m in allowed_motions:
+                    return m
+    else:
+        for m in ("reveal", "subtle_pan", "push_in"):
+            if m in allowed_motions:
+                return m
+    return None
+
+
+def _infer_motion_from_matching(
+    db: Session,
+    job_id: int,
+    ordered_photos: List["JobPhoto"],
+    allowed_motions: List[str],
+) -> Tuple[str | None, str, Dict[str, Any]]:
+    """Infer dominant motion from geometric pair directions in this cluster."""
+    summary: Dict[str, Any] = {
+        "total_transitions": max(0, len(ordered_photos) - 1),
+        "evaluated_transitions": 0,
+        "verified_transitions": 0,
+        "avg_verified_inliers": 0.0,
+        "avg_dx": 0.0,
+        "avg_dy": 0.0,
+        "dominant_camera_direction": "unknown",
+    }
+
+    if len(ordered_photos) < 2:
+        return None, "", summary
+
+    weighted_dx = 0.0
+    weighted_dy = 0.0
+    total_weight = 0.0
+    verified_inliers = 0
+
+    for idx in range(len(ordered_photos) - 1):
+        left = int(ordered_photos[idx].id)
+        right = int(ordered_photos[idx + 1].id)
+        photo_a = min(left, right)
+        photo_b = max(left, right)
+        summary["evaluated_transitions"] += 1
+
+        row = db.execute(
+            text(
+                """
+                SELECT direction_dx, direction_dy, geometric_inliers
+                FROM photo_similarities
+                WHERE job_id = :job_id
+                  AND photo_a_id = :photo_a
+                  AND photo_b_id = :photo_b
+                LIMIT 1
+                """
+            ),
+            {"job_id": int(job_id), "photo_a": int(photo_a), "photo_b": int(photo_b)},
+        ).fetchone()
+        if row is None:
+            continue
+
+        dx = row[0]
+        dy = row[1]
+        inliers = row[2]
+        if dx is None or dy is None:
+            continue
+        if inliers is None or int(inliers) < 8:
+            continue
+
+        summary["verified_transitions"] += 1
+        verified_inliers += int(inliers)
+        dx = float(dx)
+        dy = float(dy)
+        if left != photo_a:
+            dx = -dx
+            dy = -dy
+
+        weight = float(max(1, int(inliers)))
+        weighted_dx += dx * weight
+        weighted_dy += dy * weight
+        total_weight += weight
+
+    if summary["verified_transitions"] > 0:
+        summary["avg_verified_inliers"] = float(verified_inliers / summary["verified_transitions"])
+
+    if total_weight <= 0.0:
+        guidance = (
+            "Matching evidence is weak for this cluster; keep motion subtle and prioritize "
+            "layout stability over directional movement."
+        )
+        return None, guidance, summary
+
+    avg_dx = weighted_dx / total_weight
+    avg_dy = weighted_dy / total_weight
+    summary["avg_dx"] = float(avg_dx)
+    summary["avg_dy"] = float(avg_dy)
+
+    inferred = _motion_from_direction(avg_dx, avg_dy, allowed_motions)
+
+    horizontal = abs(avg_dx) >= abs(avg_dy)
+    if horizontal:
+        camera_dir = "left" if avg_dx > 0 else "right"
+    else:
+        camera_dir = "up" if avg_dy > 0 else "down"
+    summary["dominant_camera_direction"] = camera_dir
+
+    if inferred is None:
+        guidance = (
+            "Matching evidence is available but direction is ambiguous; keep movement gentle and "
+            "consistent with verified transitions."
+        )
+        return None, guidance, summary
+
+    guidance = (
+        "Match-guided camera direction: move camera "
+        f"{camera_dir} following verified geometric transitions "
+        f"({summary['verified_transitions']}/{summary['total_transitions']} verified, "
+        f"avg inliers {summary['avg_verified_inliers']:.1f}); keep motion smooth and consistent."
+    )
+    return inferred, guidance, summary
 
 
 def _select_hero_photo(cluster: RoomCluster, photos: Optional[List["JobPhoto"]] = None) -> None:

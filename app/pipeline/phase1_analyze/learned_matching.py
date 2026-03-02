@@ -540,6 +540,63 @@ def _build_native_tensor(
     return tensor
 
 
+def _mps_memory_stats_mb() -> Dict[str, float]:
+    """Best-effort MPS allocator stats in MB for runtime diagnostics."""
+    stats = {
+        "mps_current_allocated_mb": 0.0,
+        "mps_driver_allocated_mb": 0.0,
+    }
+    mps_mod = getattr(torch, "mps", None)
+    if mps_mod is None:
+        return stats
+    try:
+        cur_fn = getattr(mps_mod, "current_allocated_memory", None)
+        if callable(cur_fn):
+            stats["mps_current_allocated_mb"] = float(cur_fn()) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    try:
+        drv_fn = getattr(mps_mod, "driver_allocated_memory", None)
+        if callable(drv_fn):
+            stats["mps_driver_allocated_mb"] = float(drv_fn()) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    return stats
+
+
+def _release_device_cache(device: torch.device) -> Dict[str, float]:
+    """Release unused accelerator cache to keep per-pair memory bounded."""
+    if device.type == "cuda":
+        try:
+            torch.cuda.synchronize(device=device)
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return {}
+
+    if device.type == "mps":
+        mps_mod = getattr(torch, "mps", None)
+        if mps_mod is not None:
+            try:
+                sync_fn = getattr(mps_mod, "synchronize", None)
+                if callable(sync_fn):
+                    sync_fn()
+            except Exception:
+                pass
+            try:
+                empty_fn = getattr(mps_mod, "empty_cache", None)
+                if callable(empty_fn):
+                    empty_fn()
+            except Exception:
+                pass
+        return _mps_memory_stats_mb()
+
+    return {}
+
+
 def _compute_segment_scores(
     inlier_points0: np.ndarray,
     inlier_points1: np.ndarray,
@@ -1056,6 +1113,7 @@ def _extract_pair_runtime_metrics(
             "time_loftr_forward_reverse_s": 0.0,
             "time_resize_s": 0.0,
             "time_tensor_transfer_s": 0.0,
+            "time_device_cleanup_s": 0.0,
             "time_postprocess_s": 0.0,
             "time_f_s": 0.0,
             "time_h_s": 0.0,
@@ -1065,6 +1123,10 @@ def _extract_pair_runtime_metrics(
             "reverse_selected": False,
             "model_device": "n/a",
             "tensor_device": "n/a",
+            "mps_current_allocated_mb_before": 0.0,
+            "mps_driver_allocated_mb_before": 0.0,
+            "mps_current_allocated_mb_after": 0.0,
+            "mps_driver_allocated_mb_after": 0.0,
         }
     return {
         "time_pair_total_s": float(timing.get("time_pair_total_s", fallback_pair_time_s) or fallback_pair_time_s),
@@ -1073,6 +1135,7 @@ def _extract_pair_runtime_metrics(
         "time_loftr_forward_reverse_s": float(timing.get("time_loftr_forward_reverse_s", 0.0) or 0.0),
         "time_resize_s": float(timing.get("time_resize_s", 0.0) or 0.0),
         "time_tensor_transfer_s": float(timing.get("time_tensor_transfer_s", 0.0) or 0.0),
+        "time_device_cleanup_s": float(timing.get("time_device_cleanup_s", 0.0) or 0.0),
         "time_postprocess_s": float(timing.get("time_postprocess_s", 0.0) or 0.0),
         "time_f_s": float(timing.get("time_f_s", 0.0) or 0.0),
         "time_h_s": float(timing.get("time_h_s", 0.0) or 0.0),
@@ -1082,6 +1145,10 @@ def _extract_pair_runtime_metrics(
         "reverse_selected": bool(timing.get("reverse_selected", False)),
         "model_device": str(timing.get("model_device", "n/a")),
         "tensor_device": str(timing.get("tensor_device", "n/a")),
+        "mps_current_allocated_mb_before": float(timing.get("mps_current_allocated_mb_before", 0.0) or 0.0),
+        "mps_driver_allocated_mb_before": float(timing.get("mps_driver_allocated_mb_before", 0.0) or 0.0),
+        "mps_current_allocated_mb_after": float(timing.get("mps_current_allocated_mb_after", 0.0) or 0.0),
+        "mps_driver_allocated_mb_after": float(timing.get("mps_driver_allocated_mb_after", 0.0) or 0.0),
     }
 
 
@@ -1092,6 +1159,7 @@ def _accumulate_pair_runtime(stage_timers: Dict[str, float], pair_metrics: Dict[
     stage_timers["time_scoring_total"] += float(pair_metrics["time_scoring_s"])
     stage_timers["time_resize_total"] += float(pair_metrics["time_resize_s"])
     stage_timers["time_tensor_transfer_total"] += float(pair_metrics["time_tensor_transfer_s"])
+    stage_timers["time_device_cleanup_total"] += float(pair_metrics["time_device_cleanup_s"])
     stage_timers["time_postprocess_total"] += float(pair_metrics["time_postprocess_s"])
 
 
@@ -1128,7 +1196,7 @@ def _log_pair_timing(
     )
     logger.info(
         "pair_timing phase=%s pair=%s<->%s resize_ms=%.1f xfer_ms=%.1f loFTR_ms=%.1f loFTR_main_ms=%.1f loFTR_reverse_ms=%.1f "
-        "F_ms=%.1f H_ms=%.1f score_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s passes=%s reverse_attempted=%s reverse_selected=%s model_device=%s tensor_device=%s",
+        "F_ms=%.1f H_ms=%.1f score_ms=%.1f cleanup_ms=%.1f total_ms=%.1f inlier_ratio=%.3f overlap_ratio=%s passes=%s reverse_attempted=%s reverse_selected=%s model_device=%s tensor_device=%s mps_drv_mb=%s->%s mps_cur_mb=%s->%s",
         phase,
         left_photo_id,
         right_photo_id,
@@ -1140,6 +1208,7 @@ def _log_pair_timing(
         pair_metrics["time_f_s"] * 1000.0,
         pair_metrics["time_h_s"] * 1000.0,
         pair_metrics["time_scoring_s"] * 1000.0,
+        pair_metrics["time_device_cleanup_s"] * 1000.0,
         pair_metrics["time_pair_total_s"] * 1000.0,
         inlier_ratio_dbg,
         f"{overlap_ratio_dbg:.3f}" if overlap_ratio_dbg is not None else "n/a",
@@ -1148,6 +1217,10 @@ def _log_pair_timing(
         "yes" if pair_metrics["reverse_selected"] else "no",
         pair_metrics["model_device"],
         pair_metrics["tensor_device"],
+        f"{pair_metrics.get('mps_driver_allocated_mb_before', 0.0):.0f}",
+        f"{pair_metrics.get('mps_driver_allocated_mb_after', 0.0):.0f}",
+        f"{pair_metrics.get('mps_current_allocated_mb_before', 0.0):.0f}",
+        f"{pair_metrics.get('mps_current_allocated_mb_after', 0.0):.0f}",
     )
 
 
@@ -2972,6 +3045,8 @@ def _match_loftr_kornia_indoor_native(
     tensor1 = _build_native_tensor(img1_resized, device=device)
     tensor2 = _build_native_tensor(img2_resized, device=device)
     tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
+    tensor_device = str(tensor1.device)
+    mps_mem_before = _mps_memory_stats_mb() if device.type == "mps" else {}
 
     loftr_started_at = time.perf_counter()
     batch = {"image0": tensor1, "image1": tensor2}
@@ -2982,6 +3057,19 @@ def _match_loftr_kornia_indoor_native(
     loftr_seconds = time.perf_counter() - loftr_started_at
 
     points0, points1, scores = _extract_loftr_points_and_scores(correspondences)
+    # Explicitly drop device tensors before CPU-heavy geometry/scoring.
+    del correspondences
+    del batch
+    del tensor1
+    del tensor2
+    try:
+        del raw_output
+    except Exception:
+        pass
+    cleanup_started_at = time.perf_counter()
+    mps_mem_after = _release_device_cache(device=device)
+    cleanup_seconds = time.perf_counter() - cleanup_started_at
+
     diagnostics_started_at = time.perf_counter()
     result = _build_native_loftr_diagnostics(
         matcher_name="loftr_kornia_indoor_native",
@@ -3009,6 +3097,7 @@ def _match_loftr_kornia_indoor_native(
         "time_loftr_s": float(loftr_seconds),
         "time_loftr_forward_main_s": float(loftr_seconds),
         "time_loftr_forward_reverse_s": 0.0,
+        "time_device_cleanup_s": float(cleanup_seconds),
         "time_postprocess_s": float(diagnostics_seconds),
         "time_pair_total_s": float(total_seconds),
         "time_reverse_pair_total_s": 0.0,
@@ -3022,9 +3111,19 @@ def _match_loftr_kornia_indoor_native(
         "mps_available": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
         "preferred_device": str(_preferred_torch_device()),
         "model_device": str(device),
-        "tensor_device": str(tensor1.device),
+        "tensor_device": tensor_device,
         "model_cache_hit": bool(cache_hit),
     }
+    if mps_mem_before:
+        timing_payload.update({
+            "mps_current_allocated_mb_before": float(mps_mem_before.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_before": float(mps_mem_before.get("mps_driver_allocated_mb", 0.0)),
+        })
+    if mps_mem_after:
+        timing_payload.update({
+            "mps_current_allocated_mb_after": float(mps_mem_after.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_after": float(mps_mem_after.get("mps_driver_allocated_mb", 0.0)),
+        })
     if isinstance(diagnostics, dict):
         diagnostics["timing"] = timing_payload
     return int(num_matches), int(num_inliers), float(score), direction, diagnostics
@@ -3461,6 +3560,7 @@ def cluster_photos_graph_based(
         "time_scoring_total": 0.0,
         "time_resize_total": 0.0,
         "time_tensor_transfer_total": 0.0,
+        "time_device_cleanup_total": 0.0,
         "time_postprocess_total": 0.0,
     }
     pair_timing_count = 0
@@ -4266,7 +4366,7 @@ def cluster_photos_graph_based(
         "PERF_SUMMARY job_id=%s photos=%s pairs_processed=%s time_dino_total=%.3fs "
         "time_candidate_generation=%.3fs time_loftr_total=%.3fs time_loftr_per_pair_avg=%.3fs "
         "time_f_total=%.3fs time_h_total=%.3fs time_scoring_total=%.3fs "
-        "time_resize_total=%.3fs time_tensor_transfer_total=%.3fs time_postprocess_total=%.3fs "
+        "time_resize_total=%.3fs time_tensor_transfer_total=%.3fs time_device_cleanup_total=%.3fs time_postprocess_total=%.3fs "
         "total_listing_time=%.3fs",
         job_id,
         n,
@@ -4280,6 +4380,7 @@ def cluster_photos_graph_based(
         stage_timers["time_scoring_total"],
         stage_timers["time_resize_total"],
         stage_timers["time_tensor_transfer_total"],
+        stage_timers["time_device_cleanup_total"],
         stage_timers["time_postprocess_total"],
         total_listing_time,
     )

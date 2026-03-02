@@ -60,3 +60,17 @@ Before production rollout:
 - check `pair_debug_timing` logs and confirm matcher backend is CUDA
 - compare clustering output against baseline (`scripts/baselines/README.md`)
 - confirm alarms/logging for failed jobs and worker crashes
+
+## 7) Future Consideration: SQS Retry + DLQ Policy (Not Implemented Yet)
+
+Target behavior for robustness:
+- If processing fails for any reason (photo download issue, transient service error, worker/server drop, unexpected exception), do not acknowledge the message.
+- Allow exactly one retry.
+- If the retry also fails, route the message to a Dead Letter Queue (DLQ).
+
+Suggested SQS setup when this is implemented:
+- Configure source queue redrive policy with `maxReceiveCount = 2` (initial attempt + one retry).
+- Attach a dedicated DLQ for failed job messages.
+- Add monitoring/alerts on DLQ depth and message age.
+
+Note: this section is documentation-only for future implementation planning; no runtime behavior changes are included yet.

@@ -21,6 +21,13 @@ from app.db.models import Job, JobPhoto, RoomCluster
 
 logger = logging.getLogger(__name__)
 
+# Post-cluster shot caps (applied after geometry clustering, before RoomCluster rows).
+MAIN_ROOM_SHOT_CAP = 4       # living/kitchen/dining
+BEDROOM_SHOT_CAP = 2
+BATHROOM_SHOT_CAP_STRONG = 2
+BATHROOM_SHOT_CAP_WEAK = 1
+BATHROOM_STRONG_SCORE_THRESHOLD = 0.55
+
 # Try to import the optimized pipeline (DINOv2 + LightGlue)
 try:
     from app.pipeline.phase1_analyze.learned_matching import cluster_photos_optimized
@@ -171,6 +178,7 @@ def _cluster_with_learned_matching(
         raw_cluster_photo_groups,
         duplicate_of_map=duplicate_of_map,
     )
+    ordered_cluster_photo_groups = _apply_post_cluster_shot_caps(ordered_cluster_photo_groups)
 
     # Create RoomCluster records
     clusters = []
@@ -252,6 +260,7 @@ def _cluster_with_orb(
                     raw_cluster_photo_groups.append(overlap_group)
 
     ordered_cluster_photo_groups = _order_clusters_for_story(raw_cluster_photo_groups)
+    ordered_cluster_photo_groups = _apply_post_cluster_shot_caps(ordered_cluster_photo_groups)
     room_instance_counts = defaultdict(int)
     for sequence_order, overlap_group in enumerate(ordered_cluster_photo_groups):
         room_type = _majority_room_label(overlap_group)
@@ -580,6 +589,60 @@ def _room_instance_base_label(room_type: str | None) -> str:
         "unknown": "unknown",
     }
     return bucket_to_name.get(bucket, _normalize_room_label(room_type) or "unknown")
+
+
+def _bathroom_cluster_is_strong(photos: List[JobPhoto]) -> bool:
+    scores = [float(p.final_score) for p in photos if p.final_score is not None]
+    if not scores:
+        return False
+    return float(np.mean(scores)) >= float(BATHROOM_STRONG_SCORE_THRESHOLD)
+
+
+def _room_shot_cap(room_type: str | None, photos: List[JobPhoto]) -> int:
+    bucket = _room_bucket(room_type)
+    if bucket in {"living_room", "kitchen", "dining_room"}:
+        return int(MAIN_ROOM_SHOT_CAP)
+    if bucket == "bedroom":
+        return int(BEDROOM_SHOT_CAP)
+    if bucket == "bathroom":
+        return int(BATHROOM_SHOT_CAP_STRONG if _bathroom_cluster_is_strong(photos) else BATHROOM_SHOT_CAP_WEAK)
+    return len(photos)
+
+
+def _apply_post_cluster_shot_caps(
+    cluster_photo_groups: List[List[JobPhoto]],
+) -> List[List[JobPhoto]]:
+    """Apply final shot-count caps after clustering is already decided.
+
+    This does not re-cluster; it trims oversized groups for render sequencing.
+    """
+    capped_groups: List[List[JobPhoto]] = []
+    trimmed_total = 0
+    for photos in cluster_photo_groups:
+        if not photos:
+            continue
+        room_labels = [p.room_override or p.room_label or "unknown" for p in photos]
+        room_type = max(set(room_labels), key=room_labels.count)
+        cap = _room_shot_cap(room_type, photos)
+        if cap <= 0:
+            continue
+        if len(photos) <= cap:
+            capped_groups.append(photos)
+            continue
+
+        trimmed = photos[:cap]
+        capped_groups.append(trimmed)
+        trimmed_total += (len(photos) - cap)
+        logger.info(
+            "Post-filter shot cap: room=%s size=%s -> %s",
+            room_type,
+            len(photos),
+            len(trimmed),
+        )
+
+    if trimmed_total > 0:
+        logger.info("Post-filter shot caps removed %s photos across clusters", trimmed_total)
+    return capped_groups
 
 
 def _master_priority(photo: JobPhoto) -> int:
