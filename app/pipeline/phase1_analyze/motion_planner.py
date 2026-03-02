@@ -9,11 +9,14 @@ LTX-2 Prompting Strategy:
 - Use CFG scale 3-6
 """
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
 from app.db.models import RoomCluster, AnalysisResult
+
+if TYPE_CHECKING:
+    from app.db.models import JobPhoto
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +138,11 @@ Natural lighting.
 Photorealistic."""
 
 
-def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult:
+def plan_motion_for_cluster(
+    db: Session,
+    cluster: RoomCluster,
+    preloaded_photos: Optional[List["JobPhoto"]] = None,
+) -> AnalysisResult:
     """Plan motion strategy for a room cluster.
 
     Based on OVERVIEW.md:
@@ -204,7 +211,7 @@ def plan_motion_for_cluster(db: Session, cluster: RoomCluster) -> AnalysisResult
     cluster.recommended_duration = duration
 
     # Select hero photo for cluster
-    _select_hero_photo(cluster)
+    _select_hero_photo(cluster, photos=preloaded_photos)
 
     db.commit()
 
@@ -363,7 +370,7 @@ def _select_recommended_motion(cluster: RoomCluster, allowed_motions: List[str])
     return allowed_motions[0] if allowed_motions else "static"
 
 
-def _select_hero_photo(cluster: RoomCluster) -> None:
+def _select_hero_photo(cluster: RoomCluster, photos: Optional[List["JobPhoto"]] = None) -> None:
     """Select the hero photo for a cluster.
 
     Based on OVERVIEW.md priority:
@@ -374,11 +381,12 @@ def _select_hero_photo(cluster: RoomCluster) -> None:
     Args:
         cluster: RoomCluster to update
     """
-    if not cluster.photos:
+    candidates_source = photos if photos is not None else cluster.photos
+    if not candidates_source:
         return
 
     candidates = []
-    for photo in cluster.photos:
+    for photo in candidates_source:
         if photo.exclude:
             continue
 

@@ -194,6 +194,7 @@ class PairDebugRequest(BaseModel):
     confidence_threshold: Optional[float] = Field(default=None, ge=0.1, le=1.0)
     matcher: Literal[
         "current",
+        "loftr_kornia_indoor_simplified",
         "loftr_kornia_indoor_native",
     ] = "current"
 
@@ -253,6 +254,7 @@ class PairDebugLiveMetrics(BaseModel):
     active_match_count: int = 0
     num_inliers: int = 0
     geometric_score: float = 0.0
+    motion_label: Optional[str] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
     match_width: Optional[int] = None

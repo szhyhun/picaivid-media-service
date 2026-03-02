@@ -13,7 +13,13 @@ engine = create_engine(
     echo=settings.DEBUG,
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    # Avoid N+1 refresh storms after each commit in long-running pipeline phases.
+    expire_on_commit=False,
+)
 
 
 def get_db() -> Generator[Session, None, None]:

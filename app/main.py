@@ -959,6 +959,11 @@ async def debug_pair_geometry(
         active_match_count=_safe_int(diagnostics.get("active_match_count")) or int(num_matches),
         num_inliers=int(num_inliers),
         geometric_score=float(score),
+        motion_label=(
+            str(diagnostics.get("motion_label"))
+            if diagnostics.get("motion_label") is not None
+            else None
+        ),
         direction_dx=_safe_float(direction[0]) if direction else None,
         direction_dy=_safe_float(direction[1]) if direction else None,
         match_width=_safe_int(diagnostics.get("match_width")),

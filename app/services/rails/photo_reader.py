@@ -66,6 +66,7 @@ class RailsPhotoReader:
             FROM photos
             WHERE project_id = :project_id
             AND status = 2  -- ready status in Rails enum
+            AND selected = true
             ORDER BY position ASC
         """)
 
@@ -86,7 +87,7 @@ class RailsPhotoReader:
                 )
                 photos.append(photo)
 
-        logger.info(f"Read {len(photos)} photos from Rails for project {project_id}")
+        logger.info(f"Read {len(photos)} selected ready photos from Rails for project {project_id}")
         return photos
 
     def get_project_exists(self, project_id: str) -> bool:

@@ -28,6 +28,10 @@ import torch
 from PIL import Image, ImageOps
 
 from app.core.config import settings
+from app.pipeline.phase1_analyze.learned_matching_simplified import (
+    SimplifiedLoFTREssentialMatcher,
+    SimplifiedMatcherConfig,
+)
 
 if TYPE_CHECKING:
     from app.db.models import JobPhoto
@@ -310,7 +314,7 @@ MIN_INLIERS_VERY_FAR = 35              # Enforce stronger geometry for very-far 
 MIN_SCORE_VERY_FAR = 0.45              # Reject weak-overlap scores for very-far pairs
 
 # Adaptive geometric matching thresholds
-DEFAULT_LOFTR_INPUT_SIZE = (960, 720)  # width, height
+DEFAULT_LOFTR_INPUT_SIZE = (768, 576)  # width, height
 DEFAULT_PRODUCTION_MATCHER = "loftr_kornia_indoor_native"
 LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.20
 NATIVE_SCORE_COUNT_ZERO = 80
@@ -332,7 +336,7 @@ ROBUST_SCORE_MIN_ACTIVE_MATCHES = 40
 FINAL_GATE_MIN_INLIERS = 20
 FINAL_GATE_MIN_INLIER_RATIO = 0.20
 FINAL_GATE_MIN_OVERLAP_RATIO = 0.10
-NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac"}
+NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac", "essential_ransac"}
 # If native forward pass is weak, retry reverse orientation and keep the stronger result.
 # This stabilizes pair-debug and clustering against directional LoFTR asymmetry.
 NATIVE_REVERSE_RETRY_ENABLED = True
@@ -1761,6 +1765,59 @@ def deduplicate_and_split_cluster(
             return emitted_duplicate_clusters, duplicate_of
         return [remaining] + emitted_duplicate_clusters, duplicate_of
 
+    if max_size == 2:
+        # For pair-only output, greedily keep the strongest disjoint overlaps first.
+        # This prioritizes "best transition pair" behavior inside larger connected components.
+        remaining_cluster_indices = [pid_to_idx[pid] for pid in remaining]
+        candidate_edges: List[Tuple[float, int, int]] = []
+        m = len(remaining)
+        for i in range(m):
+            for j in range(i + 1, m):
+                idx_i = remaining_cluster_indices[i]
+                idx_j = remaining_cluster_indices[j]
+                strength = float(adjacency[idx_i, idx_j])
+                if not np.isfinite(strength) or strength <= 0.0:
+                    continue
+                candidate_edges.append((strength, i, j))
+
+        candidate_edges.sort(key=lambda item: (-item[0], item[1], item[2]))
+        used_local: set[int] = set()
+        paired_clusters: List[List[int]] = []
+
+        for strength, i, j in candidate_edges:
+            if i in used_local or j in used_local:
+                continue
+            paired_clusters.append([remaining[i], remaining[j]])
+            used_local.add(i)
+            used_local.add(j)
+            logger.debug(
+                "Pair-only split selected edge %s<->%s strength=%.3f",
+                remaining[i],
+                remaining[j],
+                strength,
+            )
+
+        for i in range(m):
+            if i not in used_local:
+                paired_clusters.append([remaining[i]])
+
+        # Keep deterministic order in output based on original cluster position.
+        original_pos = {pid: idx for idx, pid in enumerate(cluster_photo_ids)}
+        paired_clusters.sort(key=lambda cluster: min(original_pos.get(pid, 10**9) for pid in cluster))
+        sizes = [len(c) for c in paired_clusters]
+        logger.info(
+            "Pair-only split: %s photos -> %s canonical clusters (sizes: %s)%s",
+            len(cluster_photo_ids),
+            len(paired_clusters),
+            sizes,
+            (
+                f" + {len(duplicate_clusters)} duplicate singleton clusters"
+                if keep_duplicate_singletons and duplicate_clusters
+                else ""
+            ),
+        )
+        return paired_clusters + emitted_duplicate_clusters, duplicate_of
+
     # Too many photos - SPLIT into multiple clusters instead of dropping.
     # Use constrained partitioning to GUARANTEE each cluster size <= max_size.
     m = len(remaining)
@@ -2172,6 +2229,19 @@ def enforce_transition_quality(
 
 # LightGlue/LoFTR model singleton
 _loftr_matchers: Dict[str, Any] = {}
+_simplified_loftr_matcher = SimplifiedLoFTREssentialMatcher(
+    SimplifiedMatcherConfig(
+        checkpoint="indoor",
+        long_side=768,
+        confidence_threshold=0.5,
+        min_confident_matches=30,
+        ransac_threshold_px=1.0,
+        ransac_prob=0.999,
+        rng_seed=42,
+        rotation_threshold_deg=2.0,
+        translation_z_threshold=0.15,
+    )
+)
 
 
 def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, Any] | None) -> str:
@@ -2878,6 +2948,20 @@ def _match_loftr_kornia_indoor_native(
     return int(num_matches), int(num_inliers), float(score), direction, diagnostics
 
 
+def _match_loftr_kornia_indoor_simplified(
+    img1: Image.Image,
+    img2: Image.Image,
+    confidence_threshold: float = 0.5,
+    full_diagnostics: bool = False,
+) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
+    return _simplified_loftr_matcher.match_pair(
+        img1=img1,
+        img2=img2,
+        confidence_threshold=float(confidence_threshold),
+        full_diagnostics=bool(full_diagnostics),
+    )
+
+
 def match_image_pair(
     img1: Image.Image,
     img2: Image.Image,
@@ -2919,37 +3003,48 @@ def match_image_pair(
         matcher_preference = DEFAULT_PRODUCTION_MATCHER
     full_diagnostics = bool(options.get("full_diagnostics", False))
     requested_threshold = options.get("confidence_threshold")
-    confidence_threshold = LOFTR_NATIVE_CONFIDENCE_THRESHOLD
+    default_threshold = (
+        0.5 if matcher_preference == "loftr_kornia_indoor_simplified" else LOFTR_NATIVE_CONFIDENCE_THRESHOLD
+    )
+    confidence_threshold = default_threshold
     if requested_threshold is not None:
         try:
             confidence_threshold = float(requested_threshold)
         except (TypeError, ValueError):
-            confidence_threshold = LOFTR_NATIVE_CONFIDENCE_THRESHOLD
+            confidence_threshold = default_threshold
     confidence_threshold = float(np.clip(confidence_threshold, 0.1, 1.0))
 
-    allowed_matchers = {"loftr_kornia_indoor_native"}
+    allowed_matchers = {"loftr_kornia_indoor_native", "loftr_kornia_indoor_simplified"}
     if matcher_preference not in allowed_matchers:
         raise ValueError(
             f"Unsupported matcher '{matcher_preference}'. "
-            "Only 'loftr_kornia_indoor_native' is enabled."
+            "Supported matchers: 'loftr_kornia_indoor_simplified', 'loftr_kornia_indoor_native'."
         )
 
-    result = _match_loftr_kornia_indoor_native(
-        img1=img1,
-        img2=img2,
-        confidence_threshold=confidence_threshold,
-        full_diagnostics=full_diagnostics,
-    )
-    result = _maybe_retry_reverse_native(
-        img1=img1,
-        img2=img2,
-        forward_result=result,
-        run_fn=_match_loftr_kornia_indoor_native,
-        run_kwargs={
-            "confidence_threshold": confidence_threshold,
-            "full_diagnostics": full_diagnostics,
-        },
-    )
+    if matcher_preference == "loftr_kornia_indoor_simplified":
+        result = _match_loftr_kornia_indoor_simplified(
+            img1=img1,
+            img2=img2,
+            confidence_threshold=confidence_threshold,
+            full_diagnostics=full_diagnostics,
+        )
+    else:
+        result = _match_loftr_kornia_indoor_native(
+            img1=img1,
+            img2=img2,
+            confidence_threshold=confidence_threshold,
+            full_diagnostics=full_diagnostics,
+        )
+        result = _maybe_retry_reverse_native(
+            img1=img1,
+            img2=img2,
+            forward_result=result,
+            run_fn=_match_loftr_kornia_indoor_native,
+            run_kwargs={
+                "confidence_threshold": confidence_threshold,
+                "full_diagnostics": full_diagnostics,
+            },
+        )
     if return_diagnostics:
         return result
     return result[0], result[1], result[2], result[3]
@@ -4220,7 +4315,7 @@ def cluster_photos_optimized(
         images,
         photo_ids,
         k=candidate_k,
-        max_cluster_size=3,  # Limit to 3 best photos per cluster
+        max_cluster_size=2,  # Hard cap: keep best transition pairs only
         db_session=db_session,
         job_id=job_id,
         room_labels=room_labels,

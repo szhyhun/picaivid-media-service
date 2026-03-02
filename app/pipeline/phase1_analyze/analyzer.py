@@ -122,8 +122,17 @@ class Phase1Analyzer:
             self.db.commit()
 
             # Step 8: Plan motion for each cluster
+            photos_by_cluster: Dict[int, List[JobPhoto]] = {}
+            for photo in job_photos:
+                if photo.room_cluster_id is None:
+                    continue
+                photos_by_cluster.setdefault(int(photo.room_cluster_id), []).append(photo)
             for cluster in clusters:
-                plan_motion_for_cluster(self.db, cluster)
+                plan_motion_for_cluster(
+                    self.db,
+                    cluster,
+                    preloaded_photos=photos_by_cluster.get(int(cluster.id), []),
+                )
 
             # Update job status
             job.status = "analysis_complete"
