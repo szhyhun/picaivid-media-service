@@ -30,6 +30,40 @@ At minimum configure:
 
 Use `.env.example` as the source for all required keys.
 
+### Optional Debug Matcher Variables
+
+If you plan to use debug matchers in cloud:
+
+- MatchFormer debug:
+  - `MATCHFORMER_REPO_DIR`
+  - `MATCHFORMER_INDOOR_CKPT`
+  - `MATCHFORMER_OUTDOOR_CKPT`
+
+RoMa-v2 does not require checkpoint env vars, but downloads large weights on first use into the runtime cache.
+Optional device override for RoMa debug matcher:
+- `ROMA_DEBUG_DEVICE=auto|cpu|mps|cuda`
+Optional device override for MatchFormer debug matcher:
+- `MATCHFORMER_DEBUG_DEVICE=auto|cpu|mps|cuda`
+
+## 3.1) Dependency Lock Strategy (Recommended)
+
+To keep AWS behavior consistent with local runs:
+
+- Build/install with `requirements.lock.txt` (fully pinned from working venv).
+- Use `requirements.txt` only for local iteration when intentionally updating dependencies.
+
+Example:
+
+```bash
+pip install -r requirements.lock.txt
+```
+
+When intentionally updating dependencies, regenerate the lock file from a validated venv:
+
+```bash
+./venv/bin/pip freeze | LC_ALL=C sort > requirements.lock.txt
+```
+
 ## 4) Deploy Shape
 
 - API task (FastAPI)

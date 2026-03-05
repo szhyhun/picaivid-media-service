@@ -370,6 +370,39 @@ class Phase1Analyzer:
 
         changed = 0
 
+        # Rule 0: laundry->bathroom recovery for adjacent service-room shots.
+        # Conservative: only relabel when metadata does not indicate laundry.
+        for idx, photo in enumerate(ordered):
+            if photo.room_override:
+                continue
+
+            current = _normalize_room_label(photo.room_label)
+            if current not in {"laundry", "laundry room"}:
+                continue
+            if _looks_like_laundry(photo):
+                continue
+
+            window = ordered[max(0, idx - 2): min(n, idx + 3)]
+            neighbor_labels = [
+                _normalize_room_label(p.room_label)
+                for p in window
+                if p.id != photo.id
+            ]
+            bathroom_votes = sum(label == "bathroom" for label in neighbor_labels)
+            laundry_votes = sum(label in {"laundry", "laundry room"} for label in neighbor_labels)
+            depth_var = float(photo.depth_variance or 0.0)
+
+            if bathroom_votes >= 1 and laundry_votes == 0 and depth_var <= 0.10:
+                photo.room_label = "bathroom"
+                changed += 1
+                logger.info(
+                    "Photo %s room relabel: %s -> bathroom (adjacent bathroom context, bathroom_votes=%s, depth_var=%.3f)",
+                    photo.id,
+                    current,
+                    bathroom_votes,
+                    depth_var,
+                )
+
         # Rule 1: recover interior kitchen shots mislabeled as patio/exterior.
         for idx, photo in enumerate(ordered):
             if photo.room_override:
@@ -417,7 +450,7 @@ class Phase1Analyzer:
                 .filter(PhotoSimilarity.geometric_inliers.isnot(None))
                 .filter(PhotoSimilarity.geometric_inliers >= 20)
                 .filter(PhotoSimilarity.geometric_score.isnot(None))
-                .filter(PhotoSimilarity.geometric_score >= 0.40)
+                .filter(PhotoSimilarity.geometric_score >= 0.30)
                 .all()
             )
 

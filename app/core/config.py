@@ -38,6 +38,21 @@ class Settings(BaseSettings):
     MODEL_CACHE_DIR: str = "./ml_models"
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
+    ROMA_DEBUG_DEVICE: str = "auto"
+    MATCHFORMER_DEBUG_DEVICE: str = "auto"
+
+    # ZJU LoFTR strict debug settings
+    LOFTR_ZJU_REPO_DIR: str | None = None
+    LOFTR_ZJU_INDOOR_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_DS_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_OT_CKPT: str | None = None
+    LOFTR_ZJU_OUTDOOR_DS_CKPT: str | None = None
+    LOFTR_ZJU_OUTDOOR_OT_CKPT: str | None = None
+
+    # MatchFormer strict debug settings
+    MATCHFORMER_REPO_DIR: str | None = None
+    MATCHFORMER_INDOOR_CKPT: str | None = None
+    MATCHFORMER_OUTDOOR_CKPT: str | None = None
 
     # Clustering behavior
     DELETE_OBVIOUS_DUPLICATES: bool = True

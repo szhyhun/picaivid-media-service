@@ -194,8 +194,12 @@ class PairDebugRequest(BaseModel):
     confidence_threshold: Optional[float] = Field(default=None, ge=0.1, le=1.0)
     matcher: Literal[
         "current",
-        "loftr_kornia_indoor_simplified",
         "loftr_kornia_indoor_native",
+        "loftr_zju_indoor_ds_debug",
+        "loftr_zju_indoor_ot_debug",
+        "roma_v2_debug",
+        "matchformer_indoor_debug",
+        "matchformer_outdoor_debug",
     ] = "current"
 
 

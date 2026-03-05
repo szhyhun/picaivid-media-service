@@ -18,7 +18,11 @@ Stage 3 (selective SfM): Optional COLMAP
 This keeps 90% of compute small while getting high-quality results.
 """
 import logging
+import os
+import sys
 import time
+import warnings
+from copy import deepcopy
 from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any
 from collections import defaultdict
 
@@ -28,10 +32,6 @@ import torch
 from PIL import Image, ImageOps
 
 from app.core.config import settings
-from app.pipeline.phase1_analyze.learned_matching_simplified import (
-    SimplifiedLoFTREssentialMatcher,
-    SimplifiedMatcherConfig,
-)
 
 if TYPE_CHECKING:
     from app.db.models import JobPhoto
@@ -297,6 +297,8 @@ ENABLE_FUNDAMENTAL_SAMPSON_REFINEMENT = False
 # Room label mismatch controls.
 # Strict mode blocks cross-room pairs entirely (including adjacent photos).
 STRICT_ROOM_LABEL_BLOCK = True
+STRICT_SOCIAL_CROSS_ROOM_RECHECK_MIN_SEMANTIC = 0.65  # Allow geometry check for likely open-plan relabel errors
+STRICT_SERVICE_CROSS_ROOM_RECHECK_MIN_SEMANTIC = 0.60  # Allow adjacent bathroom/laundry relabel errors to reach geometry
 MIN_INLIERS_CROSS_ROOM = 30       # Require 30+ inliers for non-adjacent cross-room pairs
 MIN_INLIERS_CROSS_ROOM_ADJACENT = 15  # Lower threshold for adjacent photos (ML often mislabels)
 CROSS_ROOM_ADJ_LOW_SEMANTIC = 0.20  # Very low semantic for adjacent cross-room is suspicious
@@ -308,7 +310,8 @@ MIN_INLIERS_CROSS_ROOM_ADJ_LOW_SEMANTIC = 30
 # (prevents clustering photos from different physical locations with same room label)
 POSITION_GAP_THRESHOLD = 3         # If gap >= 3, require higher inlier count
 MIN_INLIERS_FAR_APART = 25         # Require 25+ inliers for non-adjacent same-room photos
-VERY_FAR_POSITION_GAP_THRESHOLD = 20   # Very distant photos in upload order are unlikely to transition directly
+MIN_SCORE_FAR_APART = 0.18         # Gap>=3 links also need minimum geometric confidence
+VERY_FAR_POSITION_GAP_THRESHOLD = 5    # Gap>=5 is already very far in listing order; require stronger evidence
 MIN_SEMANTIC_FOR_VERY_FAR = 0.55       # Very-far pairs also need moderate semantic affinity
 MIN_INLIERS_VERY_FAR = 35              # Enforce stronger geometry for very-far pairs
 MIN_SCORE_VERY_FAR = 0.45              # Reject weak-overlap scores for very-far pairs
@@ -336,7 +339,7 @@ ROBUST_SCORE_MIN_ACTIVE_MATCHES = 40
 FINAL_GATE_MIN_INLIERS = 20
 FINAL_GATE_MIN_INLIER_RATIO = 0.20
 FINAL_GATE_MIN_OVERLAP_RATIO = 0.10
-NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac", "essential_ransac"}
+NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS = {"fundamental_magsac", "fundamental_ransac"}
 # If native forward pass is weak, retry reverse orientation and keep the stronger result.
 # This stabilizes pair-debug and clustering against directional LoFTR asymmetry.
 NATIVE_REVERSE_RETRY_ENABLED = True
@@ -1328,6 +1331,12 @@ PRE_PIPELINE_DUPLICATE_SIMILARITY_THRESHOLD = 0.95  # Pre-graph prune for obviou
 PRE_PIPELINE_DUPLICATE_MAX_GAP = 4  # Keep dedupe local in sequence to avoid dropping valid alternate viewpoints
 KEEP_DUPLICATE_SINGLETON_CLUSTERS = not settings.DELETE_OBVIOUS_DUPLICATES
 SPLIT_LONG_GAP_DECAY = 0.25  # Prefer cutting oversized clusters at large capture-order jumps
+PAIR_ONLY_SPLIT_GEOMETRY_WEIGHT = 0.45  # Keep geometry primary but let semantics break ties in pair-only split
+PAIR_ONLY_SPLIT_SEMANTIC_WEIGHT = 0.55  # Helps avoid cross-room-ish pair picks when max cluster size is 2
+PAIR_ONLY_SPLIT_CROSS_ROOM_PENALTY = 0.60  # Reduce cross-room edge preference in final pair-only split
+PAIR_ONLY_MIN_OVERLAP_RATIO = 0.12  # Pair-only selection requires enough shared coverage
+PAIR_ONLY_MIN_COMBINED_SCORE = 0.22  # Pair-only selection requires minimum overall pair quality
+PAIR_ONLY_MIN_INLIERS = 20  # Pair-only selection requires minimum geometric support
 
 
 def compute_direction_vector(
@@ -1432,6 +1441,27 @@ def rooms_allow_adjacent_semantic_bridge(room1: str | None, room2: str | None) -
 
 def is_exterior_like(room: str | None) -> bool:
     return room_family(room) in {"front_exterior", "exterior"}
+
+
+def allow_strict_cross_room_temporal_recheck(
+    room1: str | None,
+    room2: str | None,
+    temporal_dist: int,
+    sem_sim: float,
+) -> bool:
+    """Allow adjacent same-family label mismatches to be resolved by geometry."""
+    if temporal_dist != 1:
+        return False
+    family1 = room_family(room1)
+    family2 = room_family(room2)
+    if family1 != family2:
+        return False
+    sem = float(sem_sim)
+    if family1 == "social":
+        return sem >= float(STRICT_SOCIAL_CROSS_ROOM_RECHECK_MIN_SEMANTIC)
+    if family1 == "service":
+        return sem >= float(STRICT_SERVICE_CROSS_ROOM_RECHECK_MIN_SEMANTIC)
+    return False
 
 
 def is_mutual_top_semantic_neighbor(i: int, j: int, similarity: np.ndarray, top_k: int = 2) -> bool:
@@ -1773,6 +1803,8 @@ def deduplicate_and_split_cluster(
     adjacency: np.ndarray,
     max_size: int = 3,
     keep_duplicate_singletons: bool = True,
+    room_labels: Optional[List[str]] = None,
+    pair_metrics_lookup: Optional[Dict[Tuple[int, int], Dict[str, object]]] = None,
 ) -> Tuple[List[List[int]], Dict[int, int]]:
     """Remove duplicates and split large clusters into smaller ones.
 
@@ -1902,40 +1934,152 @@ def deduplicate_and_split_cluster(
         return [remaining] + emitted_duplicate_clusters, duplicate_of
 
     if max_size == 2:
-        # For pair-only output, greedily keep the strongest disjoint overlaps first.
-        # This prioritizes "best transition pair" behavior inside larger connected components.
+        # For pair-only output, build pairs left-to-right on the ordered chain.
+        # This preserves temporal continuity while still using blended edge ranking.
         remaining_cluster_indices = [pid_to_idx[pid] for pid in remaining]
-        candidate_edges: List[Tuple[float, int, int]] = []
+        edge_scores: Dict[Tuple[int, int], Dict[str, object]] = {}
+        strict_rejected_edges: List[Tuple[int, int, str]] = []
         m = len(remaining)
         for i in range(m):
             for j in range(i + 1, m):
                 idx_i = remaining_cluster_indices[i]
                 idx_j = remaining_cluster_indices[j]
-                strength = float(adjacency[idx_i, idx_j])
-                if not np.isfinite(strength) or strength <= 0.0:
+                geo_strength = float(adjacency[idx_i, idx_j])
+                if not np.isfinite(geo_strength) or geo_strength <= 0.0:
                     continue
-                candidate_edges.append((strength, i, j))
+                src_i = remaining_indices[i]
+                src_j = remaining_indices[j]
+                sem_strength = float(sem_sim[src_i, src_j])
+                if not np.isfinite(sem_strength):
+                    sem_strength = 0.0
+                blended_strength = (
+                    PAIR_ONLY_SPLIT_GEOMETRY_WEIGHT * geo_strength
+                    + PAIR_ONLY_SPLIT_SEMANTIC_WEIGHT * sem_strength
+                )
+                room_penalty = 1.0
+                if room_labels and len(room_labels) == len(photo_ids):
+                    room_i = room_labels[idx_i]
+                    room_j = room_labels[idx_j]
+                    if rooms_are_different(room_i, room_j):
+                        room_penalty = PAIR_ONLY_SPLIT_CROSS_ROOM_PENALTY
 
-        candidate_edges.sort(key=lambda item: (-item[0], item[1], item[2]))
+                adjusted_strength = blended_strength * room_penalty
+                pair_key = (min(remaining[i], remaining[j]), max(remaining[i], remaining[j]))
+                pair_record = pair_metrics_lookup.get(pair_key) if pair_metrics_lookup else None
+                if not isinstance(pair_record, dict):
+                    strict_rejected_edges.append((remaining[i], remaining[j], "missing_pair_record"))
+                    continue
+
+                combined_score = _float_or_none(pair_record.get("combined_score"))
+                if combined_score is None:
+                    strict_rejected_edges.append((remaining[i], remaining[j], "missing_combined_score"))
+                    continue
+
+                overlap_ratio = _float_or_none(pair_record.get("overlap_ratio"))
+                if overlap_ratio is None:
+                    strict_rejected_edges.append((remaining[i], remaining[j], "missing_overlap_ratio"))
+                    continue
+
+                inliers = _int_or_none(pair_record.get("geometric_inliers"))
+                if inliers is None:
+                    strict_rejected_edges.append((remaining[i], remaining[j], "missing_geometric_inliers"))
+                    continue
+
+                if float(overlap_ratio) < float(PAIR_ONLY_MIN_OVERLAP_RATIO):
+                    strict_rejected_edges.append((remaining[i], remaining[j], "low_overlap_ratio"))
+                    continue
+                if float(combined_score) < float(PAIR_ONLY_MIN_COMBINED_SCORE):
+                    strict_rejected_edges.append((remaining[i], remaining[j], "low_combined_score"))
+                    continue
+                if int(inliers) < int(PAIR_ONLY_MIN_INLIERS):
+                    strict_rejected_edges.append((remaining[i], remaining[j], "low_inliers"))
+                    continue
+
+                rank_key = (
+                    float(overlap_ratio),
+                    float(combined_score),
+                    int(inliers),
+                    float(adjusted_strength),
+                    float(sem_strength),
+                )
+                edge_scores[(i, j)] = {
+                    "rank_key": rank_key,
+                    "adjusted_strength": adjusted_strength,
+                    "geo_strength": geo_strength,
+                    "sem_strength": sem_strength,
+                    "room_penalty": room_penalty,
+                    "combined_score": float(combined_score),
+                    "overlap_ratio": float(overlap_ratio),
+                    "inliers": int(inliers),
+                }
+
+        if strict_rejected_edges:
+            reasons: Dict[str, int] = {}
+            for _, _, reason in strict_rejected_edges:
+                reasons[reason] = reasons.get(reason, 0) + 1
+            examples = ", ".join(
+                f"{left}<->{right}:{reason}" for left, right, reason in strict_rejected_edges[:8]
+            )
+            logger.warning(
+                "Pair-only strict ranking rejected %s candidate edges due missing metrics (reasons=%s, examples=%s)",
+                len(strict_rejected_edges),
+                reasons,
+                examples or "none",
+            )
+
         used_local: set[int] = set()
         paired_clusters: List[List[int]] = []
 
-        for strength, i, j in candidate_edges:
-            if i in used_local or j in used_local:
-                continue
-            paired_clusters.append([remaining[i], remaining[j]])
-            used_local.add(i)
-            used_local.add(j)
-            logger.debug(
-                "Pair-only split selected edge %s<->%s strength=%.3f",
-                remaining[i],
-                remaining[j],
-                strength,
-            )
-
         for i in range(m):
-            if i not in used_local:
+            if i in used_local:
+                continue
+            best_j: Optional[int] = None
+            best_rank = (0.0, 0.0, 0, 0.0, 0.0)
+            best_adjusted = 0.0
+            best_geo = 0.0
+            best_sem = 0.0
+            best_penalty = 1.0
+            best_combined = 0.0
+            best_overlap = 0.0
+            best_inliers = 0
+
+            for j in range(i + 1, m):
+                if j in used_local:
+                    continue
+                edge_info = edge_scores.get((i, j))
+                if not edge_info:
+                    continue
+                rank_key = edge_info.get("rank_key", (0.0, 0.0, 0, 0.0, 0.0))
+                if rank_key > best_rank:
+                    best_rank = rank_key
+                    best_j = j
+                    best_adjusted = float(edge_info.get("adjusted_strength", 0.0) or 0.0)
+                    best_geo = float(edge_info.get("geo_strength", 0.0) or 0.0)
+                    best_sem = float(edge_info.get("sem_strength", 0.0) or 0.0)
+                    best_penalty = float(edge_info.get("room_penalty", 1.0) or 1.0)
+                    best_combined = float(edge_info.get("combined_score", 0.0) or 0.0)
+                    best_overlap = float(edge_info.get("overlap_ratio", 0.0) or 0.0)
+                    best_inliers = int(edge_info.get("inliers", 0) or 0)
+
+            if best_j is not None and best_adjusted > 0.0:
+                paired_clusters.append([remaining[i], remaining[best_j]])
+                used_local.add(i)
+                used_local.add(best_j)
+                logger.debug(
+                    "Pair-only split selected edge %s<->%s combined=%.3f overlap=%.3f inliers=%s adjusted=%.3f geo=%.3f sem=%.3f room_penalty=%.2f",
+                    remaining[i],
+                    remaining[best_j],
+                    best_combined,
+                    best_overlap,
+                    best_inliers,
+                    best_adjusted,
+                    best_geo,
+                    best_sem,
+                    best_penalty,
+                )
+            else:
                 paired_clusters.append([remaining[i]])
+                used_local.add(i)
 
         # Keep deterministic order in output based on original cluster position.
         original_pos = {pid: idx for idx, pid in enumerate(cluster_photo_ids)}
@@ -2122,10 +2266,24 @@ def _oracle_metrics_from_diagnostics(diagnostics: Dict[str, Any] | None) -> Dict
     }
 
 
+def _score_metrics_from_diagnostics(diagnostics: Dict[str, Any] | None) -> Dict[str, float | int | None]:
+    score_components = diagnostics.get("score_components") if diagnostics else {}
+    raw = score_components if isinstance(score_components, dict) else {}
+    overlap_ratio = _float_or_none(raw.get("overlap_ratio"))
+    if overlap_ratio is None:
+        overlap_ratio = _float_or_none(raw.get("robust_coverage"))
+    return {
+        "combined_score": _float_or_none(raw.get("combined_score")),
+        "overlap_ratio": overlap_ratio,
+        "inlier_ratio": _float_or_none(raw.get("inlier_ratio")),
+    }
+
+
 def _build_pair_metrics_payload(diagnostics: Dict[str, Any] | None) -> Dict[str, float | int | None]:
     payload: Dict[str, float | int | None] = {}
     payload.update(_segment_scores_from_diagnostics(diagnostics))
     payload.update(_oracle_metrics_from_diagnostics(diagnostics))
+    payload.update(_score_metrics_from_diagnostics(diagnostics))
     return payload
 
 
@@ -2365,19 +2523,380 @@ def enforce_transition_quality(
 
 # LightGlue/LoFTR model singleton
 _loftr_matchers: Dict[str, Any] = {}
-_simplified_loftr_matcher = SimplifiedLoFTREssentialMatcher(
-    SimplifiedMatcherConfig(
-        checkpoint="indoor",
-        long_side=768,
-        confidence_threshold=0.5,
-        min_confident_matches=30,
-        ransac_threshold_px=1.0,
-        ransac_prob=0.999,
-        rng_seed=42,
-        rotation_threshold_deg=2.0,
-        translation_z_threshold=0.15,
+_zju_loftr_matchers: Dict[str, Any] = {}
+_zju_loftr_matcher_meta: Dict[str, Dict[str, str]] = {}
+_matchformer_matchers: Dict[str, Any] = {}
+_matchformer_matcher_meta: Dict[str, Dict[str, str]] = {}
+_roma_v2_matchers: Dict[str, Any] = {}
+_roma_v2_matcher_meta: Dict[str, Dict[str, str]] = {}
+_ZJU_DEBUG_ENV_BY_VARIANT: Dict[str, str] = {
+    "indoor_ds": "LOFTR_ZJU_INDOOR_DS_CKPT",
+    "indoor_ot": "LOFTR_ZJU_INDOOR_OT_CKPT",
+}
+_MATCHFORMER_DEBUG_ENV_BY_VARIANT: Dict[str, str] = {
+    "indoor": "MATCHFORMER_INDOOR_CKPT",
+    "outdoor": "MATCHFORMER_OUTDOOR_CKPT",
+}
+
+
+def _same_torch_device(a: torch.device, b: torch.device) -> bool:
+    if a.type != b.type:
+        return False
+    if a.type in {"cpu", "mps"}:
+        return True
+    if a.type == "cuda":
+        if a.index is None or b.index is None:
+            return True
+        return a.index == b.index
+    return a == b
+
+
+def _env_or_settings(name: str, default: str = "") -> str:
+    raw_env = str(os.getenv(name, "")).strip()
+    if raw_env:
+        return raw_env
+    raw_settings = getattr(settings, name, None)
+    if raw_settings is None:
+        return str(default)
+    return str(raw_settings).strip() or str(default)
+
+
+def _zju_debug_repo_dir() -> str:
+    repo_dir = _env_or_settings("LOFTR_ZJU_REPO_DIR", "")
+    if not repo_dir:
+        raise RuntimeError("ZJU debug matcher is missing env LOFTR_ZJU_REPO_DIR")
+    if not os.path.isdir(repo_dir):
+        raise RuntimeError(f"ZJU debug matcher repo path not found: {repo_dir}")
+    return repo_dir
+
+
+def _zju_debug_checkpoint_path(variant: str) -> Tuple[str, str]:
+    env_key = _ZJU_DEBUG_ENV_BY_VARIANT.get(str(variant))
+    if not env_key:
+        raise RuntimeError(f"Unsupported ZJU debug variant '{variant}'")
+    ckpt_path = _env_or_settings(env_key, "")
+    if not ckpt_path:
+        raise RuntimeError(f"ZJU debug matcher is missing env {env_key}")
+    if not os.path.isfile(ckpt_path):
+        raise RuntimeError(f"ZJU debug checkpoint not found for {variant}: {ckpt_path}")
+    return ckpt_path, env_key
+
+
+def _load_zju_loftr_debug_variant(variant: str) -> Tuple[Any, Dict[str, str]]:
+    variant = str(variant)
+    preferred = _preferred_torch_device()
+    if variant in _zju_loftr_matchers:
+        matcher = _zju_loftr_matchers[variant]
+        try:
+            current = next(matcher.parameters()).device
+        except Exception:
+            current = torch.device("cpu")
+        if not _same_torch_device(current, preferred):
+            matcher = matcher.to(preferred)
+            matcher.eval()
+            _zju_loftr_matchers[variant] = matcher
+            logger.info(
+                "Moved cached ZJU LoFTR debug matcher (%s) from %s to %s",
+                variant,
+                current,
+                preferred,
+            )
+        return matcher, dict(_zju_loftr_matcher_meta.get(variant, {}))
+
+    repo_dir = _zju_debug_repo_dir()
+    ckpt_path, env_key = _zju_debug_checkpoint_path(variant)
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+    try:
+        from src.loftr import LoFTR as ZJULoFTR, default_cfg as zju_default_cfg
+    except Exception as exc:
+        raise RuntimeError(
+            f"ZJU debug matcher failed importing repo modules from {repo_dir}: {exc}"
+        ) from exc
+
+    cfg = deepcopy(zju_default_cfg)
+    if isinstance(cfg.get("match_coarse"), dict):
+        cfg["match_coarse"].setdefault("sparse_spvs", False)
+
+    matcher = ZJULoFTR(config=cfg)
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
+    except Exception as exc:
+        raise RuntimeError(f"ZJU debug matcher failed loading checkpoint '{ckpt_path}': {exc}") from exc
+
+    state_dict = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(
+            f"ZJU debug matcher checkpoint has invalid state_dict format: {ckpt_path}"
+        )
+
+    try:
+        incompatible = matcher.load_state_dict(state_dict, strict=False)
+    except Exception as exc:
+        raise RuntimeError(f"ZJU debug matcher failed loading state_dict for {variant}: {exc}") from exc
+
+    matcher = matcher.to(preferred)
+    matcher.eval()
+    _zju_loftr_matchers[variant] = matcher
+    _zju_loftr_matcher_meta[variant] = {
+        "variant": variant,
+        "repo_dir": repo_dir,
+        "ckpt_path": ckpt_path,
+        "env_key": env_key,
+        "model_class": matcher.__class__.__name__,
+        "missing_keys": str(len(getattr(incompatible, "missing_keys", []) or [])),
+        "unexpected_keys": str(len(getattr(incompatible, "unexpected_keys", []) or [])),
+    }
+    logger.info(
+        "Loaded ZJU LoFTR debug matcher (%s) from %s on %s [missing=%s unexpected=%s]",
+        variant,
+        ckpt_path,
+        preferred,
+        _zju_loftr_matcher_meta[variant]["missing_keys"],
+        _zju_loftr_matcher_meta[variant]["unexpected_keys"],
     )
-)
+    return matcher, dict(_zju_loftr_matcher_meta[variant])
+
+
+def _matchformer_debug_repo_dir() -> str:
+    repo_dir = _env_or_settings("MATCHFORMER_REPO_DIR", "")
+    if not repo_dir:
+        raise RuntimeError("MatchFormer debug matcher is missing env MATCHFORMER_REPO_DIR")
+    if not os.path.isdir(repo_dir):
+        raise RuntimeError(f"MatchFormer debug matcher repo path not found: {repo_dir}")
+    return repo_dir
+
+
+def _matchformer_debug_checkpoint_path(variant: str) -> Tuple[str, str]:
+    env_key = _MATCHFORMER_DEBUG_ENV_BY_VARIANT.get(str(variant))
+    if not env_key:
+        raise RuntimeError(f"Unsupported MatchFormer debug variant '{variant}'")
+    ckpt_path = _env_or_settings(env_key, "")
+    if not ckpt_path:
+        raise RuntimeError(f"MatchFormer debug matcher is missing env {env_key}")
+    if not os.path.isfile(ckpt_path):
+        raise RuntimeError(f"MatchFormer debug checkpoint not found for {variant}: {ckpt_path}")
+    return ckpt_path, env_key
+
+
+def _cfg_to_lower_dict(config: Any) -> Any:
+    if isinstance(config, dict):
+        return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
+    if isinstance(config, (list, tuple)):
+        converted = [_cfg_to_lower_dict(v) for v in config]
+        return type(config)(converted) if isinstance(config, tuple) else converted
+    if hasattr(config, "items"):
+        return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
+    return config
+
+
+def _matchformer_config_for_variant(cfg: Any, variant: str) -> Any:
+    if variant == "indoor":
+        cfg.MATCHFORMER.BACKBONE_TYPE = "largesea"
+        cfg.MATCHFORMER.SCENS = "indoor"
+    elif variant == "outdoor":
+        cfg.MATCHFORMER.BACKBONE_TYPE = "largela"
+        cfg.MATCHFORMER.SCENS = "outdoor"
+    else:
+        raise RuntimeError(f"Unsupported MatchFormer debug variant '{variant}'")
+
+    # Keep parity with the repo test/inference defaults.
+    cfg.MATCHFORMER.RESOLUTION = (8, 2)
+    cfg.MATCHFORMER.COARSE.D_MODEL = 256
+    cfg.MATCHFORMER.COARSE.D_FFN = 256
+    return cfg
+
+
+def _load_matchformer_debug_variant(variant: str) -> Tuple[Any, Dict[str, str]]:
+    variant = str(variant)
+    requested_device = _env_or_settings("MATCHFORMER_DEBUG_DEVICE", "auto").lower()
+    preferred = _preferred_torch_device()
+    if requested_device in {"", "auto"}:
+        # On macOS MPS, MatchFormer can trigger large CPU fallback buffers.
+        # Prefer CPU locally unless explicitly overridden.
+        preferred = torch.device("cpu") if preferred.type == "mps" else preferred
+    elif requested_device == "cpu":
+        preferred = torch.device("cpu")
+    elif requested_device == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not bool(mps_backend.is_available()):
+            raise RuntimeError("MatchFormer debug matcher requested MATCHFORMER_DEBUG_DEVICE=mps but MPS is unavailable")
+        preferred = torch.device("mps")
+    elif requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("MatchFormer debug matcher requested MATCHFORMER_DEBUG_DEVICE=cuda but CUDA is unavailable")
+        preferred = torch.device("cuda")
+    else:
+        raise RuntimeError(
+            f"MatchFormer debug matcher has invalid MATCHFORMER_DEBUG_DEVICE='{requested_device}'. "
+            "Use one of: auto, cpu, mps, cuda."
+        )
+    if variant in _matchformer_matchers:
+        matcher = _matchformer_matchers[variant]
+        try:
+            current = next(matcher.parameters()).device
+        except Exception:
+            current = torch.device("cpu")
+        if not _same_torch_device(current, preferred):
+            matcher = matcher.to(preferred)
+            matcher.eval()
+            _matchformer_matchers[variant] = matcher
+            logger.info(
+                "Moved cached MatchFormer debug matcher (%s) from %s to %s",
+                variant,
+                current,
+                preferred,
+            )
+        return matcher, dict(_matchformer_matcher_meta.get(variant, {}))
+
+    repo_dir = _matchformer_debug_repo_dir()
+    ckpt_path, env_key = _matchformer_debug_checkpoint_path(variant)
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Importing from timm\.models\.layers is deprecated, please import via timm\.layers",
+                category=FutureWarning,
+            )
+            from config.defaultmf import get_cfg_defaults
+            from model.matchformer import Matchformer
+    except Exception as exc:
+        raise RuntimeError(
+            f"MatchFormer debug matcher failed importing repo modules from {repo_dir}: {exc}"
+        ) from exc
+
+    try:
+        cfg = get_cfg_defaults()
+    except Exception as exc:
+        raise RuntimeError(f"MatchFormer debug matcher failed building default config: {exc}") from exc
+    cfg = _matchformer_config_for_variant(cfg, variant)
+    cfg_lower = _cfg_to_lower_dict(cfg)
+    model_cfg = cfg_lower.get("matchformer")
+    if not isinstance(model_cfg, dict):
+        raise RuntimeError("MatchFormer debug matcher config is invalid: missing 'matchformer' block")
+
+    matcher = Matchformer(config=model_cfg)
+    try:
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location=torch.device("cpu"),
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
+    except Exception as exc:
+        raise RuntimeError(f"MatchFormer debug matcher failed loading checkpoint '{ckpt_path}': {exc}") from exc
+
+    if isinstance(checkpoint, dict):
+        nested_state = checkpoint.get("state_dict")
+        state_dict = nested_state if isinstance(nested_state, dict) else checkpoint
+    else:
+        state_dict = checkpoint
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(
+            f"MatchFormer debug matcher checkpoint has invalid state_dict format: {ckpt_path}"
+        )
+
+    model_state_dict: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        normalized_key = str(key)
+        if normalized_key.startswith("matcher."):
+            normalized_key = normalized_key[len("matcher."):]
+        elif normalized_key.startswith("model.matcher."):
+            normalized_key = normalized_key[len("model.matcher."):]
+        elif normalized_key.startswith("model."):
+            normalized_key = normalized_key[len("model."):]
+        model_state_dict[normalized_key] = value
+
+    try:
+        incompatible = matcher.load_state_dict(model_state_dict, strict=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"MatchFormer debug matcher failed loading state_dict for {variant}: {exc}"
+        ) from exc
+
+    matcher = matcher.to(preferred)
+    matcher.eval()
+    _matchformer_matchers[variant] = matcher
+    _matchformer_matcher_meta[variant] = {
+        "variant": variant,
+        "repo_dir": repo_dir,
+        "ckpt_path": ckpt_path,
+        "env_key": env_key,
+        "model_class": matcher.__class__.__name__,
+        "requested_device": requested_device or "auto",
+        "missing_keys": str(len(getattr(incompatible, "missing_keys", []) or [])),
+        "unexpected_keys": str(len(getattr(incompatible, "unexpected_keys", []) or [])),
+    }
+    logger.info(
+        "Loaded MatchFormer debug matcher (%s) from %s on %s (requested=%s) [missing=%s unexpected=%s]",
+        variant,
+        ckpt_path,
+        preferred,
+        requested_device or "auto",
+        _matchformer_matcher_meta[variant]["missing_keys"],
+        _matchformer_matcher_meta[variant]["unexpected_keys"],
+    )
+    return matcher, dict(_matchformer_matcher_meta[variant])
+
+
+def _load_roma_v2_debug_matcher() -> Tuple[Any, Dict[str, str]]:
+    cache_key = "outdoor"
+    if cache_key in _roma_v2_matchers:
+        return _roma_v2_matchers[cache_key], dict(_roma_v2_matcher_meta.get(cache_key, {}))
+
+    requested_device = _env_or_settings("ROMA_DEBUG_DEVICE", "auto").lower()
+    preferred_device = _preferred_torch_device()
+    if requested_device in {"", "auto"}:
+        # On macOS MPS RoMa uses unsupported ops that bounce to CPU anyway.
+        # Prefer CPU locally for stable/consistent timing unless explicitly overridden.
+        model_device = torch.device("cpu") if preferred_device.type == "mps" else preferred_device
+    elif requested_device == "cpu":
+        model_device = torch.device("cpu")
+    elif requested_device == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not bool(mps_backend.is_available()):
+            raise RuntimeError("RoMa-v2 debug matcher requested ROMA_DEBUG_DEVICE=mps but MPS is unavailable")
+        model_device = torch.device("mps")
+    elif requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("RoMa-v2 debug matcher requested ROMA_DEBUG_DEVICE=cuda but CUDA is unavailable")
+        model_device = torch.device("cuda")
+    else:
+        raise RuntimeError(
+            f"RoMa-v2 debug matcher has invalid ROMA_DEBUG_DEVICE='{requested_device}'. "
+            "Use one of: auto, cpu, mps, cuda."
+        )
+    try:
+        from romatch import roma_outdoor
+    except Exception as exc:
+        raise RuntimeError(
+            "RoMa-v2 debug matcher requires package 'romatch'. Install it in media-service venv first."
+        ) from exc
+
+    try:
+        matcher = roma_outdoor(device=str(model_device))
+    except TypeError:
+        matcher = roma_outdoor(device=model_device)
+    except Exception as exc:
+        raise RuntimeError(f"RoMa-v2 debug matcher failed to initialize: {exc}") from exc
+
+    _roma_v2_matchers[cache_key] = matcher
+    _roma_v2_matcher_meta[cache_key] = {
+        "variant": "outdoor",
+        "model_class": matcher.__class__.__name__,
+        "device": str(model_device),
+        "requested_device": requested_device or "auto",
+    }
+    logger.info(
+        "Loaded RoMa-v2 debug matcher (outdoor) on %s (requested=%s, preferred=%s)",
+        model_device,
+        requested_device or "auto",
+        preferred_device,
+    )
+    return matcher, dict(_roma_v2_matcher_meta[cache_key])
 
 
 def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, Any] | None) -> str:
@@ -3129,18 +3648,350 @@ def _match_loftr_kornia_indoor_native(
     return int(num_matches), int(num_inliers), float(score), direction, diagnostics
 
 
-def _match_loftr_kornia_indoor_simplified(
+def _match_loftr_zju_variant_debug(
     img1: Image.Image,
     img2: Image.Image,
-    confidence_threshold: float = 0.5,
+    variant: str,
+    confidence_threshold: float = LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
     full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
-    return _simplified_loftr_matcher.match_pair(
-        img1=img1,
-        img2=img2,
+    total_started_at = time.perf_counter()
+    matcher, matcher_meta = _load_zju_loftr_debug_variant(variant)
+    model_load_seconds = 0.0
+    device = next(matcher.parameters()).device
+
+    target_long_side = max(64, int(max(DEFAULT_LOFTR_INPUT_SIZE)))
+    prep_started_at = time.perf_counter()
+    prep1 = _get_native_preprocessed_entry(img1, target_long_side=target_long_side)
+    prep2 = _get_native_preprocessed_entry(img2, target_long_side=target_long_side)
+    img1_resized = prep1["gray_resized"]
+    img2_resized = prep2["gray_resized"]
+    meta0 = prep1["meta"]
+    meta1 = prep2["meta"]
+    resize_seconds = time.perf_counter() - prep_started_at
+
+    tensor_transfer_started_at = time.perf_counter()
+    tensor1 = _build_native_tensor(img1_resized, device=device)
+    tensor2 = _build_native_tensor(img2_resized, device=device)
+    tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
+    tensor_device = str(tensor1.device)
+    mps_mem_before = _mps_memory_stats_mb() if device.type == "mps" else {}
+
+    loftr_started_at = time.perf_counter()
+    batch: Dict[str, Any] = {"image0": tensor1, "image1": tensor2}
+    with torch.inference_mode():
+        raw_output = matcher(batch)
+        correspondences = raw_output if isinstance(raw_output, dict) else batch
+    loftr_seconds = time.perf_counter() - loftr_started_at
+
+    points0, points1, scores = _extract_loftr_points_and_scores(correspondences)
+    del correspondences
+    del batch
+    del tensor1
+    del tensor2
+    try:
+        del raw_output
+    except Exception:
+        pass
+    cleanup_started_at = time.perf_counter()
+    mps_mem_after = _release_device_cache(device=device)
+    cleanup_seconds = time.perf_counter() - cleanup_started_at
+
+    diagnostics_started_at = time.perf_counter()
+    matcher_name = f"loftr_zju_{variant}_debug"
+    result = _build_native_loftr_diagnostics(
+        matcher_name=matcher_name,
+        checkpoint=f"zju:{variant}",
         confidence_threshold=float(confidence_threshold),
-        full_diagnostics=bool(full_diagnostics),
+        points0=points0,
+        points1=points1,
+        scores=scores,
+        width0=int(meta0["content_w"]),
+        height0=int(meta0["content_h"]),
+        width1=int(meta1["content_w"]),
+        height1=int(meta1["content_h"]),
+        input_w=int(meta0["content_w"] + meta0["pad_w"]),
+        input_h=int(meta0["content_h"] + meta0["pad_h"]),
+        full_diagnostics=full_diagnostics,
     )
+    diagnostics_seconds = time.perf_counter() - diagnostics_started_at
+    total_seconds = time.perf_counter() - total_started_at
+    num_matches, num_inliers, score, direction, diagnostics = result
+    inner_timing = diagnostics.get("timing") if isinstance(diagnostics, dict) and isinstance(diagnostics.get("timing"), dict) else {}
+
+    timing_payload = {
+        "time_model_load_s": float(model_load_seconds),
+        "time_resize_s": float(resize_seconds),
+        "time_tensor_transfer_s": float(tensor_transfer_seconds),
+        "time_loftr_s": float(loftr_seconds),
+        "time_loftr_forward_main_s": float(loftr_seconds),
+        "time_loftr_forward_reverse_s": 0.0,
+        "time_device_cleanup_s": float(cleanup_seconds),
+        "time_postprocess_s": float(diagnostics_seconds),
+        "time_pair_total_s": float(total_seconds),
+        "time_reverse_pair_total_s": 0.0,
+        "time_f_s": float(inner_timing.get("time_f_s", 0.0) or 0.0),
+        "time_h_s": float(inner_timing.get("time_h_s", 0.0) or 0.0),
+        "time_scoring_s": float(inner_timing.get("time_scoring_s", 0.0) or 0.0),
+        "forward_pass_count": 1,
+        "reverse_attempted": False,
+        "reverse_selected": False,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "mps_available": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        "preferred_device": str(_preferred_torch_device()),
+        "model_device": str(device),
+        "tensor_device": tensor_device,
+        "model_cache_hit": True,
+    }
+    if mps_mem_before:
+        timing_payload.update({
+            "mps_current_allocated_mb_before": float(mps_mem_before.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_before": float(mps_mem_before.get("mps_driver_allocated_mb", 0.0)),
+        })
+    if mps_mem_after:
+        timing_payload.update({
+            "mps_current_allocated_mb_after": float(mps_mem_after.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_after": float(mps_mem_after.get("mps_driver_allocated_mb", 0.0)),
+        })
+
+    diagnostics["zju_variant"] = str(variant)
+    diagnostics["zju_loader"] = "strict_repo_debug"
+    diagnostics["zju_checkpoint_path"] = matcher_meta.get("ckpt_path")
+    diagnostics["zju_repo_dir"] = matcher_meta.get("repo_dir")
+    diagnostics["zju_match_type"] = "native_repo"
+    diagnostics["zju_model_class"] = matcher_meta.get("model_class")
+    diagnostics["timing"] = timing_payload
+    return int(num_matches), int(num_inliers), float(score), direction, diagnostics
+
+
+def _match_matchformer_variant_debug(
+    img1: Image.Image,
+    img2: Image.Image,
+    variant: str,
+    confidence_threshold: float = LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+    full_diagnostics: bool = False,
+) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
+    total_started_at = time.perf_counter()
+    cache_hit = str(variant) in _matchformer_matchers
+    model_load_started_at = time.perf_counter()
+    matcher, matcher_meta = _load_matchformer_debug_variant(variant)
+    model_load_seconds = time.perf_counter() - model_load_started_at
+    device = next(matcher.parameters()).device
+
+    target_long_side = max(64, int(max(DEFAULT_LOFTR_INPUT_SIZE)))
+    prep_started_at = time.perf_counter()
+    prep1 = _get_native_preprocessed_entry(img1, target_long_side=target_long_side)
+    prep2 = _get_native_preprocessed_entry(img2, target_long_side=target_long_side)
+    img1_resized = prep1["gray_resized"]
+    img2_resized = prep2["gray_resized"]
+    meta0 = prep1["meta"]
+    meta1 = prep2["meta"]
+    resize_seconds = time.perf_counter() - prep_started_at
+
+    tensor_transfer_started_at = time.perf_counter()
+    tensor1 = _build_native_tensor(img1_resized, device=device)
+    tensor2 = _build_native_tensor(img2_resized, device=device)
+    tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
+    tensor_device = str(tensor1.device)
+    mps_mem_before = _mps_memory_stats_mb() if device.type == "mps" else {}
+
+    loftr_started_at = time.perf_counter()
+    batch: Dict[str, Any] = {"image0": tensor1, "image1": tensor2}
+    with torch.inference_mode():
+        raw_output = matcher(batch)
+        correspondences = raw_output if isinstance(raw_output, dict) else batch
+    loftr_seconds = time.perf_counter() - loftr_started_at
+
+    points0, points1, scores = _extract_loftr_points_and_scores(correspondences)
+    del correspondences
+    del batch
+    del tensor1
+    del tensor2
+    try:
+        del raw_output
+    except Exception:
+        pass
+    cleanup_started_at = time.perf_counter()
+    mps_mem_after = _release_device_cache(device=device)
+    cleanup_seconds = time.perf_counter() - cleanup_started_at
+
+    diagnostics_started_at = time.perf_counter()
+    matcher_name = f"matchformer_{variant}_debug"
+    result = _build_native_loftr_diagnostics(
+        matcher_name=matcher_name,
+        checkpoint=f"matchformer:{variant}",
+        confidence_threshold=float(confidence_threshold),
+        points0=points0,
+        points1=points1,
+        scores=scores,
+        width0=int(meta0["content_w"]),
+        height0=int(meta0["content_h"]),
+        width1=int(meta1["content_w"]),
+        height1=int(meta1["content_h"]),
+        input_w=int(meta0["content_w"] + meta0["pad_w"]),
+        input_h=int(meta0["content_h"] + meta0["pad_h"]),
+        full_diagnostics=full_diagnostics,
+    )
+    diagnostics_seconds = time.perf_counter() - diagnostics_started_at
+    total_seconds = time.perf_counter() - total_started_at
+    num_matches, num_inliers, score, direction, diagnostics = result
+    inner_timing = diagnostics.get("timing") if isinstance(diagnostics, dict) and isinstance(diagnostics.get("timing"), dict) else {}
+    timing_payload = {
+        "time_model_load_s": float(model_load_seconds),
+        "time_resize_s": float(resize_seconds),
+        "time_tensor_transfer_s": float(tensor_transfer_seconds),
+        "time_loftr_s": float(loftr_seconds),
+        "time_loftr_forward_main_s": float(loftr_seconds),
+        "time_loftr_forward_reverse_s": 0.0,
+        "time_device_cleanup_s": float(cleanup_seconds),
+        "time_postprocess_s": float(diagnostics_seconds),
+        "time_pair_total_s": float(total_seconds),
+        "time_reverse_pair_total_s": 0.0,
+        "time_f_s": float(inner_timing.get("time_f_s", 0.0) or 0.0),
+        "time_h_s": float(inner_timing.get("time_h_s", 0.0) or 0.0),
+        "time_scoring_s": float(inner_timing.get("time_scoring_s", 0.0) or 0.0),
+        "forward_pass_count": 1,
+        "reverse_attempted": False,
+        "reverse_selected": False,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "mps_available": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        "preferred_device": str(_preferred_torch_device()),
+        "model_device": str(device),
+        "tensor_device": tensor_device,
+        "model_cache_hit": bool(cache_hit),
+    }
+    if mps_mem_before:
+        timing_payload.update({
+            "mps_current_allocated_mb_before": float(mps_mem_before.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_before": float(mps_mem_before.get("mps_driver_allocated_mb", 0.0)),
+        })
+    if mps_mem_after:
+        timing_payload.update({
+            "mps_current_allocated_mb_after": float(mps_mem_after.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_after": float(mps_mem_after.get("mps_driver_allocated_mb", 0.0)),
+        })
+    diagnostics["matchformer_variant"] = str(variant)
+    diagnostics["matchformer_loader"] = "strict_repo_debug"
+    diagnostics["matchformer_checkpoint_path"] = matcher_meta.get("ckpt_path")
+    diagnostics["matchformer_repo_dir"] = matcher_meta.get("repo_dir")
+    diagnostics["matchformer_model_class"] = matcher_meta.get("model_class")
+    diagnostics["timing"] = timing_payload
+    return int(num_matches), int(num_inliers), float(score), direction, diagnostics
+
+
+def _match_roma_v2_debug(
+    img1: Image.Image,
+    img2: Image.Image,
+    confidence_threshold: float = LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
+    full_diagnostics: bool = False,
+) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
+    total_started_at = time.perf_counter()
+    cache_hit = "outdoor" in _roma_v2_matchers
+    model_load_started_at = time.perf_counter()
+    matcher, matcher_meta = _load_roma_v2_debug_matcher()
+    model_load_seconds = time.perf_counter() - model_load_started_at
+    model_device = torch.device(str(matcher_meta.get("device", "cpu")))
+
+    width0, height0 = img1.size
+    width1, height1 = img2.size
+
+    resize_seconds = 0.0
+    tensor_transfer_seconds = 0.0
+    tensor_device = str(model_device)
+    loftr_started_at = time.perf_counter()
+    try:
+        warp, certainty = matcher.match(
+            img1.convert("RGB"),
+            img2.convert("RGB"),
+            device=str(model_device),
+        )
+    except TypeError:
+        warp, certainty = matcher.match(
+            img1.convert("RGB"),
+            img2.convert("RGB"),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"RoMa-v2 debug matcher forward failed: {exc}") from exc
+    try:
+        sampled_matches, sampled_certainty = matcher.sample(warp, certainty)
+    except Exception as exc:
+        raise RuntimeError(f"RoMa-v2 debug matcher sampling failed: {exc}") from exc
+    try:
+        points0_raw, points1_raw = matcher.to_pixel_coordinates(
+            sampled_matches,
+            int(height0),
+            int(width0),
+            int(height1),
+            int(width1),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"RoMa-v2 debug matcher coordinate conversion failed: {exc}") from exc
+    loftr_seconds = time.perf_counter() - loftr_started_at
+
+    points0 = _as_xy_points(points0_raw)
+    points1 = _as_xy_points(points1_raw)
+    scores = _as_score_vector(sampled_certainty)
+
+    cleanup_started_at = time.perf_counter()
+    mps_mem_after = _release_device_cache(device=model_device)
+    cleanup_seconds = time.perf_counter() - cleanup_started_at
+
+    diagnostics_started_at = time.perf_counter()
+    result = _build_native_loftr_diagnostics(
+        matcher_name="roma_v2_debug",
+        checkpoint="roma_v2:outdoor",
+        confidence_threshold=float(confidence_threshold),
+        points0=points0,
+        points1=points1,
+        scores=scores,
+        width0=int(width0),
+        height0=int(height0),
+        width1=int(width1),
+        height1=int(height1),
+        input_w=int(width0),
+        input_h=int(height0),
+        full_diagnostics=full_diagnostics,
+    )
+    diagnostics_seconds = time.perf_counter() - diagnostics_started_at
+    total_seconds = time.perf_counter() - total_started_at
+    num_matches, num_inliers, score, direction, diagnostics = result
+    inner_timing = diagnostics.get("timing") if isinstance(diagnostics, dict) and isinstance(diagnostics.get("timing"), dict) else {}
+
+    timing_payload = {
+        "time_model_load_s": float(model_load_seconds),
+        "time_resize_s": float(resize_seconds),
+        "time_tensor_transfer_s": float(tensor_transfer_seconds),
+        "time_loftr_s": float(loftr_seconds),
+        "time_loftr_forward_main_s": float(loftr_seconds),
+        "time_loftr_forward_reverse_s": 0.0,
+        "time_device_cleanup_s": float(cleanup_seconds),
+        "time_postprocess_s": float(diagnostics_seconds),
+        "time_pair_total_s": float(total_seconds),
+        "time_reverse_pair_total_s": 0.0,
+        "time_f_s": float(inner_timing.get("time_f_s", 0.0) or 0.0),
+        "time_h_s": float(inner_timing.get("time_h_s", 0.0) or 0.0),
+        "time_scoring_s": float(inner_timing.get("time_scoring_s", 0.0) or 0.0),
+        "forward_pass_count": 1,
+        "reverse_attempted": False,
+        "reverse_selected": False,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "mps_available": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        "preferred_device": str(_preferred_torch_device()),
+        "model_device": str(model_device),
+        "tensor_device": tensor_device,
+        "model_cache_hit": bool(cache_hit),
+    }
+    if mps_mem_after:
+        timing_payload.update({
+            "mps_current_allocated_mb_after": float(mps_mem_after.get("mps_current_allocated_mb", 0.0)),
+            "mps_driver_allocated_mb_after": float(mps_mem_after.get("mps_driver_allocated_mb", 0.0)),
+        })
+
+    diagnostics["roma_variant"] = "outdoor"
+    diagnostics["roma_loader"] = "romatch_debug"
+    diagnostics["roma_model_class"] = matcher_meta.get("model_class")
+    diagnostics["timing"] = timing_payload
+    return int(num_matches), int(num_inliers), float(score), direction, diagnostics
 
 
 def match_image_pair(
@@ -3184,9 +4035,7 @@ def match_image_pair(
         matcher_preference = DEFAULT_PRODUCTION_MATCHER
     full_diagnostics = bool(options.get("full_diagnostics", False))
     requested_threshold = options.get("confidence_threshold")
-    default_threshold = (
-        0.5 if matcher_preference == "loftr_kornia_indoor_simplified" else LOFTR_NATIVE_CONFIDENCE_THRESHOLD
-    )
+    default_threshold = LOFTR_NATIVE_CONFIDENCE_THRESHOLD
     confidence_threshold = default_threshold
     if requested_threshold is not None:
         try:
@@ -3195,17 +4044,57 @@ def match_image_pair(
             confidence_threshold = default_threshold
     confidence_threshold = float(np.clip(confidence_threshold, 0.1, 1.0))
 
-    allowed_matchers = {"loftr_kornia_indoor_native", "loftr_kornia_indoor_simplified"}
+    allowed_matchers = {
+        "loftr_kornia_indoor_native",
+        "loftr_zju_indoor_ds_debug",
+        "loftr_zju_indoor_ot_debug",
+        "roma_v2_debug",
+        "matchformer_indoor_debug",
+        "matchformer_outdoor_debug",
+    }
     if matcher_preference not in allowed_matchers:
         raise ValueError(
             f"Unsupported matcher '{matcher_preference}'. "
-            "Supported matchers: 'loftr_kornia_indoor_simplified', 'loftr_kornia_indoor_native'."
+            "Supported matchers: 'loftr_kornia_indoor_native', "
+            "'loftr_zju_indoor_ds_debug', 'loftr_zju_indoor_ot_debug', "
+            "'roma_v2_debug', 'matchformer_indoor_debug', 'matchformer_outdoor_debug'."
         )
-
-    if matcher_preference == "loftr_kornia_indoor_simplified":
-        result = _match_loftr_kornia_indoor_simplified(
+    if matcher_preference == "loftr_zju_indoor_ds_debug":
+        result = _match_loftr_zju_variant_debug(
             img1=img1,
             img2=img2,
+            variant="indoor_ds",
+            confidence_threshold=confidence_threshold,
+            full_diagnostics=full_diagnostics,
+        )
+    elif matcher_preference == "loftr_zju_indoor_ot_debug":
+        result = _match_loftr_zju_variant_debug(
+            img1=img1,
+            img2=img2,
+            variant="indoor_ot",
+            confidence_threshold=confidence_threshold,
+            full_diagnostics=full_diagnostics,
+        )
+    elif matcher_preference == "roma_v2_debug":
+        result = _match_roma_v2_debug(
+            img1=img1,
+            img2=img2,
+            confidence_threshold=confidence_threshold,
+            full_diagnostics=full_diagnostics,
+        )
+    elif matcher_preference == "matchformer_indoor_debug":
+        result = _match_matchformer_variant_debug(
+            img1=img1,
+            img2=img2,
+            variant="indoor",
+            confidence_threshold=confidence_threshold,
+            full_diagnostics=full_diagnostics,
+        )
+    elif matcher_preference == "matchformer_outdoor_debug":
+        result = _match_matchformer_variant_debug(
+            img1=img1,
+            img2=img2,
+            variant="outdoor",
             confidence_threshold=confidence_threshold,
             full_diagnostics=full_diagnostics,
         )
@@ -3664,9 +4553,20 @@ def cluster_photos_graph_based(
         room_j = room_labels[j] if room_labels else None
         is_cross_room = rooms_are_different(room_i, room_j)
 
-        # In strict room mode, block cross-room temporal pairs entirely.
+        # In strict room mode, block cross-room temporal pairs except adjacent
+        # social-family pairs with strong semantic affinity (likely label error).
+        strict_recheck_allowed = (
+            is_cross_room
+            and STRICT_ROOM_LABEL_BLOCK
+            and allow_strict_cross_room_temporal_recheck(
+                room1=room_i,
+                room2=room_j,
+                temporal_dist=temporal_dist,
+                sem_sim=float(sem_sim),
+            )
+        )
         # Non-strict mode keeps the legacy behavior (skip only non-adjacent cross-room pairs).
-        if is_cross_room and (STRICT_ROOM_LABEL_BLOCK or temporal_dist > 1):
+        if is_cross_room and ((STRICT_ROOM_LABEL_BLOCK and not strict_recheck_allowed) or temporal_dist > 1):
             if STRICT_ROOM_LABEL_BLOCK:
                 logger.info(
                     f"  Temporal {photo_ids[i]} <-> {photo_ids[j]}: "
@@ -3687,6 +4587,15 @@ def cluster_photos_graph_based(
                 is_connected=False,
             )
             continue
+        if strict_recheck_allowed:
+            logger.info(
+                "  Temporal %s <-> %s: strict cross-room recheck enabled (%s vs %s, sem=%.3f)",
+                photo_ids[i],
+                photo_ids[j],
+                room_i,
+                room_j,
+                sem_sim,
+            )
 
         room_info = f" [cross-room: {room_i}/{room_j}]" if is_cross_room else ""
         logger.info(f"  Temporal {photo_ids[i]} <-> {photo_ids[j]} (dist={temporal_dist}): "
@@ -4159,6 +5068,14 @@ def cluster_photos_graph_based(
             diagnostics=diagnostics,
             min_inliers_required=effective_min_inliers,
         )
+        if is_matched and position_gap >= POSITION_GAP_THRESHOLD and float(score) < float(MIN_SCORE_FAR_APART):
+            is_matched = False
+            logger.info(
+                "    ✗ Rejected far-gap geometric link (gap=%s, score=%.3f < %.2f)",
+                position_gap,
+                float(score),
+                float(MIN_SCORE_FAR_APART),
+            )
         if is_matched and not accepts_very_far_pair(position_gap, float(sem_sim), int(num_inliers), float(score)):
             is_matched = False
             logger.info(
@@ -4330,6 +5247,7 @@ def cluster_photos_graph_based(
     # Stage 5: Deduplicate and split large clusters
     # -------------------------------------------------------------------------
     logger.info(f"Stage 5: Deduplicating and splitting clusters (max {max_cluster_size} photos each)...")
+    pair_metrics_lookup = _build_similarity_lookup(similarity_records)
 
     final_clusters = []
     duplicate_of_map: Dict[int, int] = dict(pre_pipeline_duplicate_of_map)
@@ -4342,6 +5260,8 @@ def cluster_photos_graph_based(
             adjacency,
             max_size=max_cluster_size,
             keep_duplicate_singletons=KEEP_DUPLICATE_SINGLETON_CLUSTERS,
+            room_labels=room_labels,
+            pair_metrics_lookup=pair_metrics_lookup,
         )
         final_clusters.extend(split_clusters)
         duplicate_of_map.update(cluster_duplicate_map)

@@ -37,6 +37,8 @@ If you change these assumptions, update:
 - Keep controllers/endpoints thin; push logic into pipeline/services.
 - Prefer explicit diagnostics over hidden heuristics.
 - Do not add semantic fallback shortcuts that bypass geometry gates without documenting why.
+- Do not add "safety fallback" matching/ranking paths in strict clustering flow.
+  If required metrics are missing, fail/reject with explicit reason logging.
 - When changing scoring thresholds, add/update regression checks in `scripts/`.
 - Keep logs actionable: include pair IDs, model/matcher, and key gate reasons.
 

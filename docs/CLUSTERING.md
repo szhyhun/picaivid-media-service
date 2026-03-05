@@ -20,6 +20,17 @@ Cluster edges require strict geometry checks:
 
 This intentionally rejects many semantic-only or weak-planar links.
 
+## Strictness Policy (No Safety Fallbacks)
+
+For clustering and pair ranking, "safe fallback" behavior is disallowed because it creates wrong pair choices.
+
+- If a strict metric is required and missing (`combined_score`, `overlap_ratio`, `geometric_inliers`), reject the edge for ranking.
+- Do not substitute alternate metrics when strict metrics are missing.
+- Do not silently downgrade to weaker ranking logic.
+- Emit explicit reason logs for rejected edges/links.
+
+Rule: be precise or fail with detailed reason.
+
 ## Key Outputs Persisted
 
 For each checked pair (when available):

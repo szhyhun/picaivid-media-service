@@ -12,6 +12,12 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
+For reproducible environments (recommended for staging/AWS), install from lock file:
+
+```bash
+pip install -r requirements.lock.txt
+```
+
 Worker (separate terminal):
 
 ```bash
@@ -26,6 +32,20 @@ Validate with logs:
 
 - `Loaded LoFTR matcher (indoor) on cuda`
 - `pair_debug_timing ... model_device=cuda ... preferred_device=cuda`
+
+## Debug Matcher Dependencies
+
+- `roma_v2_debug` requires `romatch` (already included in `requirements.txt` and `requirements.lock.txt`).
+- Optional RoMa device override:
+  - `ROMA_DEBUG_DEVICE=auto|cpu|mps|cuda`
+  - default `auto`: uses `cuda` when available; on macOS `mps` defaults to `cpu` for stability
+- Optional MatchFormer device override:
+  - `MATCHFORMER_DEBUG_DEVICE=auto|cpu|mps|cuda`
+  - default `auto`: uses `cuda` when available; on macOS `mps` defaults to `cpu` for stability
+- `matchformer_indoor_debug` / `matchformer_outdoor_debug` require:
+  - `MATCHFORMER_REPO_DIR`
+  - `MATCHFORMER_INDOOR_CKPT`
+  - `MATCHFORMER_OUTDOOR_CKPT`
 
 ## Local Dependencies
 

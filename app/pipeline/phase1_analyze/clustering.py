@@ -27,6 +27,7 @@ BEDROOM_SHOT_CAP = 2
 BATHROOM_SHOT_CAP_STRONG = 2
 BATHROOM_SHOT_CAP_WEAK = 1
 BATHROOM_STRONG_SCORE_THRESHOLD = 0.55
+ROOM_INSTANCE_POSITION_GAP = 10  # Same room name across nearby clusters; split only when far apart
 
 # Try to import the optimized pipeline (DINOv2 + LightGlue)
 try:
@@ -121,7 +122,6 @@ def _cluster_with_learned_matching(
                 img = ImageOps.exif_transpose(img)
             except Exception:
                 pass
-            img = img.resize((512, 384), Image.Resampling.LANCZOS)
             images.append(img)
             photo_ids.append(photo.id)
             room_labels.append(photo.room_override or photo.room_label or "unknown")
@@ -182,7 +182,7 @@ def _cluster_with_learned_matching(
 
     # Create RoomCluster records
     clusters = []
-    room_instance_counts = defaultdict(int)
+    room_instance_tracker: Dict[str, Dict[str, Any]] = {}
     for sequence_order, cluster_photos in enumerate(ordered_cluster_photo_groups):
         if not cluster_photos:
             continue
@@ -190,8 +190,11 @@ def _cluster_with_learned_matching(
         # Determine room type from majority vote
         room_type = _majority_room_label(cluster_photos)
         base_room_name = _room_instance_base_label(room_type)
-        room_instance_counts[base_room_name] += 1
-        room_instance_label = f"{base_room_name} {room_instance_counts[base_room_name]}"
+        room_instance_label = _room_instance_label_for_cluster(
+            base_room_name=base_room_name,
+            cluster_photos=cluster_photos,
+            tracker=room_instance_tracker,
+        )
 
         cluster = RoomCluster(
             job_id=job.id,
@@ -261,12 +264,15 @@ def _cluster_with_orb(
 
     ordered_cluster_photo_groups = _order_clusters_for_story(raw_cluster_photo_groups)
     ordered_cluster_photo_groups = _apply_post_cluster_shot_caps(ordered_cluster_photo_groups)
-    room_instance_counts = defaultdict(int)
+    room_instance_tracker: Dict[str, Dict[str, Any]] = {}
     for sequence_order, overlap_group in enumerate(ordered_cluster_photo_groups):
         room_type = _majority_room_label(overlap_group)
         base_room_name = _room_instance_base_label(room_type)
-        room_instance_counts[base_room_name] += 1
-        room_instance_label = f"{base_room_name} {room_instance_counts[base_room_name]}"
+        room_instance_label = _room_instance_label_for_cluster(
+            base_room_name=base_room_name,
+            cluster_photos=overlap_group,
+            tracker=room_instance_tracker,
+        )
 
         cluster = RoomCluster(
             job_id=job.id,
@@ -304,7 +310,7 @@ def _create_single_cluster(
         return []
 
     room_type = photos[0].room_override or photos[0].room_label or "unknown"
-    room_instance_label = f"{_room_instance_base_label(room_type)} 1"
+    room_instance_label = _room_instance_base_label(room_type)
 
     cluster = RoomCluster(
         job_id=job.id,
@@ -523,6 +529,7 @@ def _bucket_priority(bucket: str) -> int:
         "kitchen": 50,
         "dining_room": 60,
         "bedroom": 70,
+        "service_room": 80,
         "bathroom": 80,
         "office": 90,
         "laundry": 100,
@@ -559,7 +566,18 @@ def _as_bool(value: Any) -> bool:
 
 def _majority_room_label(photos: List[JobPhoto]) -> str:
     labels = [p.room_override or p.room_label or "unknown" for p in photos]
-    return max(set(labels), key=labels.count)
+    if not labels:
+        return "unknown"
+
+    counts: Dict[str, int] = defaultdict(int)
+    first_index: Dict[str, int] = {}
+    for idx, label in enumerate(labels):
+        counts[label] += 1
+        if label not in first_index:
+            first_index[label] = idx
+
+    # Deterministic tie-break: highest count, then first appearance in cluster order.
+    return max(counts.keys(), key=lambda label: (counts[label], -first_index[label]))
 
 
 def _room_instance_base_label(room_type: str | None) -> str:
@@ -589,6 +607,69 @@ def _room_instance_base_label(room_type: str | None) -> str:
         "unknown": "unknown",
     }
     return bucket_to_name.get(bucket, _normalize_room_label(room_type) or "unknown")
+
+
+def _cluster_position_center(photos: List[JobPhoto]) -> float:
+    positions = [int(p.position or 0) for p in photos]
+    if not positions:
+        return 0.0
+    return float(np.median(positions))
+
+
+def _cluster_floor_tag(photos: List[JobPhoto]) -> str | None:
+    floor_keys = (
+        "floor",
+        "floor_label",
+        "floor_name",
+        "level",
+        "story",
+        "storey",
+    )
+    for photo in photos:
+        metadata = photo.manual_metadata if isinstance(photo.manual_metadata, dict) else {}
+        for key in floor_keys:
+            value = metadata.get(key)
+            if value is None:
+                continue
+            tag = str(value).strip().lower()
+            if tag:
+                return tag
+    return None
+
+
+def _room_instance_label_for_cluster(
+    base_room_name: str,
+    cluster_photos: List[JobPhoto],
+    tracker: Dict[str, Dict[str, Any]],
+) -> str:
+    state = tracker.get(base_room_name)
+    pos_center = _cluster_position_center(cluster_photos)
+    floor_tag = _cluster_floor_tag(cluster_photos)
+
+    if state is None:
+        state = {"index": 1, "last_pos_center": pos_center, "last_floor_tag": floor_tag}
+        tracker[base_room_name] = state
+    else:
+        last_pos_center = float(state.get("last_pos_center", pos_center))
+        last_floor_tag = state.get("last_floor_tag")
+
+        is_new_instance = False
+        if floor_tag and last_floor_tag and floor_tag != last_floor_tag:
+            is_new_instance = True
+        elif abs(pos_center - last_pos_center) > float(ROOM_INSTANCE_POSITION_GAP):
+            is_new_instance = True
+
+        if is_new_instance:
+            state["index"] = int(state.get("index", 1)) + 1
+
+        state["last_pos_center"] = pos_center
+        if floor_tag:
+            state["last_floor_tag"] = floor_tag
+
+    instance_index = int(state.get("index", 1))
+    if instance_index <= 1:
+        return base_room_name
+    return f"{base_room_name} {instance_index}"
 
 
 def _bathroom_cluster_is_strong(photos: List[JobPhoto]) -> bool:
@@ -675,7 +756,7 @@ def _order_clusters_for_story(
     cluster_photo_groups: List[List[JobPhoto]],
     duplicate_of_map: Dict[int, int] | None = None,
 ) -> List[List[JobPhoto]]:
-    """Order clusters in a real-estate story arc with opposite-side preference."""
+    """Order clusters in a real-estate story arc with upload-order continuity."""
     duplicate_of_map = duplicate_of_map or {}
 
     descriptors = []
@@ -686,6 +767,7 @@ def _order_clusters_for_story(
         room_labels = [p.room_override or p.room_label or "unknown" for p in photos]
         room_type = max(set(room_labels), key=room_labels.count)
         bucket = _room_bucket(room_type)
+        story_bucket = "service_room" if bucket in {"bathroom", "laundry"} else bucket
 
         positions = [p.position or 0 for p in photos]
         pos_center = float(np.median(positions)) if positions else 0.0
@@ -698,6 +780,7 @@ def _order_clusters_for_story(
             {
                 "photos": photos,
                 "room_bucket": bucket,
+                "story_bucket": story_bucket,
                 "stage": stage,
                 "pos_center": pos_center,
                 "quality": quality,
@@ -718,7 +801,7 @@ def _order_clusters_for_story(
         masters.sort(
             key=lambda d: (
                 -d["master_priority"],
-                _bucket_priority(d["room_bucket"]),
+                _bucket_priority(d["story_bucket"]),
                 d["pos_center"],
                 -d["quality"],
             )
@@ -726,27 +809,15 @@ def _order_clusters_for_story(
 
         normals_by_bucket = defaultdict(list)
         for desc in normals:
-            normals_by_bucket[desc["room_bucket"]].append(desc)
+            normals_by_bucket[desc["story_bucket"]].append(desc)
 
-        alternating = []
+        ordered_normals = []
         for bucket in sorted(normals_by_bucket.keys(), key=_bucket_priority):
             bucket_normals = normals_by_bucket[bucket]
             bucket_normals.sort(key=lambda d: (d["pos_center"], -d["quality"]))
-
-            # Prefer opposite sides of the same room by alternating low/high capture positions.
-            left = 0
-            right = len(bucket_normals) - 1
-            take_left = True
-            while left <= right:
-                if take_left:
-                    alternating.append(bucket_normals[left])
-                    left += 1
-                else:
-                    alternating.append(bucket_normals[right])
-                    right -= 1
-                take_left = not take_left
+            ordered_normals.extend(bucket_normals)
 
         ordered.extend(masters)
-        ordered.extend(alternating)
+        ordered.extend(ordered_normals)
 
     return [desc["photos"] for desc in ordered]
