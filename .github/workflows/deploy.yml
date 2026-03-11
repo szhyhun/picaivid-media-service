@@ -1,0 +1,81 @@
+name: Deploy Media Service via SSM
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_MEDIA_INSTANCE_ID }}
+      DEPLOY_PATH: ${{ vars.MEDIA_DEPLOY_PATH }}
+      DEPLOY_REF: ${{ github.ref_name }}
+      SERVICE_API: picaivid-media-api
+      SERVICE_WORKER: picaivid-media-worker
+      RESTART_API: ${{ vars.MEDIA_RESTART_API }}
+      CUDA_WHL_INDEX: https://download.pytorch.org/whl/cu124
+    steps:
+      - name: Validate required variables
+        run: |
+          test -n "${AWS_REGION}" || (echo "Missing repo variable AWS_REGION" && exit 1)
+          test -n "${EC2_INSTANCE_ID}" || (echo "Missing repo variable EC2_MEDIA_INSTANCE_ID" && exit 1)
+          test -n "${DEPLOY_PATH}" || (echo "Missing repo variable MEDIA_DEPLOY_PATH" && exit 1)
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger SSM deploy command
+        id: ssm
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --region "${AWS_REGION}" \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy media-service ${GITHUB_SHA}" \
+            --parameters commands="[
+              \"set -euo pipefail\",
+              \"cd ${DEPLOY_PATH}\",
+              \"git fetch --all --prune\",
+              \"git checkout ${DEPLOY_REF}\",
+              \"git pull --ff-only\",
+              \"python3 -m venv venv || true\",
+              \"source venv/bin/activate\",
+              \"pip install -U pip\",
+              \"pip install -r requirements.lock.txt\",
+              \"pip uninstall -y torch torchvision torchaudio || true\",
+              \"pip install --index-url ${CUDA_WHL_INDEX} torch torchvision torchaudio\",
+              \"python -c 'import torch; print(\\\"cuda_available=\\\", torch.cuda.is_available())'\",
+              \"sudo systemctl restart ${SERVICE_WORKER}\",
+              \"if [ \\\"${RESTART_API}\\\" = \\\"1\\\" ]; then sudo systemctl restart ${SERVICE_API}; fi\",
+              \"sudo systemctl --no-pager --full status ${SERVICE_WORKER} | head -n 40\"
+            ]" \
+            --query "Command.CommandId" \
+            --output text)
+          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait and verify command
+        run: |
+          aws ssm wait command-executed \
+            --region "${AWS_REGION}" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${EC2_INSTANCE_ID}"
+
+          STATUS=$(aws ssm get-command-invocation \
+            --region "${AWS_REGION}" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${EC2_INSTANCE_ID}" \
+            --query "Status" \
+            --output text)
+
+          echo "SSM command status: ${STATUS}"
+          test "${STATUS}" = "Success"

@@ -66,4 +66,10 @@ This service expects local infrastructure from `picaivid-rails/docker-compose.ym
 - `docs/ARCHITECTURE.md` - Runtime architecture and ownership boundaries
 - `docs/CLUSTERING.md` - Current clustering and geometry behavior
 - `docs/AWS_SETUP.md` - Minimal AWS deployment setup
+- `docs/AWS_DEPLOYMENT.md` - Full AWS runbook (all apps, CD, Spot cost control)
+- `scripts/aws/` - GPU instance start/stop/status cost-control scripts
+- `scripts/aws/bootstrap-ec2.sh` - EC2 bootstrap for media-service GPU host
+- `.github/workflows/deploy.yml` - GitHub Actions OIDC + SSM deploy workflow
+- `deploy/systemd/` - Media API/worker service unit templates
+- `deploy/env/` - Example env files for media API/worker systemd services
 - `scripts/baselines/README.md` - Clustering baseline regression checks

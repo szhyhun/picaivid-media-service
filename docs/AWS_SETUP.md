@@ -1,6 +1,9 @@
-# AWS Setup (Minimal)
+# AWS Setup (Media-Service Focus)
 
-This is the minimum setup to run media-service workloads in AWS.
+This document is media-service specific.
+
+For full-stack AWS deployment (Rails + React + media-service + CD + cost scripts), use:
+- `AWS_DEPLOYMENT.md`
 
 ## 1) Core Services
 
@@ -45,24 +48,19 @@ Optional device override for RoMa debug matcher:
 Optional device override for MatchFormer debug matcher:
 - `MATCHFORMER_DEBUG_DEVICE=auto|cpu|mps|cuda`
 
-## 3.1) Dependency Lock Strategy (Recommended)
+## 3.1) Dependency Strategy for GPU
 
-To keep AWS behavior consistent with local runs:
+`requirements.lock.txt` is useful for deterministic local/dev environments, but do not assume it implies CUDA-enabled PyTorch on AWS GPU hosts.
 
-- Build/install with `requirements.lock.txt` (fully pinned from working venv).
-- Use `requirements.txt` only for local iteration when intentionally updating dependencies.
-
-Example:
+For GPU worker machines/containers, install CUDA Torch explicitly:
 
 ```bash
-pip install -r requirements.lock.txt
+pip uninstall -y torch torchvision torchaudio
+pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-When intentionally updating dependencies, regenerate the lock file from a validated venv:
-
-```bash
-./venv/bin/pip freeze | LC_ALL=C sort > requirements.lock.txt
-```
+If this check is false, matching will run on CPU and be significantly slower.
 
 ## 4) Deploy Shape
 

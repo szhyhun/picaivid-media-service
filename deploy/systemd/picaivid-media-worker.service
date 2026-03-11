@@ -1,0 +1,16 @@
+[Unit]
+Description=Picaivid Media Service Worker
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/srv/picaivid/picaivid-media-service
+EnvironmentFile=/etc/picaivid/media-worker.env
+ExecStart=/usr/bin/bash -lc 'source venv/bin/activate && python -m app.worker'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
