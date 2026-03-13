@@ -2,7 +2,7 @@
 set -euo pipefail
 
 : "${GPU_INSTANCE_ID:?GPU_INSTANCE_ID is required}"
-AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_REGION="${AWS_REGION:-us-west-2}"
 
 profile_args=()
 if [[ -n "${AWS_PROFILE:-}" ]]; then

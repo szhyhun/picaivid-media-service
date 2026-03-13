@@ -6,9 +6,9 @@ Build room-consistent clusters and transition-safe ordering from listing photos.
 
 ## Current Matching Path
 
-- Matcher: `loftr_kornia_indoor_native`
-- Pair debug and production both run through native LoFTR diagnostics path
-- Reverse retry is enabled for weak forward results to reduce order sensitivity (`A->B` vs `B->A`)
+- Production default matcher: `loftr_kornia_indoor_native`
+- Pair debug can also run strict debug-only matchers (`ZJU`, `RoMa-v2`, `MatchFormer`)
+- Reverse retry is enabled only for weak forward native results to reduce order sensitivity (`A->B` vs `B->A`)
 
 ## Edge Acceptance (High Level)
 

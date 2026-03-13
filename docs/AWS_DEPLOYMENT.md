@@ -9,7 +9,7 @@ Scope:
 
 ## 1) Recommended Architecture
 
-- Region: pick one and keep everything there (suggest `us-east-1` for pricing/capacity).
+- Region: pick one and keep everything there. Examples below use the active production region.
 - S3: one bucket for photos/renders/artifacts.
 - SQS: one main queue for jobs (DLQ can be added next).
 - EC2 app instance (small, always on):
@@ -26,7 +26,7 @@ This is simpler and cheaper than ECS/Kubernetes for your current stage.
 
 Use x86 burstable first for compatibility:
 - `t3a.small` or `t3a.medium`.
-- AWS EC2 T3 page shows `t3a.small` around `$0.0188/hr` in `us-east-1` (Linux).
+- Verify current price in your chosen region before launch.
 
 If you want Graviton later, migrate to `t4g.*` after confirming gem/node native deps.
 
@@ -47,7 +47,7 @@ aws ec2 describe-spot-price-history \
   --instance-types g4dn.xlarge \
   --product-descriptions "Linux/UNIX" \
   --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --region us-east-1 \
+  --region "${AWS_REGION:-us-west-2}" \
   --max-items 20 \
   --query 'SpotPriceHistory[].{AZ:AvailabilityZone,Price:SpotPrice,Time:Timestamp}' \
   --output table
@@ -72,9 +72,9 @@ aws ec2 describe-spot-price-history \
 Create bucket, example:
 - `picaivid-prod-media`
 
-Enable:
-- versioning
-- lifecycle policies (move stale outputs to cheaper storage)
+Recommended:
+- keep versioning off unless you explicitly need rollback/delete protection
+- add lifecycle policies once object growth becomes material
 
 ## 4.2 SQS
 
@@ -289,7 +289,7 @@ Use provided scripts in `scripts/aws/`:
 Usage:
 
 ```bash
-export AWS_REGION=us-east-1
+export AWS_REGION=us-west-2
 export GPU_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx
 ./scripts/aws/gpu-start.sh
 ./scripts/aws/gpu-status.sh

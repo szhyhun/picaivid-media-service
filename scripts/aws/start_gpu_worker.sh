@@ -5,16 +5,16 @@
 #   DATABASE_URL - PostgreSQL connection string
 #   S3_BUCKET - S3 bucket name
 #   SQS_QUEUE_URL - SQS queue URL
-#   ECR_REGISTRY - ECR registry URL (e.g., 123456.dkr.ecr.us-east-1.amazonaws.com)
+#   ECR_REGISTRY - ECR registry URL (e.g., 123456.dkr.ecr.us-west-2.amazonaws.com)
 #
 # Optional:
-#   AWS_REGION - defaults to us-east-1
+#   AWS_REGION - defaults to us-west-2
 #   IMAGE_TAG - defaults to gpu-latest
 
 set -e
 
 # Defaults
-AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_REGION="${AWS_REGION:-us-west-2}"
 IMAGE_TAG="${IMAGE_TAG:-gpu-latest}"
 CONTAINER_NAME="picaivid-gpu-worker"
 

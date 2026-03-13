@@ -5,24 +5,20 @@ Stage 1 (cheap): DINOv2 embedding clustering
 - Keep clusters small (5-20 images)
 - Fast: one forward pass per image
 
-Stage 2 (medium): SuperPoint + LightGlue within clusters
-- Only match within each DINOv2 cluster
-- Build overlap graph
-- Medium cost: N*(N-1)/2 matches per cluster
+Stage 2 (medium): LoFTR within candidate groups
+- Match only promising pairs
+- Build overlap graph from geometric verification
+- Medium cost: dominant inference stage
 
 Stage 3 (selective SfM): Optional COLMAP
 - Only for clusters with 3+ images
 - Only if strong geometric consistency
 - Expensive: full SfM reconstruction
 
-This keeps 90% of compute small while getting high-quality results.
+This keeps most compute in cheap Stage 1 while preserving geometric quality.
 """
 import logging
-import os
-import sys
 import time
-import warnings
-from copy import deepcopy
 from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any
 from collections import defaultdict
 
@@ -32,6 +28,15 @@ import torch
 from PIL import Image, ImageOps
 
 from app.core.config import settings
+from app.pipeline.phase1_analyze.matcher_loaders import (
+    kornia_loftr_cache_hit,
+    load_loftr_checkpoint as _loader_load_loftr_checkpoint,
+    load_matchformer_debug_variant as _loader_load_matchformer_debug_variant,
+    load_roma_v2_debug_matcher as _loader_load_roma_v2_debug_matcher,
+    load_zju_loftr_debug_variant as _loader_load_zju_loftr_debug_variant,
+    matchformer_debug_cache_hit,
+    roma_debug_cache_hit,
+)
 
 if TYPE_CHECKING:
     from app.db.models import JobPhoto
@@ -277,7 +282,7 @@ def cluster_by_dinov2(
 
 
 # ============================================================================
-# STAGE 2: SuperPoint + LightGlue (within clusters)
+# STAGE 2: LoFTR geometric verification
 # ============================================================================
 
 # Matching thresholds - tuned for real estate photo transitions
@@ -2521,382 +2526,16 @@ def enforce_transition_quality(
     return refined_clusters
 
 
-# LightGlue/LoFTR model singleton
-_loftr_matchers: Dict[str, Any] = {}
-_zju_loftr_matchers: Dict[str, Any] = {}
-_zju_loftr_matcher_meta: Dict[str, Dict[str, str]] = {}
-_matchformer_matchers: Dict[str, Any] = {}
-_matchformer_matcher_meta: Dict[str, Dict[str, str]] = {}
-_roma_v2_matchers: Dict[str, Any] = {}
-_roma_v2_matcher_meta: Dict[str, Dict[str, str]] = {}
-_ZJU_DEBUG_ENV_BY_VARIANT: Dict[str, str] = {
-    "indoor_ds": "LOFTR_ZJU_INDOOR_DS_CKPT",
-    "indoor_ot": "LOFTR_ZJU_INDOOR_OT_CKPT",
-}
-_MATCHFORMER_DEBUG_ENV_BY_VARIANT: Dict[str, str] = {
-    "indoor": "MATCHFORMER_INDOOR_CKPT",
-    "outdoor": "MATCHFORMER_OUTDOOR_CKPT",
-}
-
-
-def _same_torch_device(a: torch.device, b: torch.device) -> bool:
-    if a.type != b.type:
-        return False
-    if a.type in {"cpu", "mps"}:
-        return True
-    if a.type == "cuda":
-        if a.index is None or b.index is None:
-            return True
-        return a.index == b.index
-    return a == b
-
-
-def _env_or_settings(name: str, default: str = "") -> str:
-    raw_env = str(os.getenv(name, "")).strip()
-    if raw_env:
-        return raw_env
-    raw_settings = getattr(settings, name, None)
-    if raw_settings is None:
-        return str(default)
-    return str(raw_settings).strip() or str(default)
-
-
-def _zju_debug_repo_dir() -> str:
-    repo_dir = _env_or_settings("LOFTR_ZJU_REPO_DIR", "")
-    if not repo_dir:
-        raise RuntimeError("ZJU debug matcher is missing env LOFTR_ZJU_REPO_DIR")
-    if not os.path.isdir(repo_dir):
-        raise RuntimeError(f"ZJU debug matcher repo path not found: {repo_dir}")
-    return repo_dir
-
-
-def _zju_debug_checkpoint_path(variant: str) -> Tuple[str, str]:
-    env_key = _ZJU_DEBUG_ENV_BY_VARIANT.get(str(variant))
-    if not env_key:
-        raise RuntimeError(f"Unsupported ZJU debug variant '{variant}'")
-    ckpt_path = _env_or_settings(env_key, "")
-    if not ckpt_path:
-        raise RuntimeError(f"ZJU debug matcher is missing env {env_key}")
-    if not os.path.isfile(ckpt_path):
-        raise RuntimeError(f"ZJU debug checkpoint not found for {variant}: {ckpt_path}")
-    return ckpt_path, env_key
-
-
 def _load_zju_loftr_debug_variant(variant: str) -> Tuple[Any, Dict[str, str]]:
-    variant = str(variant)
-    preferred = _preferred_torch_device()
-    if variant in _zju_loftr_matchers:
-        matcher = _zju_loftr_matchers[variant]
-        try:
-            current = next(matcher.parameters()).device
-        except Exception:
-            current = torch.device("cpu")
-        if not _same_torch_device(current, preferred):
-            matcher = matcher.to(preferred)
-            matcher.eval()
-            _zju_loftr_matchers[variant] = matcher
-            logger.info(
-                "Moved cached ZJU LoFTR debug matcher (%s) from %s to %s",
-                variant,
-                current,
-                preferred,
-            )
-        return matcher, dict(_zju_loftr_matcher_meta.get(variant, {}))
-
-    repo_dir = _zju_debug_repo_dir()
-    ckpt_path, env_key = _zju_debug_checkpoint_path(variant)
-    if repo_dir not in sys.path:
-        sys.path.insert(0, repo_dir)
-    try:
-        from src.loftr import LoFTR as ZJULoFTR, default_cfg as zju_default_cfg
-    except Exception as exc:
-        raise RuntimeError(
-            f"ZJU debug matcher failed importing repo modules from {repo_dir}: {exc}"
-        ) from exc
-
-    cfg = deepcopy(zju_default_cfg)
-    if isinstance(cfg.get("match_coarse"), dict):
-        cfg["match_coarse"].setdefault("sparse_spvs", False)
-
-    matcher = ZJULoFTR(config=cfg)
-    try:
-        checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
-    except Exception as exc:
-        raise RuntimeError(f"ZJU debug matcher failed loading checkpoint '{ckpt_path}': {exc}") from exc
-
-    state_dict = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else checkpoint
-    if not isinstance(state_dict, dict):
-        raise RuntimeError(
-            f"ZJU debug matcher checkpoint has invalid state_dict format: {ckpt_path}"
-        )
-
-    try:
-        incompatible = matcher.load_state_dict(state_dict, strict=False)
-    except Exception as exc:
-        raise RuntimeError(f"ZJU debug matcher failed loading state_dict for {variant}: {exc}") from exc
-
-    matcher = matcher.to(preferred)
-    matcher.eval()
-    _zju_loftr_matchers[variant] = matcher
-    _zju_loftr_matcher_meta[variant] = {
-        "variant": variant,
-        "repo_dir": repo_dir,
-        "ckpt_path": ckpt_path,
-        "env_key": env_key,
-        "model_class": matcher.__class__.__name__,
-        "missing_keys": str(len(getattr(incompatible, "missing_keys", []) or [])),
-        "unexpected_keys": str(len(getattr(incompatible, "unexpected_keys", []) or [])),
-    }
-    logger.info(
-        "Loaded ZJU LoFTR debug matcher (%s) from %s on %s [missing=%s unexpected=%s]",
-        variant,
-        ckpt_path,
-        preferred,
-        _zju_loftr_matcher_meta[variant]["missing_keys"],
-        _zju_loftr_matcher_meta[variant]["unexpected_keys"],
-    )
-    return matcher, dict(_zju_loftr_matcher_meta[variant])
-
-
-def _matchformer_debug_repo_dir() -> str:
-    repo_dir = _env_or_settings("MATCHFORMER_REPO_DIR", "")
-    if not repo_dir:
-        raise RuntimeError("MatchFormer debug matcher is missing env MATCHFORMER_REPO_DIR")
-    if not os.path.isdir(repo_dir):
-        raise RuntimeError(f"MatchFormer debug matcher repo path not found: {repo_dir}")
-    return repo_dir
-
-
-def _matchformer_debug_checkpoint_path(variant: str) -> Tuple[str, str]:
-    env_key = _MATCHFORMER_DEBUG_ENV_BY_VARIANT.get(str(variant))
-    if not env_key:
-        raise RuntimeError(f"Unsupported MatchFormer debug variant '{variant}'")
-    ckpt_path = _env_or_settings(env_key, "")
-    if not ckpt_path:
-        raise RuntimeError(f"MatchFormer debug matcher is missing env {env_key}")
-    if not os.path.isfile(ckpt_path):
-        raise RuntimeError(f"MatchFormer debug checkpoint not found for {variant}: {ckpt_path}")
-    return ckpt_path, env_key
-
-
-def _cfg_to_lower_dict(config: Any) -> Any:
-    if isinstance(config, dict):
-        return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
-    if isinstance(config, (list, tuple)):
-        converted = [_cfg_to_lower_dict(v) for v in config]
-        return type(config)(converted) if isinstance(config, tuple) else converted
-    if hasattr(config, "items"):
-        return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
-    return config
-
-
-def _matchformer_config_for_variant(cfg: Any, variant: str) -> Any:
-    if variant == "indoor":
-        cfg.MATCHFORMER.BACKBONE_TYPE = "largesea"
-        cfg.MATCHFORMER.SCENS = "indoor"
-    elif variant == "outdoor":
-        cfg.MATCHFORMER.BACKBONE_TYPE = "largela"
-        cfg.MATCHFORMER.SCENS = "outdoor"
-    else:
-        raise RuntimeError(f"Unsupported MatchFormer debug variant '{variant}'")
-
-    # Keep parity with the repo test/inference defaults.
-    cfg.MATCHFORMER.RESOLUTION = (8, 2)
-    cfg.MATCHFORMER.COARSE.D_MODEL = 256
-    cfg.MATCHFORMER.COARSE.D_FFN = 256
-    return cfg
+    return _loader_load_zju_loftr_debug_variant(str(variant))
 
 
 def _load_matchformer_debug_variant(variant: str) -> Tuple[Any, Dict[str, str]]:
-    variant = str(variant)
-    requested_device = _env_or_settings("MATCHFORMER_DEBUG_DEVICE", "auto").lower()
-    preferred = _preferred_torch_device()
-    if requested_device in {"", "auto"}:
-        # On macOS MPS, MatchFormer can trigger large CPU fallback buffers.
-        # Prefer CPU locally unless explicitly overridden.
-        preferred = torch.device("cpu") if preferred.type == "mps" else preferred
-    elif requested_device == "cpu":
-        preferred = torch.device("cpu")
-    elif requested_device == "mps":
-        mps_backend = getattr(torch.backends, "mps", None)
-        if mps_backend is None or not bool(mps_backend.is_available()):
-            raise RuntimeError("MatchFormer debug matcher requested MATCHFORMER_DEBUG_DEVICE=mps but MPS is unavailable")
-        preferred = torch.device("mps")
-    elif requested_device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("MatchFormer debug matcher requested MATCHFORMER_DEBUG_DEVICE=cuda but CUDA is unavailable")
-        preferred = torch.device("cuda")
-    else:
-        raise RuntimeError(
-            f"MatchFormer debug matcher has invalid MATCHFORMER_DEBUG_DEVICE='{requested_device}'. "
-            "Use one of: auto, cpu, mps, cuda."
-        )
-    if variant in _matchformer_matchers:
-        matcher = _matchformer_matchers[variant]
-        try:
-            current = next(matcher.parameters()).device
-        except Exception:
-            current = torch.device("cpu")
-        if not _same_torch_device(current, preferred):
-            matcher = matcher.to(preferred)
-            matcher.eval()
-            _matchformer_matchers[variant] = matcher
-            logger.info(
-                "Moved cached MatchFormer debug matcher (%s) from %s to %s",
-                variant,
-                current,
-                preferred,
-            )
-        return matcher, dict(_matchformer_matcher_meta.get(variant, {}))
-
-    repo_dir = _matchformer_debug_repo_dir()
-    ckpt_path, env_key = _matchformer_debug_checkpoint_path(variant)
-    if repo_dir not in sys.path:
-        sys.path.insert(0, repo_dir)
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r"Importing from timm\.models\.layers is deprecated, please import via timm\.layers",
-                category=FutureWarning,
-            )
-            from config.defaultmf import get_cfg_defaults
-            from model.matchformer import Matchformer
-    except Exception as exc:
-        raise RuntimeError(
-            f"MatchFormer debug matcher failed importing repo modules from {repo_dir}: {exc}"
-        ) from exc
-
-    try:
-        cfg = get_cfg_defaults()
-    except Exception as exc:
-        raise RuntimeError(f"MatchFormer debug matcher failed building default config: {exc}") from exc
-    cfg = _matchformer_config_for_variant(cfg, variant)
-    cfg_lower = _cfg_to_lower_dict(cfg)
-    model_cfg = cfg_lower.get("matchformer")
-    if not isinstance(model_cfg, dict):
-        raise RuntimeError("MatchFormer debug matcher config is invalid: missing 'matchformer' block")
-
-    matcher = Matchformer(config=model_cfg)
-    try:
-        checkpoint = torch.load(
-            ckpt_path,
-            map_location=torch.device("cpu"),
-            weights_only=False,
-        )
-    except TypeError:
-        checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
-    except Exception as exc:
-        raise RuntimeError(f"MatchFormer debug matcher failed loading checkpoint '{ckpt_path}': {exc}") from exc
-
-    if isinstance(checkpoint, dict):
-        nested_state = checkpoint.get("state_dict")
-        state_dict = nested_state if isinstance(nested_state, dict) else checkpoint
-    else:
-        state_dict = checkpoint
-    if not isinstance(state_dict, dict):
-        raise RuntimeError(
-            f"MatchFormer debug matcher checkpoint has invalid state_dict format: {ckpt_path}"
-        )
-
-    model_state_dict: Dict[str, Any] = {}
-    for key, value in state_dict.items():
-        normalized_key = str(key)
-        if normalized_key.startswith("matcher."):
-            normalized_key = normalized_key[len("matcher."):]
-        elif normalized_key.startswith("model.matcher."):
-            normalized_key = normalized_key[len("model.matcher."):]
-        elif normalized_key.startswith("model."):
-            normalized_key = normalized_key[len("model."):]
-        model_state_dict[normalized_key] = value
-
-    try:
-        incompatible = matcher.load_state_dict(model_state_dict, strict=False)
-    except Exception as exc:
-        raise RuntimeError(
-            f"MatchFormer debug matcher failed loading state_dict for {variant}: {exc}"
-        ) from exc
-
-    matcher = matcher.to(preferred)
-    matcher.eval()
-    _matchformer_matchers[variant] = matcher
-    _matchformer_matcher_meta[variant] = {
-        "variant": variant,
-        "repo_dir": repo_dir,
-        "ckpt_path": ckpt_path,
-        "env_key": env_key,
-        "model_class": matcher.__class__.__name__,
-        "requested_device": requested_device or "auto",
-        "missing_keys": str(len(getattr(incompatible, "missing_keys", []) or [])),
-        "unexpected_keys": str(len(getattr(incompatible, "unexpected_keys", []) or [])),
-    }
-    logger.info(
-        "Loaded MatchFormer debug matcher (%s) from %s on %s (requested=%s) [missing=%s unexpected=%s]",
-        variant,
-        ckpt_path,
-        preferred,
-        requested_device or "auto",
-        _matchformer_matcher_meta[variant]["missing_keys"],
-        _matchformer_matcher_meta[variant]["unexpected_keys"],
-    )
-    return matcher, dict(_matchformer_matcher_meta[variant])
+    return _loader_load_matchformer_debug_variant(str(variant))
 
 
 def _load_roma_v2_debug_matcher() -> Tuple[Any, Dict[str, str]]:
-    cache_key = "outdoor"
-    if cache_key in _roma_v2_matchers:
-        return _roma_v2_matchers[cache_key], dict(_roma_v2_matcher_meta.get(cache_key, {}))
-
-    requested_device = _env_or_settings("ROMA_DEBUG_DEVICE", "auto").lower()
-    preferred_device = _preferred_torch_device()
-    if requested_device in {"", "auto"}:
-        # On macOS MPS RoMa uses unsupported ops that bounce to CPU anyway.
-        # Prefer CPU locally for stable/consistent timing unless explicitly overridden.
-        model_device = torch.device("cpu") if preferred_device.type == "mps" else preferred_device
-    elif requested_device == "cpu":
-        model_device = torch.device("cpu")
-    elif requested_device == "mps":
-        mps_backend = getattr(torch.backends, "mps", None)
-        if mps_backend is None or not bool(mps_backend.is_available()):
-            raise RuntimeError("RoMa-v2 debug matcher requested ROMA_DEBUG_DEVICE=mps but MPS is unavailable")
-        model_device = torch.device("mps")
-    elif requested_device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("RoMa-v2 debug matcher requested ROMA_DEBUG_DEVICE=cuda but CUDA is unavailable")
-        model_device = torch.device("cuda")
-    else:
-        raise RuntimeError(
-            f"RoMa-v2 debug matcher has invalid ROMA_DEBUG_DEVICE='{requested_device}'. "
-            "Use one of: auto, cpu, mps, cuda."
-        )
-    try:
-        from romatch import roma_outdoor
-    except Exception as exc:
-        raise RuntimeError(
-            "RoMa-v2 debug matcher requires package 'romatch'. Install it in media-service venv first."
-        ) from exc
-
-    try:
-        matcher = roma_outdoor(device=str(model_device))
-    except TypeError:
-        matcher = roma_outdoor(device=model_device)
-    except Exception as exc:
-        raise RuntimeError(f"RoMa-v2 debug matcher failed to initialize: {exc}") from exc
-
-    _roma_v2_matchers[cache_key] = matcher
-    _roma_v2_matcher_meta[cache_key] = {
-        "variant": "outdoor",
-        "model_class": matcher.__class__.__name__,
-        "device": str(model_device),
-        "requested_device": requested_device or "auto",
-    }
-    logger.info(
-        "Loaded RoMa-v2 debug matcher (outdoor) on %s (requested=%s, preferred=%s)",
-        model_device,
-        requested_device or "auto",
-        preferred_device,
-    )
-    return matcher, dict(_roma_v2_matcher_meta[cache_key])
+    return _loader_load_roma_v2_debug_matcher()
 
 
 def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, Any] | None) -> str:
@@ -2922,48 +2561,8 @@ def _annotate_pair_source_with_oracle(pair_source: str, diagnostics: Dict[str, A
 
 
 def _load_loftr_checkpoint(checkpoint: str):
-    """Load and cache a specific LoFTR checkpoint."""
-    def _same_device(a: torch.device, b: torch.device) -> bool:
-        # On MPS, PyTorch may surface cached params as "mps:0" while preferred is "mps".
-        # Treat those as equivalent so we do not keep remapping the same model.
-        if a.type != b.type:
-            return False
-        if a.type in {"cpu", "mps"}:
-            return True
-        if a.type == "cuda":
-            if a.index is None or b.index is None:
-                return True
-            return a.index == b.index
-        return a == b
-
-    if checkpoint in _loftr_matchers:
-        matcher = _loftr_matchers[checkpoint]
-        preferred = _preferred_torch_device()
-        try:
-            current = next(matcher.parameters()).device
-        except Exception:
-            current = torch.device("cpu")
-        if not _same_device(current, preferred):
-            matcher = matcher.to(preferred)
-            matcher.eval()
-            _loftr_matchers[checkpoint] = matcher
-            logger.info(
-                "Moved cached LoFTR matcher (%s) from %s to %s",
-                checkpoint,
-                current,
-                preferred,
-            )
-        return matcher
-
-    device = _preferred_torch_device()
-    from kornia.feature import LoFTR
-
-    matcher = LoFTR(pretrained=checkpoint)
-    matcher = matcher.to(device)
-    matcher.eval()
-    _loftr_matchers[checkpoint] = matcher
-    logger.info("Loaded LoFTR matcher (%s) on %s", checkpoint, device)
-    return matcher
+    """Load and cache a specific Kornia LoFTR checkpoint."""
+    return _loader_load_loftr_checkpoint(str(checkpoint))
 
 
 def _as_xy_points(raw_points: Any) -> np.ndarray:
@@ -3544,7 +3143,7 @@ def _match_loftr_kornia_indoor_native(
     """Native Kornia LoFTR indoor debug path (no custom geometric scoring)."""
     total_started_at = time.perf_counter()
     checkpoint_name = "indoor"
-    cache_hit = checkpoint_name in _loftr_matchers
+    cache_hit = kornia_loftr_cache_hit(checkpoint_name)
     model_load_started_at = time.perf_counter()
     matcher = _load_loftr_checkpoint(checkpoint_name)
     model_load_seconds = time.perf_counter() - model_load_started_at
@@ -3772,7 +3371,7 @@ def _match_matchformer_variant_debug(
     full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     total_started_at = time.perf_counter()
-    cache_hit = str(variant) in _matchformer_matchers
+    cache_hit = matchformer_debug_cache_hit(str(variant))
     model_load_started_at = time.perf_counter()
     matcher, matcher_meta = _load_matchformer_debug_variant(variant)
     model_load_seconds = time.perf_counter() - model_load_started_at
@@ -3886,7 +3485,7 @@ def _match_roma_v2_debug(
     full_diagnostics: bool = False,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     total_started_at = time.perf_counter()
-    cache_hit = "outdoor" in _roma_v2_matchers
+    cache_hit = roma_debug_cache_hit()
     model_load_started_at = time.perf_counter()
     matcher, matcher_meta = _load_roma_v2_debug_matcher()
     model_load_seconds = time.perf_counter() - model_load_started_at
