@@ -17,7 +17,7 @@ from PIL import Image, ImageOps
 from sklearn.cluster import DBSCAN
 from sqlalchemy.orm import Session
 
-from app.db.models import Job, JobPhoto, RoomCluster
+from app.db.models import Job, JobPhoto, RoomCluster, TransitionSequence, TransitionSequenceStep
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,7 @@ def _cluster_with_learned_matching(
         metadata = {}
     duplicate_of_map: Dict[int, int] = metadata.get("duplicate_of_map", {})
     duplicates_dropped = bool(metadata.get("duplicates_dropped", False))
+    transition_sequences = metadata.get("transition_sequences", [])
 
     # Mark duplicate metadata on JobPhoto records.
     for photo in photo_map.values():
@@ -183,6 +184,7 @@ def _cluster_with_learned_matching(
     # Create RoomCluster records
     clusters = []
     room_instance_tracker: Dict[str, Dict[str, Any]] = {}
+    photo_to_cluster_id: Dict[int, int] = {}
     for sequence_order, cluster_photos in enumerate(ordered_cluster_photo_groups):
         if not cluster_photos:
             continue
@@ -208,6 +210,7 @@ def _cluster_with_learned_matching(
         for photo_order, photo in enumerate(cluster_photos):
             photo.room_cluster_id = cluster.id
             photo.cluster_order = photo_order
+            photo_to_cluster_id[int(photo.id)] = int(cluster.id)
 
         _compute_cluster_metrics(cluster, cluster_photos)
         clusters.append(cluster)
@@ -217,9 +220,83 @@ def _cluster_with_learned_matching(
             f"with {len(cluster_photos)} photos"
         )
 
+    _persist_transition_sequences(
+        db=db,
+        job_id=job.id,
+        sequences=transition_sequences,
+        photo_to_cluster_id=photo_to_cluster_id,
+        photo_map=photo_map,
+    )
+
     db.commit()
     logger.info(f"Created {len(clusters)} room clusters")
     return clusters
+
+
+def _persist_transition_sequences(
+    db: Session,
+    job_id: int,
+    sequences: List[Dict[str, Any]],
+    photo_to_cluster_id: Dict[int, int],
+    photo_map: Dict[int, JobPhoto],
+) -> None:
+    db.query(TransitionSequence).filter(TransitionSequence.job_id == job_id).delete(synchronize_session=False)
+    if not sequences:
+        return
+
+    for rank, sequence in enumerate(sequences):
+        photo_ids = [int(photo_id) for photo_id in sequence.get("photo_ids", [])]
+        if len(photo_ids) < 3:
+            continue
+        cluster_ids = sorted(
+            {
+                photo_to_cluster_id.get(photo_id)
+                for photo_id in photo_ids
+                if photo_to_cluster_id.get(photo_id) is not None
+            }
+        )
+        room_type_hint = None
+        for photo_id in photo_ids:
+            photo = photo_map.get(photo_id)
+            if photo is None:
+                continue
+            room_type_hint = photo.room_override or photo.room_label
+            if room_type_hint:
+                break
+        record = TransitionSequence(
+            job_id=job_id,
+            sequence_rank=rank,
+            sequence_score=float(sequence.get("sequence_score", 0.0) or 0.0),
+            certification_status=str(sequence.get("certification_status") or "usable"),
+            room_type_hint=room_type_hint,
+            source_cluster_ids=cluster_ids,
+            motion_hint=str(sequence.get("motion_hint") or "smooth_transition"),
+        )
+        db.add(record)
+        db.flush()
+        edge_lookup = {
+            (
+                min(int(edge["photo_a_id"]), int(edge["photo_b_id"])),
+                max(int(edge["photo_a_id"]), int(edge["photo_b_id"])),
+            ): edge
+            for edge in sequence.get("edges", [])
+            if isinstance(edge, dict)
+        }
+        for step_index, photo_id in enumerate(photo_ids):
+            similarity_id = None
+            if step_index > 0:
+                left = min(photo_ids[step_index - 1], photo_id)
+                right = max(photo_ids[step_index - 1], photo_id)
+                edge = edge_lookup.get((left, right))
+                similarity_id = int(edge["id"]) if edge and edge.get("id") is not None else None
+            db.add(
+                TransitionSequenceStep(
+                    transition_sequence_id=record.id,
+                    step_index=step_index,
+                    photo_id=photo_id,
+                    photo_similarity_id=similarity_id,
+                )
+            )
 
 
 def _cluster_with_orb(

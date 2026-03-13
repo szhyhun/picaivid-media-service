@@ -14,11 +14,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.session import get_db
-from app.db.models import Job, Clip, JobPhoto, RoomCluster, AnalysisResult, PhotoSimilarity
+from app.db.models import Job, Clip, JobPhoto, RoomCluster, AnalysisResult, PhotoSimilarity, TransitionSequence
 from app.schemas.job import JobMessage, JobStatusResponse
 from app.schemas.clip import (
     ClipResponse, ClipListResponse, SourcePhotoInfo, ClusterInfo, AnalysisInfo,
-    ClipTransitionStep,
+    ClipTransitionStep, TransitionSequenceInfo, TransitionSequenceStepInfo,
     ClusterDebugResponse, ClusterListDebugResponse, PhotoDebugInfo, PhotoSimilarityInfo,
     PairDebugRequest, PairDebugResponse, PairDebugPhotoInfo, PairDebugStoredMetrics,
     PairDebugLiveMetrics, PairDebugPoint,
@@ -34,6 +34,7 @@ from app.pipeline.phase1_analyze.learned_matching import (
     FINAL_GATE_MIN_OVERLAP_RATIO,
     NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS,
 )
+from app.pipeline.phase1_analyze.pair_verification import summarize_pair_precision_first
 
 # Setup logging
 setup_logging()
@@ -79,6 +80,34 @@ def _safe_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _side_shift_label(side_a: int | None, side_b: int | None) -> str | None:
+    if side_a is None or side_b is None:
+        return None
+    labels = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
+    return f"{labels.get(int(side_a), '?')} -> {labels.get(int(side_b), '?')}"
+
+
+def _serialize_transition_sequence(sequence: TransitionSequence) -> TransitionSequenceInfo:
+    photo_ids = [int(step.photo_id) for step in sequence.steps]
+    return TransitionSequenceInfo(
+        sequence_rank=int(sequence.sequence_rank or 0),
+        sequence_score=float(sequence.sequence_score or 0.0),
+        certification_status=str(sequence.certification_status or "usable"),
+        room_type_hint=sequence.room_type_hint,
+        source_cluster_ids=[int(value) for value in (sequence.source_cluster_ids or [])],
+        motion_hint=sequence.motion_hint,
+        photo_ids=photo_ids,
+        steps=[
+            TransitionSequenceStepInfo(
+                step_index=int(step.step_index or 0),
+                photo_id=int(step.photo_id),
+                photo_similarity_id=_safe_int(step.photo_similarity_id),
+            )
+            for step in sequence.steps
+        ],
+    )
 
 
 def _build_pair_debug_strict_gate(
@@ -901,23 +930,28 @@ async def debug_pair_geometry(
         stored_metrics = PairDebugStoredMetrics(
             pair_source=sim.pair_source,
             dinov2_similarity=_safe_float(sim.dinov2_similarity),
-            geometric_matches=_safe_int(sim.geometric_matches),
-            geometric_inliers=_safe_int(sim.geometric_inliers),
-            geometric_score=_safe_float(sim.geometric_score),
+            raw_matches=_safe_int(getattr(sim, "raw_matches", None)),
+            f_inliers=_safe_int(getattr(sim, "f_inliers", None)),
+            f_inlier_ratio=_safe_float(getattr(sim, "f_inlier_ratio", None)),
+            coverage_4x4=_safe_float(getattr(sim, "coverage_4x4", None)),
+            grid_entropy=_safe_float(getattr(sim, "grid_entropy", None)),
+            overlap_ratio=_safe_float(getattr(sim, "overlap_ratio", None)),
+            combined_geometry_score=_safe_float(getattr(sim, "combined_geometry_score", None)),
+            median_flow_magnitude=_safe_float(getattr(sim, "median_flow_magnitude", None)),
+            near_positive_ratio=_safe_float(getattr(sim, "near_positive_ratio", None)),
+            near_negative_ratio=_safe_float(getattr(sim, "near_negative_ratio", None)),
+            split_score=_safe_float(getattr(sim, "split_score", None)),
+            depth_monotonicity_score=_safe_float(getattr(sim, "depth_monotonicity_score", None)),
+            dominant_foreground_side_a=_safe_int(getattr(sim, "dominant_foreground_side_a", None)),
+            dominant_foreground_side_b=_safe_int(getattr(sim, "dominant_foreground_side_b", None)),
+            foreground_support_persistence_penalty=_safe_float(getattr(sim, "foreground_support_persistence_penalty", None)),
+            crossing_penalty=_safe_float(getattr(sim, "crossing_penalty", None)),
+            order_proximity=_safe_float(getattr(sim, "order_proximity", None)),
+            pair_rank=_safe_float(getattr(sim, "pair_rank", None)),
+            certification_status=getattr(sim, "certification_status", None),
+            rejection_reason=getattr(sim, "rejection_reason", None),
             direction_dx=_safe_float(sim.direction_dx),
             direction_dy=_safe_float(sim.direction_dy),
-            cross_left_to_right=_safe_float(getattr(sim, "cross_left_to_right", None)),
-            cross_right_to_left=_safe_float(getattr(sim, "cross_right_to_left", None)),
-            cross_center_to_center=_safe_float(getattr(sim, "cross_center_to_center", None)),
-            kornia_overlap_ratio=_safe_float(getattr(sim, "kornia_overlap_ratio", None)),
-            kornia_side_overlap=_safe_float(getattr(sim, "kornia_side_overlap", None)),
-            kornia_center_overlap=_safe_float(getattr(sim, "kornia_center_overlap", None)),
-            kornia_inlier_ratio=_safe_float(getattr(sim, "kornia_inlier_ratio", None)),
-            kornia_transition_overlap_ok=(
-                bool(getattr(sim, "kornia_transition_overlap_ok"))
-                if getattr(sim, "kornia_transition_overlap_ok", None) is not None
-                else None
-            ),
             is_connected=bool(sim.is_connected) if sim.is_connected is not None else None,
         )
 
@@ -929,6 +963,20 @@ async def debug_pair_geometry(
         geometric_score=score,
         diagnostics=diagnostics if isinstance(diagnostics, dict) else None,
         min_inliers_required=NATIVE_EDGE_MIN_INLIERS,
+    )
+    live_summary = summarize_pair_precision_first(
+        photo_a_id=min(left_photo.id, right_photo.id),
+        photo_b_id=max(left_photo.id, right_photo.id),
+        image_a=left_image,
+        image_b=right_image,
+        dinov2_similarity=float(getattr(sim, "dinov2_similarity", 0.0) or 0.0),
+        position_a=int(left_photo.position or 0),
+        position_b=int(right_photo.position or 0),
+        depth_cache={},
+        num_matches=int(num_matches),
+        num_inliers=int(num_inliers),
+        direction=direction,
+        diagnostics=diagnostics,
     )
 
     live_metrics = PairDebugLiveMetrics(
@@ -957,6 +1005,22 @@ async def debug_pair_geometry(
         active_match_count=_safe_int(diagnostics.get("active_match_count")) or int(num_matches),
         num_inliers=int(num_inliers),
         geometric_score=float(score),
+        pair_rank=float(live_summary.get("pair_rank", 0.0) or 0.0),
+        certification_status=str(live_summary.get("certification_status")) if live_summary.get("certification_status") is not None else None,
+        rejection_reason=str(live_summary.get("rejection_reason")) if live_summary.get("rejection_reason") is not None else None,
+        coverage_4x4=_safe_float(live_summary.get("coverage_4x4")),
+        grid_entropy=_safe_float(live_summary.get("grid_entropy")),
+        overlap_ratio=_safe_float(live_summary.get("overlap_ratio")),
+        combined_geometry_score=_safe_float(live_summary.get("combined_geometry_score")),
+        median_flow_magnitude=_safe_float(live_summary.get("median_flow_magnitude")),
+        near_positive_ratio=_safe_float(live_summary.get("near_positive_ratio")),
+        near_negative_ratio=_safe_float(live_summary.get("near_negative_ratio")),
+        split_score=_safe_float(live_summary.get("split_score")),
+        depth_monotonicity_score=_safe_float(live_summary.get("depth_monotonicity_score")),
+        dominant_foreground_side_a=_safe_int(live_summary.get("dominant_foreground_side_a")),
+        dominant_foreground_side_b=_safe_int(live_summary.get("dominant_foreground_side_b")),
+        foreground_support_persistence_penalty=_safe_float(live_summary.get("foreground_support_persistence_penalty")),
+        crossing_penalty=_safe_float(live_summary.get("crossing_penalty")),
         motion_label=(
             str(diagnostics.get("motion_label"))
             if diagnostics.get("motion_label") is not None
@@ -1225,12 +1289,22 @@ async def get_project_clusters_debug(
             for r in legacy_rows
         ]
 
+    transition_sequences = (
+        db.query(TransitionSequence)
+        .filter(TransitionSequence.job_id == job.id)
+        .all()
+    )
+    sequences_by_cluster: dict[int, list[TransitionSequenceInfo]] = {}
+    for sequence in transition_sequences:
+        serialized = _serialize_transition_sequence(sequence)
+        for cluster_id in serialized.source_cluster_ids:
+            sequences_by_cluster.setdefault(int(cluster_id), []).append(serialized)
+
     # Build similarity lookup: (photo_a, photo_b) -> similarity record
     sim_lookup = {}
     for sim in similarities:
         key = (min(sim.photo_a_id, sim.photo_b_id), max(sim.photo_a_id, sim.photo_b_id))
         sim_lookup[key] = sim
-    pair_segment_cache: dict[tuple[int, int], dict[str, float | None]] = {}
 
     # Get clusters info
     clusters = db.query(RoomCluster).filter(RoomCluster.job_id == job.id).all()
@@ -1268,45 +1342,6 @@ async def get_project_clusters_debug(
                 key = (min(photo_id, other_id), max(photo_id, other_id))
                 sim = sim_lookup.get(key)
                 if sim:
-                    segment_scores = _segment_scores_from_similarity(sim)
-                    if (
-                        segment_scores["cross_left_to_right_score"] is None
-                        and segment_scores["cross_right_to_left_score"] is None
-                        and segment_scores["cross_center_to_center_score"] is None
-                    ):
-                        segment_scores = _compute_pair_segment_scores(
-                            from_photo=photo_map.get(sim.photo_a_id),
-                            to_photo=photo_map.get(sim.photo_b_id),
-                            s3_client=s3_client,
-                            cache=pair_segment_cache,
-                        )
-                    kornia_metrics = _kornia_metrics_from_similarity(sim)
-                    sim_dx = _safe_float(sim.direction_dx)
-                    sim_dy = _safe_float(sim.direction_dy)
-                    sim_inliers = _safe_int(sim.geometric_inliers)
-                    sim_geo_score = _safe_float(sim.geometric_score)
-                    sim_verified = _is_geometrically_verified(
-                        geometric_inliers=sim_inliers,
-                        geometric_score=sim_geo_score,
-                        dx=sim_dx,
-                        dy=sim_dy,
-                        side_overlap=max(
-                            segment_scores["cross_left_to_right_score"] or 0.0,
-                            segment_scores["cross_right_to_left_score"] or 0.0,
-                        ),
-                        center_overlap=segment_scores["cross_center_to_center_score"],
-                        overlap_ratio=_safe_float(kornia_metrics["kornia_overlap_ratio"]),
-                    )
-                    sim_overlap_from_zone, sim_overlap_to_zone = _overlap_zones_from_direction(
-                        sim_dx if sim_verified else None,
-                        sim_dy if sim_verified else None,
-                    )
-                    sim_overlap_summary = None
-                    if sim_overlap_from_zone and sim_overlap_to_zone:
-                        sim_overlap_summary = (
-                            f"#{sim.photo_a_id} {sim_overlap_from_zone} overlaps with "
-                            f"#{sim.photo_b_id} {sim_overlap_to_zone}"
-                        )
                     photo_sims.append(PhotoSimilarityInfo(
                         photo_a_id=sim.photo_a_id,
                         photo_b_id=sim.photo_b_id,
@@ -1314,28 +1349,31 @@ async def get_project_clusters_debug(
                         photo_b_filename=photo_filename_map.get(sim.photo_b_id),
                         pair_source=sim.pair_source,
                         dinov2_similarity=sim.dinov2_similarity,
-                        geometric_matches=sim.geometric_matches,
-                        geometric_inliers=sim_inliers,
-                        geometric_score=sim_geo_score,
-                        direction_dx=sim_dx,
-                        direction_dy=sim_dy,
+                        raw_matches=_safe_int(getattr(sim, "raw_matches", None)),
+                        f_inliers=_safe_int(getattr(sim, "f_inliers", None)),
+                        f_inlier_ratio=_safe_float(getattr(sim, "f_inlier_ratio", None)),
+                        coverage_4x4=_safe_float(getattr(sim, "coverage_4x4", None)),
+                        grid_entropy=_safe_float(getattr(sim, "grid_entropy", None)),
+                        overlap_ratio=_safe_float(getattr(sim, "overlap_ratio", None)),
+                        homography_ratio=_safe_float(getattr(sim, "homography_ratio", None)),
+                        median_epipolar_error=_safe_float(getattr(sim, "median_epipolar_error", None)),
+                        median_flow_magnitude=_safe_float(getattr(sim, "median_flow_magnitude", None)),
+                        combined_geometry_score=_safe_float(getattr(sim, "combined_geometry_score", None)),
+                        near_positive_ratio=_safe_float(getattr(sim, "near_positive_ratio", None)),
+                        near_negative_ratio=_safe_float(getattr(sim, "near_negative_ratio", None)),
+                        split_score=_safe_float(getattr(sim, "split_score", None)),
+                        depth_monotonicity_score=_safe_float(getattr(sim, "depth_monotonicity_score", None)),
+                        dominant_foreground_side_a=_safe_int(getattr(sim, "dominant_foreground_side_a", None)),
+                        dominant_foreground_side_b=_safe_int(getattr(sim, "dominant_foreground_side_b", None)),
+                        foreground_support_persistence_penalty=_safe_float(getattr(sim, "foreground_support_persistence_penalty", None)),
+                        crossing_penalty=_safe_float(getattr(sim, "crossing_penalty", None)),
+                        order_proximity=_safe_float(getattr(sim, "order_proximity", None)),
+                        pair_rank=_safe_float(getattr(sim, "pair_rank", None)),
+                        certification_status=getattr(sim, "certification_status", None),
+                        rejection_reason=getattr(sim, "rejection_reason", None),
+                        direction_dx=_safe_float(sim.direction_dx),
+                        direction_dy=_safe_float(sim.direction_dy),
                         is_connected=bool(sim.is_connected),
-                        geometric_verified=sim_verified,
-                        overlap_from_zone=sim_overlap_from_zone,
-                        overlap_to_zone=sim_overlap_to_zone,
-                        overlap_summary=sim_overlap_summary,
-                        from_left_25_50_score=segment_scores["from_left_25_50_score"],
-                        from_right_50_75_score=segment_scores["from_right_50_75_score"],
-                        to_left_25_50_score=segment_scores["to_left_25_50_score"],
-                        to_right_50_75_score=segment_scores["to_right_50_75_score"],
-                        cross_left_to_right_score=segment_scores["cross_left_to_right_score"],
-                        cross_right_to_left_score=segment_scores["cross_right_to_left_score"],
-                        cross_center_to_center_score=segment_scores["cross_center_to_center_score"],
-                        kornia_overlap_ratio=kornia_metrics["kornia_overlap_ratio"],
-                        kornia_side_overlap=kornia_metrics["kornia_side_overlap"],
-                        kornia_center_overlap=kornia_metrics["kornia_center_overlap"],
-                        kornia_inlier_ratio=kornia_metrics["kornia_inlier_ratio"],
-                        kornia_transition_overlap_ok=kornia_metrics["kornia_transition_overlap_ok"],
                     ))
                     all_similarities.append(sim)
 
@@ -1355,14 +1393,14 @@ async def get_project_clusters_debug(
 
         # Compute summary stats
         avg_dinov2 = None
-        avg_geo = None
+        avg_pair_rank = None
         if all_similarities:
             dinov2_scores = [s.dinov2_similarity for s in all_similarities if s.dinov2_similarity is not None]
-            geo_scores = [s.geometric_score for s in all_similarities if s.geometric_score is not None]
+            rank_scores = [s.pair_rank for s in all_similarities if getattr(s, "pair_rank", None) is not None]
             if dinov2_scores:
                 avg_dinov2 = sum(dinov2_scores) / len(dinov2_scores)
-            if geo_scores:
-                avg_geo = sum(geo_scores) / len(geo_scores)
+            if rank_scores:
+                avg_pair_rank = sum(rank_scores) / len(rank_scores)
 
         cluster_responses.append(ClusterDebugResponse(
             cluster_id=clip.room_cluster_id or clip.id,
@@ -1373,8 +1411,9 @@ async def get_project_clusters_debug(
             total_photos=len(photo_ids),
             sequence_order=cluster.sequence_order if cluster else None,
             avg_dinov2_similarity=avg_dinov2,
-            avg_geometric_score=avg_geo,
-            has_direction_info=any(s.geometric_inliers and s.geometric_inliers >= 3 for s in all_similarities),
+            avg_pair_rank=avg_pair_rank,
+            has_direction_info=any(getattr(s, "f_inliers", None) and s.f_inliers >= 3 for s in all_similarities),
+            sequences=sequences_by_cluster.get(int(clip.room_cluster_id or clip.id), []),
         ))
 
     return ClusterListDebugResponse(

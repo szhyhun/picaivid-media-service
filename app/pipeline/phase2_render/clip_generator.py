@@ -328,7 +328,7 @@ def _build_direction_prompt_guidance(
                     direction_dx,
                     direction_dy,
                     dinov2_similarity,
-                    geometric_inliers
+                    f_inliers
                 FROM photo_similarities
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a_id

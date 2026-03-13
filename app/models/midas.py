@@ -171,6 +171,12 @@ class MiDaSModel:
             outputs = MiDaSModel._model(**inputs)
             predicted_depth = outputs.predicted_depth
 
+        # MPS does not implement bicubic upsample for this op path.
+        # Keep model inference on the selected device, then move only the
+        # interpolation step to CPU to avoid global MPS fallback.
+        if predicted_depth.device.type == "mps":
+            predicted_depth = predicted_depth.cpu()
+
         # Interpolate to original size
         prediction = torch.nn.functional.interpolate(
             predicted_depth.unsqueeze(1),

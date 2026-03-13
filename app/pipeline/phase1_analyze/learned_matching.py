@@ -3139,6 +3139,8 @@ def _match_loftr_kornia_indoor_native(
     img2: Image.Image,
     confidence_threshold: float = LOFTR_NATIVE_CONFIDENCE_THRESHOLD,
     full_diagnostics: bool = False,
+    preprocessed_entry0: Optional[Dict[str, Any]] = None,
+    preprocessed_entry1: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, int, float, Tuple[float, float], Dict[str, Any]]:
     """Native Kornia LoFTR indoor debug path (no custom geometric scoring)."""
     total_started_at = time.perf_counter()
@@ -3151,8 +3153,8 @@ def _match_loftr_kornia_indoor_native(
 
     target_long_side = max(64, int(max(DEFAULT_LOFTR_INPUT_SIZE)))
     prep_started_at = time.perf_counter()
-    prep1 = _get_native_preprocessed_entry(img1, target_long_side=target_long_side)
-    prep2 = _get_native_preprocessed_entry(img2, target_long_side=target_long_side)
+    prep1 = preprocessed_entry0 or _get_native_preprocessed_entry(img1, target_long_side=target_long_side)
+    prep2 = preprocessed_entry1 or _get_native_preprocessed_entry(img2, target_long_side=target_long_side)
     img1_resized = prep1["gray_resized"]
     img2_resized = prep2["gray_resized"]
     meta0 = prep1["meta"]
@@ -5019,48 +5021,12 @@ def cluster_photos_optimized(
     room_labels: List[str] = None,
     return_metadata: bool = False,
 ) -> List[List[int]] | Tuple[List[List[int]], Dict[str, object]]:
-    """Run optimized graph-based clustering pipeline.
+    """Run the production precision-first clustering pipeline."""
+    from app.pipeline.phase1_analyze.precision_pipeline import cluster_photos_precision_first
 
-    Uses the "propose + verify" pattern:
-    1. DINOv2 embeddings propose candidate edges (top-K similar pairs)
-    2. Geometric verification (LoFTR/ORB) confirms overlap
-    3. Connected components = final clusters
-
-    This is cleaner than semantic-first clustering because:
-    - No artificial semantic boundaries to fix later
-    - Semantic similarity is a filter, not ground truth
-    - O(N × K) geometric checks instead of O(N²)
-
-    Args:
-        images: List of PIL Images
-        photo_ids: List of photo IDs
-        s3_client: S3 client (unused, for API compatibility)
-        db_session: Optional SQLAlchemy session for saving similarity data
-        job_id: Optional job ID for saving similarity data
-        room_labels: Optional list of room labels for each photo (used to penalize cross-room connections)
-
-    Returns:
-        Final clusters, or (clusters, metadata) when return_metadata=True.
-    """
-    n = len(images)
-    # Adaptive semantic neighborhood size:
-    # - small jobs: keep checks tight
-    # - medium jobs: balanced recall/compute
-    # - large jobs: broader proposal set
-    if n <= 80:
-        candidate_k = 4
-    elif n <= 140:
-        candidate_k = 5
-    else:
-        candidate_k = 6
-
-    logger.info("Adaptive candidate k=%s for %s photos", candidate_k, n)
-
-    return cluster_photos_graph_based(
-        images,
-        photo_ids,
-        k=candidate_k,
-        max_cluster_size=2,  # Hard cap: keep best transition pairs only
+    return cluster_photos_precision_first(
+        images=images,
+        photo_ids=photo_ids,
         db_session=db_session,
         job_id=job_id,
         room_labels=room_labels,

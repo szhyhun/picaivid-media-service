@@ -46,6 +46,11 @@ class ClipTransitionStep(BaseModel):
     dinov2_similarity: Optional[float] = None
     geometric_inliers: Optional[int] = None
     geometric_score: Optional[float] = None
+    pair_rank: Optional[float] = None
+    certification_status: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    overlap_ratio: Optional[float] = None
+    coverage_4x4: Optional[float] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
     recommendation: Optional[str] = None
@@ -67,6 +72,23 @@ class ClipTransitionStep(BaseModel):
     kornia_center_overlap: Optional[float] = None
     kornia_inlier_ratio: Optional[float] = None
     kornia_transition_overlap_ok: Optional[bool] = None
+
+
+class TransitionSequenceStepInfo(BaseModel):
+    step_index: int
+    photo_id: int
+    photo_similarity_id: Optional[int] = None
+
+
+class TransitionSequenceInfo(BaseModel):
+    sequence_rank: int
+    sequence_score: float
+    certification_status: str
+    room_type_hint: Optional[str] = None
+    source_cluster_ids: List[int] = []
+    motion_hint: Optional[str] = None
+    photo_ids: List[int] = []
+    steps: List[TransitionSequenceStepInfo] = []
 
 
 class AnalysisInfo(BaseModel):
@@ -123,28 +145,31 @@ class PhotoSimilarityInfo(BaseModel):
     photo_b_filename: Optional[str] = None
     pair_source: Optional[str] = None  # dinov2_topk, temporal_window, both
     dinov2_similarity: Optional[float] = None
-    geometric_matches: Optional[int] = None
-    geometric_inliers: Optional[int] = None
-    geometric_score: Optional[float] = None
+    raw_matches: Optional[int] = None
+    f_inliers: Optional[int] = None
+    f_inlier_ratio: Optional[float] = None
+    coverage_4x4: Optional[float] = None
+    grid_entropy: Optional[float] = None
+    overlap_ratio: Optional[float] = None
+    homography_ratio: Optional[float] = None
+    median_epipolar_error: Optional[float] = None
+    median_flow_magnitude: Optional[float] = None
+    combined_geometry_score: Optional[float] = None
+    near_positive_ratio: Optional[float] = None
+    near_negative_ratio: Optional[float] = None
+    split_score: Optional[float] = None
+    depth_monotonicity_score: Optional[float] = None
+    dominant_foreground_side_a: Optional[int] = None
+    dominant_foreground_side_b: Optional[int] = None
+    foreground_support_persistence_penalty: Optional[float] = None
+    crossing_penalty: Optional[float] = None
+    order_proximity: Optional[float] = None
+    pair_rank: Optional[float] = None
+    certification_status: Optional[str] = None
+    rejection_reason: Optional[str] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
     is_connected: bool = False
-    geometric_verified: bool = False
-    overlap_from_zone: Optional[str] = None
-    overlap_to_zone: Optional[str] = None
-    overlap_summary: Optional[str] = None
-    from_left_25_50_score: Optional[float] = None
-    from_right_50_75_score: Optional[float] = None
-    to_left_25_50_score: Optional[float] = None
-    to_right_50_75_score: Optional[float] = None
-    cross_left_to_right_score: Optional[float] = None
-    cross_right_to_left_score: Optional[float] = None
-    cross_center_to_center_score: Optional[float] = None
-    kornia_overlap_ratio: Optional[float] = None
-    kornia_side_overlap: Optional[float] = None
-    kornia_center_overlap: Optional[float] = None
-    kornia_inlier_ratio: Optional[float] = None
-    kornia_transition_overlap_ok: Optional[bool] = None
 
 
 class PhotoDebugInfo(BaseModel):
@@ -174,8 +199,9 @@ class ClusterDebugResponse(BaseModel):
     sequence_order: Optional[int] = None
     # Summary stats
     avg_dinov2_similarity: Optional[float] = None
-    avg_geometric_score: Optional[float] = None
+    avg_pair_rank: Optional[float] = None
     has_direction_info: bool = False
+    sequences: List[TransitionSequenceInfo] = []
 
 
 class ClusterListDebugResponse(BaseModel):
@@ -226,19 +252,28 @@ class PairDebugPoint(BaseModel):
 class PairDebugStoredMetrics(BaseModel):
     pair_source: Optional[str] = None
     dinov2_similarity: Optional[float] = None
-    geometric_matches: Optional[int] = None
-    geometric_inliers: Optional[int] = None
-    geometric_score: Optional[float] = None
+    raw_matches: Optional[int] = None
+    f_inliers: Optional[int] = None
+    f_inlier_ratio: Optional[float] = None
+    coverage_4x4: Optional[float] = None
+    grid_entropy: Optional[float] = None
+    overlap_ratio: Optional[float] = None
+    combined_geometry_score: Optional[float] = None
+    median_flow_magnitude: Optional[float] = None
+    near_positive_ratio: Optional[float] = None
+    near_negative_ratio: Optional[float] = None
+    split_score: Optional[float] = None
+    depth_monotonicity_score: Optional[float] = None
+    dominant_foreground_side_a: Optional[int] = None
+    dominant_foreground_side_b: Optional[int] = None
+    foreground_support_persistence_penalty: Optional[float] = None
+    crossing_penalty: Optional[float] = None
+    order_proximity: Optional[float] = None
+    pair_rank: Optional[float] = None
+    certification_status: Optional[str] = None
+    rejection_reason: Optional[str] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
-    cross_left_to_right: Optional[float] = None
-    cross_right_to_left: Optional[float] = None
-    cross_center_to_center: Optional[float] = None
-    kornia_overlap_ratio: Optional[float] = None
-    kornia_side_overlap: Optional[float] = None
-    kornia_center_overlap: Optional[float] = None
-    kornia_inlier_ratio: Optional[float] = None
-    kornia_transition_overlap_ok: Optional[bool] = None
     is_connected: Optional[bool] = None
 
 
@@ -258,6 +293,22 @@ class PairDebugLiveMetrics(BaseModel):
     active_match_count: int = 0
     num_inliers: int = 0
     geometric_score: float = 0.0
+    pair_rank: float = 0.0
+    certification_status: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    coverage_4x4: Optional[float] = None
+    grid_entropy: Optional[float] = None
+    overlap_ratio: Optional[float] = None
+    combined_geometry_score: Optional[float] = None
+    median_flow_magnitude: Optional[float] = None
+    near_positive_ratio: Optional[float] = None
+    near_negative_ratio: Optional[float] = None
+    split_score: Optional[float] = None
+    depth_monotonicity_score: Optional[float] = None
+    dominant_foreground_side_a: Optional[int] = None
+    dominant_foreground_side_b: Optional[int] = None
+    foreground_support_persistence_penalty: Optional[float] = None
+    crossing_penalty: Optional[float] = None
     motion_label: Optional[str] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None

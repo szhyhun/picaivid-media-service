@@ -447,10 +447,10 @@ class Phase1Analyzer:
                 self.db.query(PhotoSimilarity)
                 .filter(PhotoSimilarity.job_id == job_id)
                 .filter(PhotoSimilarity.is_connected == 1)
-                .filter(PhotoSimilarity.geometric_inliers.isnot(None))
-                .filter(PhotoSimilarity.geometric_inliers >= 20)
-                .filter(PhotoSimilarity.geometric_score.isnot(None))
-                .filter(PhotoSimilarity.geometric_score >= 0.30)
+                .filter(PhotoSimilarity.f_inliers.isnot(None))
+                .filter(PhotoSimilarity.f_inliers >= 20)
+                .filter(PhotoSimilarity.pair_rank.isnot(None))
+                .filter(PhotoSimilarity.pair_rank >= 0.30)
                 .all()
             )
 
@@ -487,11 +487,11 @@ class Phase1Analyzer:
                     candidate.room_label = "dining room"
                     changed += 1
                     logger.info(
-                        "Photo %s room relabel: living room -> dining room (strong geometric dining link to %s, inliers=%s, score=%.3f)",
+                        "Photo %s room relabel: living room -> dining room (strong certified dining link to %s, inliers=%s, rank=%.3f)",
                         candidate.id,
                         other.id,
-                        int(sim.geometric_inliers or 0),
-                        float(sim.geometric_score or 0.0),
+                        int(sim.f_inliers or 0),
+                        float(sim.pair_rank or 0.0),
                     )
 
         if changed:

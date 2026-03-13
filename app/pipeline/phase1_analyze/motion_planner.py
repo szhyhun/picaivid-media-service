@@ -475,7 +475,7 @@ def _infer_motion_from_matching(
         row = db.execute(
             text(
                 """
-                SELECT direction_dx, direction_dy, geometric_inliers
+                SELECT direction_dx, direction_dy, f_inliers
                 FROM photo_similarities
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a
