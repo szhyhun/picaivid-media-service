@@ -28,6 +28,15 @@ BATHROOM_SHOT_CAP_STRONG = 2
 BATHROOM_SHOT_CAP_WEAK = 1
 BATHROOM_STRONG_SCORE_THRESHOLD = 0.55
 ROOM_INSTANCE_POSITION_GAP = 10  # Same room name across nearby clusters; split only when far apart
+UTILITY_ROOM_LABELS = {
+    "garage",
+    "storage",
+    "storage room",
+    "laundry room",
+    "utility room",
+    "mechanical room",
+    "boiler room",
+}
 
 # Try to import the optimized pipeline (DINOv3-backed semantics + LoFTR).
 try:
@@ -148,11 +157,20 @@ def _cluster_with_learned_matching(
     duplicate_of_map: Dict[int, int] = metadata.get("duplicate_of_map", {})
     duplicates_dropped = bool(metadata.get("duplicates_dropped", False))
     transition_sequences = metadata.get("transition_sequences", [])
+    utility_excluded_ids = {
+        int(photo.id)
+        for photo in photo_map.values()
+        if _should_exclude_utility_room(photo)
+    }
 
     # Mark duplicate metadata on JobPhoto records.
     for photo in photo_map.values():
         photo.is_duplicate = False
         photo.duplicate_of_photo_id = None
+        if int(photo.id) in utility_excluded_ids:
+            photo.exclude = True
+            photo.room_cluster_id = None
+            photo.cluster_order = None
     for dup_id, canonical_id in duplicate_of_map.items():
         dup_photo = photo_map.get(dup_id)
         if dup_photo is None:
@@ -171,7 +189,11 @@ def _cluster_with_learned_matching(
 
     raw_cluster_photo_groups = []
     for cluster_ids in cluster_id_lists:
-        cluster_photos = [photo_map[pid] for pid in cluster_ids if pid in photo_map]
+        cluster_photos = [
+            photo_map[pid]
+            for pid in cluster_ids
+            if pid in photo_map and int(pid) not in utility_excluded_ids
+        ]
         if cluster_photos:
             raw_cluster_photo_groups.append(cluster_photos)
 
@@ -231,6 +253,11 @@ def _cluster_with_learned_matching(
     db.commit()
     logger.info(f"Created {len(clusters)} room clusters")
     return clusters
+
+
+def _should_exclude_utility_room(photo: JobPhoto) -> bool:
+    label = _normalize_room_label(photo.room_override or photo.room_label)
+    return label in UTILITY_ROOM_LABELS
 
 
 def _persist_transition_sequences(
