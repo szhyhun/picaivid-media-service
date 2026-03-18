@@ -5,7 +5,14 @@ import logging
 import time
 from typing import Any, Dict, Iterable, List, Tuple
 
+try:
+    import torch as _torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
 import numpy as np
+from PIL import Image, ImageOps
 
 from app.db.models import JobPhoto, PhotoSimilarity
 from app.pipeline.phase1_analyze.candidate_retrieval import build_candidate_pairs
@@ -13,6 +20,9 @@ from app.pipeline.phase1_analyze.pair_verification import verify_pair_precision_
 from app.pipeline.phase1_analyze.sequence_builder import build_transition_sequences
 
 logger = logging.getLogger(__name__)
+PRE_PIPELINE_DUPLICATE_SIMILARITY_THRESHOLD = 0.99
+PRE_PIPELINE_DUPLICATE_MAX_GAP = 4
+PRE_PIPELINE_DUPLICATE_PHASH_MAX_DISTANCE = 8
 
 
 def _normalize_embedding(value: object) -> list[float] | None:
@@ -28,11 +38,12 @@ def _load_job_photo_context(
     db_session,
     photo_ids: list[int],
     room_labels: list[str] | None,
-) -> tuple[list[int], list[str], np.ndarray | None]:
+) -> tuple[list[int], list[str], np.ndarray | None, list[float]]:
     if db_session is None or not photo_ids:
         fallback_positions = list(range(len(photo_ids)))
         fallback_rooms = room_labels or ["unknown"] * len(photo_ids)
-        return fallback_positions, fallback_rooms, None
+        fallback_quality = [0.0] * len(photo_ids)
+        return fallback_positions, fallback_rooms, None, fallback_quality
 
     rows = (
         db_session.query(JobPhoto)
@@ -43,6 +54,7 @@ def _load_job_photo_context(
     positions: list[int] = []
     resolved_rooms: list[str] = []
     embeddings: list[list[float] | None] = []
+    quality_scores: list[float] = []
     for index, photo_id in enumerate(photo_ids):
         row = by_id.get(int(photo_id))
         positions.append(int(row.position or index) if row is not None else index)
@@ -53,10 +65,139 @@ def _load_job_photo_context(
         else:
             resolved_rooms.append("unknown")
         embeddings.append(_normalize_embedding(row.embedding if row is not None else None))
+        quality_scores.append(_photo_quality_score(row))
 
     if any(item is None for item in embeddings):
-        return positions, resolved_rooms, None
-    return positions, resolved_rooms, np.asarray(embeddings, dtype=np.float32)
+        return positions, resolved_rooms, None, quality_scores
+    return positions, resolved_rooms, np.asarray(embeddings, dtype=np.float32), quality_scores
+
+
+def _photo_quality_score(row: JobPhoto | None) -> float:
+    if row is None:
+        return 0.0
+    final_score = float(row.final_score or 0.0)
+    if final_score > 0.0:
+        return final_score
+    base_score = float(row.base_score or 0.0)
+    sharpness = float(row.sharpness or 0.0)
+    exposure = float(row.exposure_score or 0.0)
+    composition = float(row.composition_score or 0.0)
+    return 0.45 * base_score + 0.20 * sharpness + 0.20 * exposure + 0.15 * composition
+
+
+def _prefilter_obvious_duplicates(
+    image_list: list[object],
+    photo_ids: list[int],
+    positions: list[int],
+    room_labels: list[str],
+    embeddings: np.ndarray | None,
+    quality_scores: list[float],
+    similarity_threshold: float = PRE_PIPELINE_DUPLICATE_SIMILARITY_THRESHOLD,
+    max_gap: int = PRE_PIPELINE_DUPLICATE_MAX_GAP,
+) -> tuple[list[object], list[int], list[int], list[str], np.ndarray | None, dict[int, int]]:
+    if embeddings is None or len(photo_ids) <= 1:
+        return image_list, photo_ids, positions, room_labels, embeddings, {}
+
+    n = len(photo_ids)
+    duplicate_of_map: dict[int, int] = {}
+    removed_indices: set[int] = set()
+    perceptual_hashes = [_compute_perceptual_hash(image) for image in image_list]
+
+    for i in range(n):
+        if i in removed_indices:
+            continue
+        room_i = (room_labels[i] or "").strip().lower()
+        if not room_i or room_i == "unknown":
+            continue
+        for j in range(i + 1, min(n, i + int(max_gap) + 1)):
+            if j in removed_indices:
+                continue
+            room_j = (room_labels[j] or "").strip().lower()
+            if room_i != room_j or not room_j or room_j == "unknown":
+                continue
+            semantic_similarity = float(embeddings[i] @ embeddings[j])
+            hash_distance = _hash_distance(perceptual_hashes[i], perceptual_hashes[j])
+            is_duplicate_pair = semantic_similarity >= float(similarity_threshold)
+            if hash_distance is not None and hash_distance <= PRE_PIPELINE_DUPLICATE_PHASH_MAX_DISTANCE:
+                is_duplicate_pair = True
+            if not is_duplicate_pair:
+                continue
+            canonical = max(
+                (i, j),
+                key=lambda idx: (
+                    float(quality_scores[idx] if idx < len(quality_scores) else 0.0),
+                    -int(positions[idx] if idx < len(positions) else idx),
+                ),
+            )
+            duplicate = j if canonical == i else i
+            removed_indices.add(duplicate)
+            duplicate_of_map[int(photo_ids[duplicate])] = int(photo_ids[canonical])
+            logger.info(
+                "Precision pre-dedup duplicate %s -> %s (room=%s, sem=%.3f, hash_distance=%s, quality=%.3f<%.3f, gap=%s)",
+                photo_ids[duplicate],
+                photo_ids[canonical],
+                room_labels[duplicate],
+                semantic_similarity,
+                "n/a" if hash_distance is None else hash_distance,
+                float(quality_scores[duplicate] if duplicate < len(quality_scores) else 0.0),
+                float(quality_scores[canonical] if canonical < len(quality_scores) else 0.0),
+                abs(int(positions[duplicate]) - int(positions[canonical])),
+            )
+
+    if not duplicate_of_map:
+        return image_list, photo_ids, positions, room_labels, embeddings, {}
+
+    keep_indices = [idx for idx in range(n) if idx not in removed_indices]
+    filtered_images = [image_list[idx] for idx in keep_indices]
+    filtered_photo_ids = [int(photo_ids[idx]) for idx in keep_indices]
+    filtered_positions = [int(positions[idx]) for idx in keep_indices]
+    filtered_rooms = [room_labels[idx] for idx in keep_indices]
+    filtered_embeddings = embeddings[keep_indices] if embeddings is not None else None
+    logger.info(
+        "Precision pre-dedup summary: %s -> %s photos (removed=%s threshold=%.2f max_gap=%s)",
+        n,
+        len(filtered_photo_ids),
+        len(duplicate_of_map),
+        float(similarity_threshold),
+        int(max_gap),
+    )
+    return (
+        filtered_images,
+        filtered_photo_ids,
+        filtered_positions,
+        filtered_rooms,
+        filtered_embeddings,
+        duplicate_of_map,
+    )
+
+
+def _compute_perceptual_hash(image: object) -> int | None:
+    pil_image: Image.Image | None = None
+    if isinstance(image, Image.Image):
+        pil_image = image
+    elif isinstance(image, np.ndarray):
+        try:
+            pil_image = Image.fromarray(image)
+        except Exception:
+            return None
+    if pil_image is None:
+        return None
+    try:
+        grayscale = ImageOps.exif_transpose(pil_image).convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+        pixels = np.asarray(grayscale, dtype=np.int16)
+        diff = pixels[:, 1:] > pixels[:, :-1]
+        hash_value = 0
+        for bit in diff.flatten():
+            hash_value = (hash_value << 1) | int(bool(bit))
+        return hash_value
+    except Exception:
+        return None
+
+
+def _hash_distance(left: int | None, right: int | None) -> int | None:
+    if left is None or right is None:
+        return None
+    return int((left ^ right).bit_count())
 
 
 def _persist_embeddings(db_session, photo_ids: list[int], embeddings: np.ndarray) -> None:
@@ -90,8 +231,13 @@ def _persist_pair_records(db_session, job_id: int, pair_records: list[dict[str, 
         db_session.flush()
         return
     payloads = []
+    allowed_columns = set(PhotoSimilarity.__table__.columns.keys())
     for record in pair_records:
-        payload = {key: value for key, value in record.items() if key not in {"raw_matches_payload", "inlier_matches_payload", "hard_reject"}}
+        payload = {
+            key: value
+            for key, value in record.items()
+            if key in allowed_columns and key not in {"raw_matches_payload", "inlier_matches_payload", "hard_reject"}
+        }
         payload["job_id"] = int(job_id)
         payloads.append(payload)
     db_session.bulk_insert_mappings(PhotoSimilarity, payloads)
@@ -162,10 +308,19 @@ def cluster_photos_precision_first(
 
     logger.info("Precision-first pipeline start: photos=%s job_id=%s", len(photo_ids), job_id)
 
-    positions, resolved_room_labels, persisted_embeddings = _load_job_photo_context(
+    positions, resolved_room_labels, persisted_embeddings, quality_scores = _load_job_photo_context(
         db_session=db_session,
         photo_ids=photo_ids,
         room_labels=room_labels,
+    )
+    pre_pipeline_duplicate_of_map: dict[int, int] = {}
+    image_list, photo_ids, positions, resolved_room_labels, persisted_embeddings, pre_pipeline_duplicate_of_map = _prefilter_obvious_duplicates(
+        image_list=image_list,
+        photo_ids=photo_ids,
+        positions=positions,
+        room_labels=resolved_room_labels,
+        embeddings=persisted_embeddings,
+        quality_scores=quality_scores,
     )
     candidate_stage_started_at = time.perf_counter()
     embeddings, similarity, candidates = build_candidate_pairs(
@@ -183,6 +338,8 @@ def cluster_photos_precision_first(
 
     depth_cache: dict[int, np.ndarray] = {}
     preprocessed_cache: dict[int, dict[str, Any]] = {}
+    repeated_room_cue_cache: dict[int, dict[str, Any]] = {}
+    semantic_region_cache: dict[int, dict[str, Any]] = {}
     pair_records: list[dict[str, Any]] = []
     total_candidates = len(candidates)
     for idx, candidate in enumerate(candidates, start=1):
@@ -206,8 +363,12 @@ def cluster_photos_precision_first(
             dinov2_similarity=float(candidate.dinov2_similarity),
             position_a=int(positions[candidate.left_idx]),
             position_b=int(positions[candidate.right_idx]),
+            room_label_a=resolved_room_labels[candidate.left_idx],
+            room_label_b=resolved_room_labels[candidate.right_idx],
             depth_cache=depth_cache,
             preprocessed_cache=preprocessed_cache,
+            repeated_room_cue_cache=repeated_room_cue_cache,
+            semantic_region_cache=semantic_region_cache,
         )
         result["pair_source"] = candidate.pair_source
         result["photo_a_id"] = min(photo_a_id, photo_b_id)
@@ -215,7 +376,7 @@ def cluster_photos_precision_first(
         compact_result = {
             key: value
             for key, value in result.items()
-            if key not in {"raw_matches_payload", "inlier_matches_payload"}
+            if key not in {"raw_matches_payload", "inlier_matches_payload", "semantic_regions_left", "semantic_regions_right"}
         }
         pair_records.append(compact_result)
         logger.info(
@@ -231,6 +392,22 @@ def cluster_photos_precision_first(
             float(compact_result.get("crossing_penalty", 0.0) or 0.0),
             (time.perf_counter() - pair_started_at) * 1000.0,
         )
+
+    # Release per-photo caches so GPU tensors and numpy arrays are freed before
+    # the clustering/sequence steps that follow.  preprocessed_cache is the most
+    # important because it holds LoFTR native tensors which may occupy GPU VRAM.
+    preprocessed_cache.clear()
+    depth_cache.clear()
+    semantic_region_cache.clear()
+    repeated_room_cue_cache.clear()
+    if _HAS_TORCH:
+        try:
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+    logger.debug("Cleared per-photo caches and released device cache after pair loop")
 
     _persist_pair_records(db_session, job_id, pair_records)
 
@@ -265,8 +442,8 @@ def cluster_photos_precision_first(
 
     if return_metadata:
         return final_clusters, {
-            "duplicate_of_map": {},
-            "duplicates_dropped": False,
+            "duplicate_of_map": pre_pipeline_duplicate_of_map,
+            "duplicates_dropped": bool(pre_pipeline_duplicate_of_map),
             "pair_records": pair_records,
             "transition_sequences": transition_sequences,
             "similarity_matrix": similarity,

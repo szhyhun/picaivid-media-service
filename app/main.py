@@ -21,11 +21,12 @@ from app.schemas.clip import (
     ClipTransitionStep, TransitionSequenceInfo, TransitionSequenceStepInfo,
     ClusterDebugResponse, ClusterListDebugResponse, PhotoDebugInfo, PhotoSimilarityInfo,
     PairDebugRequest, PairDebugResponse, PairDebugPhotoInfo, PairDebugStoredMetrics,
-    PairDebugLiveMetrics, PairDebugPoint,
+    PairDebugLiveMetrics, PairDebugPoint, SemanticRegionInfo,
 )
 from app.pipeline.orchestrator import PipelineOrchestrator
 from app.pipeline.phase1_analyze.learned_matching import (
     match_image_pair,
+    _match_loftr_kornia_indoor_native,
     NATIVE_EDGE_MIN_INLIERS,
     NATIVE_EDGE_MIN_INLIER_RATIO,
     NATIVE_EDGE_MIN_OVERLAP_RATIO,
@@ -35,6 +36,7 @@ from app.pipeline.phase1_analyze.learned_matching import (
     NATIVE_EDGE_ALLOWED_GEOMETRY_MODELS,
 )
 from app.pipeline.phase1_analyze.pair_verification import summarize_pair_precision_first
+from app.models.warmup import warmup_core_models
 
 # Setup logging
 setup_logging()
@@ -52,6 +54,11 @@ app = FastAPI(
     docs_url="/docs" if settings.ENVIRONMENT == "development" else None,
     redoc_url="/redoc" if settings.ENVIRONMENT == "development" else None,
 )
+
+
+@app.on_event("startup")
+async def startup_warm_models() -> None:
+    warmup_core_models(context="api", include_loftr=False)
 
 # CORS
 app.add_middleware(
@@ -80,6 +87,26 @@ def _safe_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _pair_debug_point_from_dict(point: dict[str, object]) -> PairDebugPoint:
+    return PairDebugPoint(
+        x0=float(point.get("x0", 0.0)),
+        y0=float(point.get("y0", 0.0)),
+        x1=float(point.get("x1", 0.0)),
+        y1=float(point.get("y1", 0.0)),
+        dx=float(point.get("dx", 0.0)),
+        dy=float(point.get("dy", 0.0)),
+        label_a=str(point.get("label_a")) if point.get("label_a") is not None else None,
+        label_b=str(point.get("label_b")) if point.get("label_b") is not None else None,
+        region_type_a=str(point.get("region_type_a")) if point.get("region_type_a") is not None else None,
+        region_type_b=str(point.get("region_type_b")) if point.get("region_type_b") is not None else None,
+        is_anchor_match=bool(point.get("is_anchor_match")) if point.get("is_anchor_match") is not None else None,
+        is_window_match=bool(point.get("is_window_match")) if point.get("is_window_match") is not None else None,
+        is_background_match=bool(point.get("is_background_match")) if point.get("is_background_match") is not None else None,
+        is_object_match=bool(point.get("is_object_match")) if point.get("is_object_match") is not None else None,
+        semantic_accept=bool(point.get("semantic_accept")) if point.get("semantic_accept") is not None else None,
+    )
 
 
 def _side_shift_label(side_a: int | None, side_b: int | None) -> str | None:
@@ -801,7 +828,7 @@ async def debug_pair_geometry(
 
     raw_limit = payload.sample_limit
     if raw_limit is None:
-        sample_limit = 250
+        sample_limit = 1000
     else:
         sample_limit = max(int(raw_limit), 0)
 
@@ -871,16 +898,25 @@ async def debug_pair_geometry(
 
     try:
         matcher_started_at = time.perf_counter()
-        num_matches, num_inliers, score, direction, diagnostics = match_image_pair(
-            left_image,
-            right_image,
-            return_diagnostics=True,
-            debug_options={
-                "matcher": payload.matcher,
-                "confidence_threshold": payload.confidence_threshold,
-                "full_diagnostics": True,
-            },
-        )
+        normalized_matcher = str(payload.matcher or "").strip().lower()
+        if normalized_matcher in {"", "current", "default", "loftr_kornia_indoor_native"}:
+            num_matches, num_inliers, score, direction, diagnostics = _match_loftr_kornia_indoor_native(
+                img1=left_image,
+                img2=right_image,
+                confidence_threshold=float(payload.confidence_threshold),
+                full_diagnostics=True,
+            )
+        else:
+            num_matches, num_inliers, score, direction, diagnostics = match_image_pair(
+                left_image,
+                right_image,
+                return_diagnostics=True,
+                debug_options={
+                    "matcher": payload.matcher,
+                    "confidence_threshold": payload.confidence_threshold,
+                    "full_diagnostics": True,
+                },
+            )
         matcher_seconds = time.perf_counter() - matcher_started_at
     except Exception as err:
         message = str(err)
@@ -893,6 +929,17 @@ async def debug_pair_geometry(
             payload.matcher,
             message,
         )
+        lowered = message.lower()
+        if any(
+            token in lowered
+            for token in (
+                "repo path not found",
+                "checkpoint not found",
+                "missing env",
+                "failed importing repo modules",
+            )
+        ):
+            raise HTTPException(status_code=422, detail=f"Selected debug matcher is unavailable locally: {err}") from err
         raise HTTPException(status_code=500, detail=f"Pair debug matcher failed: {err}") from err
     if not isinstance(diagnostics, dict):
         diagnostics = {}
@@ -930,6 +977,9 @@ async def debug_pair_geometry(
         stored_metrics = PairDebugStoredMetrics(
             pair_source=sim.pair_source,
             dinov2_similarity=_safe_float(sim.dinov2_similarity),
+            semantic_similarity=_safe_float(sim.dinov2_similarity),
+            semantic_backend="dinov3",
+            semantic_regions_available=None,
             raw_matches=_safe_int(getattr(sim, "raw_matches", None)),
             f_inliers=_safe_int(getattr(sim, "f_inliers", None)),
             f_inlier_ratio=_safe_float(getattr(sim, "f_inlier_ratio", None)),
@@ -937,6 +987,7 @@ async def debug_pair_geometry(
             grid_entropy=_safe_float(getattr(sim, "grid_entropy", None)),
             overlap_ratio=_safe_float(getattr(sim, "overlap_ratio", None)),
             combined_geometry_score=_safe_float(getattr(sim, "combined_geometry_score", None)),
+            geometry_soft_penalty=_safe_float(getattr(sim, "geometry_soft_penalty", None)),
             median_flow_magnitude=_safe_float(getattr(sim, "median_flow_magnitude", None)),
             near_positive_ratio=_safe_float(getattr(sim, "near_positive_ratio", None)),
             near_negative_ratio=_safe_float(getattr(sim, "near_negative_ratio", None)),
@@ -946,6 +997,40 @@ async def debug_pair_geometry(
             dominant_foreground_side_b=_safe_int(getattr(sim, "dominant_foreground_side_b", None)),
             foreground_support_persistence_penalty=_safe_float(getattr(sim, "foreground_support_persistence_penalty", None)),
             crossing_penalty=_safe_float(getattr(sim, "crossing_penalty", None)),
+            effective_overlap=_safe_float(getattr(sim, "effective_overlap", None)),
+            repeated_room_scope=getattr(sim, "repeated_room_scope", None),
+            repeated_room_penalty_weight=_safe_float(getattr(sim, "repeated_room_penalty_weight", None)),
+            fixture_disagreement_count=_safe_int(getattr(sim, "fixture_disagreement_count", None)),
+            fixture_instance_penalty=_safe_float(getattr(sim, "fixture_instance_penalty", None)),
+            mirror_similarity=_safe_float(getattr(sim, "mirror_similarity", None)),
+            mirror_penalty=_safe_float(getattr(sim, "mirror_penalty", None)),
+            layout_similarity=_safe_float(getattr(sim, "layout_similarity", None)),
+            layout_penalty=_safe_float(getattr(sim, "layout_penalty", None)),
+            center_similarity=_safe_float(getattr(sim, "center_similarity", None)),
+            center_support_bonus=_safe_float(getattr(sim, "center_support_bonus", None)),
+            center_mismatch_penalty=_safe_float(getattr(sim, "center_mismatch_penalty", None)),
+            anchor_region_name=getattr(sim, "anchor_region_name", None),
+            anchor_label_a=None,
+            anchor_label_b=None,
+            anchor_similarity=_safe_float(getattr(sim, "anchor_similarity", None)),
+            object_similarity=None,
+            anchor_match_density_a=_safe_float(getattr(sim, "anchor_match_density_a", None)),
+            anchor_match_density_b=_safe_float(getattr(sim, "anchor_match_density_b", None)),
+            anchor_support_score=_safe_float(getattr(sim, "anchor_support_score", None)),
+            anchor_support_bonus=_safe_float(getattr(sim, "anchor_support_bonus", None)),
+            anchor_inlier_ratio=None,
+            object_match_ratio=None,
+            background_match_ratio=None,
+            window_match_ratio=None,
+            same_anchor_label_ratio=None,
+            cross_label_object_ratio=None,
+            anchor_mismatch_penalty=_safe_float(getattr(sim, "anchor_mismatch_penalty", None)),
+            window_match_density_a=_safe_float(getattr(sim, "window_match_density_a", None)),
+            window_match_density_b=_safe_float(getattr(sim, "window_match_density_b", None)),
+            window_support_score=_safe_float(getattr(sim, "window_support_score", None)),
+            window_dominance_penalty=_safe_float(getattr(sim, "window_dominance_penalty", None)),
+            repeated_room_instance_penalty=_safe_float(getattr(sim, "repeated_room_instance_penalty", None)),
+            semantic_match_counts=None,
             order_proximity=_safe_float(getattr(sim, "order_proximity", None)),
             pair_rank=_safe_float(getattr(sim, "pair_rank", None)),
             certification_status=getattr(sim, "certification_status", None),
@@ -972,6 +1057,8 @@ async def debug_pair_geometry(
         dinov2_similarity=float(getattr(sim, "dinov2_similarity", 0.0) or 0.0),
         position_a=int(left_photo.position or 0),
         position_b=int(right_photo.position or 0),
+        room_label_a=left_photo.room_override or left_photo.room_label,
+        room_label_b=right_photo.room_override or right_photo.room_label,
         depth_cache={},
         num_matches=int(num_matches),
         num_inliers=int(num_inliers),
@@ -982,20 +1069,18 @@ async def debug_pair_geometry(
     live_metrics = PairDebugLiveMetrics(
         matcher=str(diagnostics.get("matcher")) if diagnostics.get("matcher") is not None else None,
         checkpoint=str(diagnostics.get("checkpoint")) if diagnostics.get("checkpoint") is not None else None,
+        dinov2_similarity=_safe_float(live_summary.get("dinov2_similarity")),
+        semantic_similarity=_safe_float(live_summary.get("semantic_similarity")) or _safe_float(live_summary.get("dinov2_similarity")),
+        semantic_backend=(
+            str(live_summary.get("semantic_backend"))
+            if live_summary.get("semantic_backend") is not None
+            else "dinov3"
+        ),
+        semantic_regions_available=bool(live_summary.get("semantic_regions_available")),
         confidence_threshold=_safe_float(diagnostics.get("confidence_threshold")),
         geometry_model=str(diagnostics.get("geometry_model")) if diagnostics.get("geometry_model") is not None else None,
         raw_correspondence_count=_safe_int(diagnostics.get("raw_correspondence_count")),
-        raw_matches=[
-            PairDebugPoint(
-                x0=float(p.get("x0", 0.0)),
-                y0=float(p.get("y0", 0.0)),
-                x1=float(p.get("x1", 0.0)),
-                y1=float(p.get("y1", 0.0)),
-                dx=float(p.get("dx", 0.0)),
-                dy=float(p.get("dy", 0.0)),
-            )
-            for p in sampled_raw_points
-        ],
+        raw_matches=[_pair_debug_point_from_dict(p) for p in sampled_raw_points if isinstance(p, dict)],
         threshold_trials=[t for t in (diagnostics.get("threshold_trials") or []) if isinstance(t, dict)],
         loftr_input_width=_safe_int(diagnostics.get("loftr_input_width")),
         loftr_input_height=_safe_int(diagnostics.get("loftr_input_height")),
@@ -1012,6 +1097,7 @@ async def debug_pair_geometry(
         grid_entropy=_safe_float(live_summary.get("grid_entropy")),
         overlap_ratio=_safe_float(live_summary.get("overlap_ratio")),
         combined_geometry_score=_safe_float(live_summary.get("combined_geometry_score")),
+        geometry_soft_penalty=_safe_float(live_summary.get("geometry_soft_penalty")),
         median_flow_magnitude=_safe_float(live_summary.get("median_flow_magnitude")),
         near_positive_ratio=_safe_float(live_summary.get("near_positive_ratio")),
         near_negative_ratio=_safe_float(live_summary.get("near_negative_ratio")),
@@ -1021,6 +1107,65 @@ async def debug_pair_geometry(
         dominant_foreground_side_b=_safe_int(live_summary.get("dominant_foreground_side_b")),
         foreground_support_persistence_penalty=_safe_float(live_summary.get("foreground_support_persistence_penalty")),
         crossing_penalty=_safe_float(live_summary.get("crossing_penalty")),
+        effective_overlap=_safe_float(live_summary.get("effective_overlap")),
+        repeated_room_scope=live_summary.get("repeated_room_scope"),
+        repeated_room_penalty_weight=_safe_float(live_summary.get("repeated_room_penalty_weight")),
+        fixture_disagreement_count=_safe_int(live_summary.get("fixture_disagreement_count")),
+        fixture_instance_penalty=_safe_float(live_summary.get("fixture_instance_penalty")),
+        mirror_similarity=_safe_float(live_summary.get("mirror_similarity")),
+        mirror_penalty=_safe_float(live_summary.get("mirror_penalty")),
+        layout_similarity=_safe_float(live_summary.get("layout_similarity")),
+        layout_penalty=_safe_float(live_summary.get("layout_penalty")),
+        center_similarity=_safe_float(live_summary.get("center_similarity")),
+        center_support_bonus=_safe_float(live_summary.get("center_support_bonus")),
+        center_mismatch_penalty=_safe_float(live_summary.get("center_mismatch_penalty")),
+        anchor_region_name=live_summary.get("anchor_region_name"),
+        anchor_label_a=(
+            str(live_summary.get("anchor_label_a"))
+            if live_summary.get("anchor_label_a") is not None
+            else None
+        ),
+        anchor_label_b=(
+            str(live_summary.get("anchor_label_b"))
+            if live_summary.get("anchor_label_b") is not None
+            else None
+        ),
+        anchor_similarity=_safe_float(live_summary.get("anchor_similarity")),
+        object_similarity=_safe_float(live_summary.get("object_similarity")),
+        anchor_match_density_a=_safe_float(live_summary.get("anchor_match_density_a")),
+        anchor_match_density_b=_safe_float(live_summary.get("anchor_match_density_b")),
+        anchor_support_score=_safe_float(live_summary.get("anchor_support_score")),
+        anchor_support_bonus=_safe_float(live_summary.get("anchor_support_bonus")),
+        anchor_inlier_ratio=_safe_float(live_summary.get("anchor_inlier_ratio")),
+        object_match_ratio=_safe_float(live_summary.get("object_match_ratio")),
+        background_match_ratio=_safe_float(live_summary.get("background_match_ratio")),
+        window_match_ratio=_safe_float(live_summary.get("window_match_ratio")),
+        same_anchor_label_ratio=_safe_float(live_summary.get("same_anchor_label_ratio")),
+        cross_label_object_ratio=_safe_float(live_summary.get("cross_label_object_ratio")),
+        anchor_mismatch_penalty=_safe_float(live_summary.get("anchor_mismatch_penalty")),
+        window_match_density_a=_safe_float(live_summary.get("window_match_density_a")),
+        window_match_density_b=_safe_float(live_summary.get("window_match_density_b")),
+        window_support_score=_safe_float(live_summary.get("window_support_score")),
+        window_dominance_penalty=_safe_float(live_summary.get("window_dominance_penalty")),
+        repeated_room_instance_penalty=_safe_float(live_summary.get("repeated_room_instance_penalty")),
+        semantic_match_counts={
+            str(k): int(v)
+            for k, v in (live_summary.get("semantic_match_counts") or {}).items()
+            if v is not None
+        },
+        semantic_regions_left=[
+            SemanticRegionInfo(**region)
+            for region in (live_summary.get("semantic_regions_left") or [])
+            if isinstance(region, dict)
+        ],
+        semantic_regions_right=[
+            SemanticRegionInfo(**region)
+            for region in (live_summary.get("semantic_regions_right") or [])
+            if isinstance(region, dict)
+        ],
+        homography_penalty=_safe_float(live_summary.get("homography_penalty")),
+        low_flow_penalty=_safe_float(live_summary.get("low_flow_penalty")),
+        order_proximity=_safe_float(live_summary.get("order_proximity")),
         motion_label=(
             str(diagnostics.get("motion_label"))
             if diagnostics.get("motion_label") is not None
@@ -1081,17 +1226,7 @@ async def debug_pair_geometry(
             else None
         ),
         inlier_match_count=len(inlier_points_list),
-        inlier_matches=[
-            PairDebugPoint(
-                x0=float(p.get("x0", 0.0)),
-                y0=float(p.get("y0", 0.0)),
-                x1=float(p.get("x1", 0.0)),
-                y1=float(p.get("y1", 0.0)),
-                dx=float(p.get("dx", 0.0)),
-                dy=float(p.get("dy", 0.0)),
-            )
-            for p in sampled_inlier_points
-        ],
+        inlier_matches=[_pair_debug_point_from_dict(p) for p in sampled_inlier_points if isinstance(p, dict)],
     )
     response_build_seconds = time.perf_counter() - postprocess_started_at
     request_total_seconds = time.perf_counter() - request_started_at
@@ -1219,7 +1354,7 @@ async def get_project_clusters_debug(
     """Get debug info for all clusters in a project.
 
     Shows why photos were grouped together:
-    - DINOv2 semantic similarity scores
+    - DINOv3-backed semantic similarity scores
     - Geometric verification results (matches, inliers)
     - Whether connection was from temporal window or semantic top-k
     - Position in cluster (endpoint vs middle)
@@ -1359,6 +1494,7 @@ async def get_project_clusters_debug(
                         median_epipolar_error=_safe_float(getattr(sim, "median_epipolar_error", None)),
                         median_flow_magnitude=_safe_float(getattr(sim, "median_flow_magnitude", None)),
                         combined_geometry_score=_safe_float(getattr(sim, "combined_geometry_score", None)),
+                        geometry_soft_penalty=_safe_float(getattr(sim, "geometry_soft_penalty", None)),
                         near_positive_ratio=_safe_float(getattr(sim, "near_positive_ratio", None)),
                         near_negative_ratio=_safe_float(getattr(sim, "near_negative_ratio", None)),
                         split_score=_safe_float(getattr(sim, "split_score", None)),
@@ -1367,6 +1503,30 @@ async def get_project_clusters_debug(
                         dominant_foreground_side_b=_safe_int(getattr(sim, "dominant_foreground_side_b", None)),
                         foreground_support_persistence_penalty=_safe_float(getattr(sim, "foreground_support_persistence_penalty", None)),
                         crossing_penalty=_safe_float(getattr(sim, "crossing_penalty", None)),
+                        effective_overlap=_safe_float(getattr(sim, "effective_overlap", None)),
+                        repeated_room_scope=getattr(sim, "repeated_room_scope", None),
+                        repeated_room_penalty_weight=_safe_float(getattr(sim, "repeated_room_penalty_weight", None)),
+                        fixture_disagreement_count=_safe_int(getattr(sim, "fixture_disagreement_count", None)),
+                        fixture_instance_penalty=_safe_float(getattr(sim, "fixture_instance_penalty", None)),
+                        mirror_similarity=_safe_float(getattr(sim, "mirror_similarity", None)),
+                        mirror_penalty=_safe_float(getattr(sim, "mirror_penalty", None)),
+                        layout_similarity=_safe_float(getattr(sim, "layout_similarity", None)),
+                        layout_penalty=_safe_float(getattr(sim, "layout_penalty", None)),
+                        center_similarity=_safe_float(getattr(sim, "center_similarity", None)),
+                        center_support_bonus=_safe_float(getattr(sim, "center_support_bonus", None)),
+                        center_mismatch_penalty=_safe_float(getattr(sim, "center_mismatch_penalty", None)),
+                        anchor_region_name=getattr(sim, "anchor_region_name", None),
+                        anchor_similarity=_safe_float(getattr(sim, "anchor_similarity", None)),
+                        anchor_match_density_a=_safe_float(getattr(sim, "anchor_match_density_a", None)),
+                        anchor_match_density_b=_safe_float(getattr(sim, "anchor_match_density_b", None)),
+                        anchor_support_score=_safe_float(getattr(sim, "anchor_support_score", None)),
+                        anchor_support_bonus=_safe_float(getattr(sim, "anchor_support_bonus", None)),
+                        anchor_mismatch_penalty=_safe_float(getattr(sim, "anchor_mismatch_penalty", None)),
+                        window_match_density_a=_safe_float(getattr(sim, "window_match_density_a", None)),
+                        window_match_density_b=_safe_float(getattr(sim, "window_match_density_b", None)),
+                        window_support_score=_safe_float(getattr(sim, "window_support_score", None)),
+                        window_dominance_penalty=_safe_float(getattr(sim, "window_dominance_penalty", None)),
+                        repeated_room_instance_penalty=_safe_float(getattr(sim, "repeated_room_instance_penalty", None)),
                         order_proximity=_safe_float(getattr(sim, "order_proximity", None)),
                         pair_rank=_safe_float(getattr(sim, "pair_rank", None)),
                         certification_status=getattr(sim, "certification_status", None),

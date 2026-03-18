@@ -1,7 +1,7 @@
-"""Room clustering using DINOv2 + LoFTR geometric verification.
+"""Room clustering using DINOv3-backed semantics + LoFTR geometric verification.
 
 Optimized 3-stage pipeline:
-1. DINOv2 clustering: Group by visual similarity (fast, semantic)
+1. DINOv3-backed semantic clustering: Group by visual similarity (fast)
 2. LoFTR: Verify geometric overlap within clusters (accurate)
 3. (Optional) COLMAP: SfM for clusters with 3+ images
 
@@ -29,7 +29,7 @@ BATHROOM_SHOT_CAP_WEAK = 1
 BATHROOM_STRONG_SCORE_THRESHOLD = 0.55
 ROOM_INSTANCE_POSITION_GAP = 10  # Same room name across nearby clusters; split only when far apart
 
-# Try to import the optimized pipeline (DINOv2 + LoFTR).
+# Try to import the optimized pipeline (DINOv3-backed semantics + LoFTR).
 try:
     from app.pipeline.phase1_analyze.learned_matching import cluster_photos_optimized
     USE_LEARNED_MATCHING = True
@@ -55,7 +55,7 @@ def cluster_photos_by_room(
     """Cluster photos by room type with visual overlap detection.
 
     Uses optimized 3-stage pipeline when available:
-    1. DINOv2 clustering: Group by visual similarity (fast)
+    1. DINOv3-backed semantic clustering: Group by visual similarity (fast)
     2. LoFTR: Verify geometric overlap (accurate)
     3. (Optional) COLMAP: SfM for high-quality clusters
 
@@ -81,7 +81,7 @@ def cluster_photos_by_room(
 
     _reset_photo_clustering_state(active_photos)
 
-    # Try optimized pipeline (DINOv2 + LoFTR)
+    # Try optimized pipeline (DINOv3-backed semantics + LoFTR)
     if USE_LEARNED_MATCHING and use_overlap_detection and s3_client:
         return _cluster_with_learned_matching(
             db,
@@ -102,8 +102,8 @@ def _cluster_with_learned_matching(
     s3_client,
     preloaded_images: Optional[Dict[int, Image.Image]] = None,
 ) -> List[RoomCluster]:
-    """Cluster using optimized DINOv2 + LoFTR pipeline."""
-    logger.info("Using optimized DINOv2 + LoFTR pipeline")
+    """Cluster using optimized DINOv3-backed semantics + LoFTR pipeline."""
+    logger.info("Using optimized DINOv3-backed semantics + LoFTR pipeline")
 
     # Download all images and collect room labels
     images = []

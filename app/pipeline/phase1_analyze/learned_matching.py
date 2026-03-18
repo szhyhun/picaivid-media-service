@@ -1,6 +1,6 @@
 """Optimized 3-stage clustering pipeline for real estate photos.
 
-Stage 1 (cheap): DINOv2 embedding clustering
+Stage 1 (cheap): DINOv3-backed embedding clustering
 - Group photos by visual similarity
 - Keep clusters small (5-20 images)
 - Fast: one forward pass per image
@@ -18,14 +18,21 @@ Stage 3 (selective SfM): Optional COLMAP
 This keeps most compute in cheap Stage 1 while preserving geometric quality.
 """
 import logging
+import os
+import shutil
 import time
+import tempfile
 from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any
 from collections import defaultdict
+from urllib.parse import urlparse
+import tarfile
+import zipfile
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageOps
+import boto3
 
 from app.core.config import settings
 from app.pipeline.phase1_analyze.matcher_loaders import (
@@ -44,12 +51,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# STAGE 1: DINOv2 Embeddings
+# STAGE 1: Semantic embeddings (DINOv3-backed)
 # ============================================================================
 
-# DINOv2 model singleton
+# DINO model singleton. Historical variable names remain for compatibility.
 _dinov2_model = None
 _dinov2_transform = None
+DINO_MODEL_NAME = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
 # Performance controls for production matcher path.
 DINO_BATCH_SIZE = 16
@@ -65,18 +73,88 @@ def _preferred_torch_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _s3_client():
+    return boto3.client(
+        "s3",
+        region_name=settings.AWS_REGION,
+        endpoint_url=settings.S3_ENDPOINT,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    )
+
+
+def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
+    parsed = urlparse(str(s3_uri))
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path:
+        raise RuntimeError(f"Invalid S3 URI: {s3_uri}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _download_file_from_s3(target_path: str, s3_uri: str) -> str:
+    bucket, key = _parse_s3_uri(s3_uri)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = f"{target_path}.tmp"
+    client = _s3_client()
+    client.download_file(bucket, key, tmp_path)
+    os.replace(tmp_path, target_path)
+    return target_path
+
+
+def _extract_archive(archive_path: str, destination_dir: str) -> None:
+    if archive_path.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zip_ref:
+            zip_ref.extractall(destination_dir)
+        return
+    if archive_path.endswith((".tar.gz", ".tgz", ".tar")):
+        with tarfile.open(archive_path, "r:*") as tar_ref:
+            tar_ref.extractall(destination_dir)
+        return
+    raise RuntimeError(f"Unsupported model cache archive format: {archive_path}")
+
+
+def _hydrate_model_cache_from_s3(cache_dir: str, archive_s3_uri: str) -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp_root = tempfile.mkdtemp(prefix="model_cache_")
+    try:
+        archive_name = os.path.basename(urlparse(str(archive_s3_uri)).path) or "model_cache.tar.gz"
+        archive_path = os.path.join(tmp_root, archive_name)
+        _download_file_from_s3(archive_path, archive_s3_uri)
+        extracted_root = os.path.join(tmp_root, "extracted")
+        os.makedirs(extracted_root, exist_ok=True)
+        _extract_archive(archive_path, extracted_root)
+
+        entries = [os.path.join(extracted_root, entry) for entry in os.listdir(extracted_root)]
+        source_dir = extracted_root
+        if len(entries) == 1 and os.path.isdir(entries[0]):
+            source_dir = entries[0]
+
+        for entry in os.listdir(source_dir):
+            src = os.path.join(source_dir, entry)
+            dst = os.path.join(cache_dir, entry)
+            if os.path.isdir(src):
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+        return cache_dir
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def _load_dinov2():
-    """Load DINOv2 model (lazy initialization)."""
+    """Load the DINOv3 semantic embedding model (lazy initialization)."""
     global _dinov2_model, _dinov2_transform
 
     if _dinov2_model is not None:
         return _dinov2_model, _dinov2_transform
 
     try:
-        # Use transformers for DINOv2
+        # Use transformers for DINOv3.
         from transformers import AutoImageProcessor, AutoModel
 
-        model_name = "facebook/dinov2-base"
+        model_name = DINO_MODEL_NAME
         cache_dir = settings.MODEL_CACHE_DIR
         processor_kwargs: Dict[str, Any] = {
             "cache_dir": cache_dir,
@@ -96,44 +174,76 @@ def _load_dinov2():
                 local_files_only=True,
                 **model_kwargs,
             )
-        except Exception:
-            load_source = "hf-hub"
-            _dinov2_transform = AutoImageProcessor.from_pretrained(
-                model_name,
-                **processor_kwargs,
-            )
-            _dinov2_model = AutoModel.from_pretrained(
-                model_name,
-                **model_kwargs,
-            )
+        except Exception as local_err:
+            archive_s3_uri = str(settings.DINO_V3_CACHE_ARCHIVE_S3_URI or "").strip()
+            if archive_s3_uri:
+                logger.info(
+                    "Hydrating DINOv3 cache from S3: %s -> %s",
+                    archive_s3_uri,
+                    cache_dir,
+                )
+                _hydrate_model_cache_from_s3(cache_dir, archive_s3_uri)
+                load_source = "s3-cache"
+                _dinov2_transform = AutoImageProcessor.from_pretrained(
+                    model_name,
+                    local_files_only=True,
+                    **processor_kwargs,
+                )
+                _dinov2_model = AutoModel.from_pretrained(
+                    model_name,
+                    local_files_only=True,
+                    **model_kwargs,
+                )
+            elif bool(settings.DINO_V3_ALLOW_REMOTE_FALLBACK):
+                load_source = "remote-fallback"
+                logger.warning(
+                    "DINOv3 local cache missing at %s and no S3 cache archive configured. Falling back to remote download.",
+                    cache_dir,
+                )
+                _dinov2_transform = AutoImageProcessor.from_pretrained(
+                    model_name,
+                    **processor_kwargs,
+                )
+                _dinov2_model = AutoModel.from_pretrained(
+                    model_name,
+                    **model_kwargs,
+                )
+            else:
+                raise local_err
 
         device = _preferred_torch_device()
         _dinov2_model = _dinov2_model.to(device)
         _dinov2_model.eval()
 
-        logger.info("Loaded DINOv2 model on %s (source=%s, use_fast=False)", device, load_source)
+        logger.info("Loaded DINOv3 model %s on %s (source=%s, use_fast=False)", model_name, device, load_source)
         return _dinov2_model, _dinov2_transform
 
     except Exception as e:
-        logger.error(f"Failed to load DINOv2: {e}")
+        logger.error(
+            "Failed to load DINOv3 model %s from local cache_dir=%s. "
+            "Populate the local Hugging Face cache first; remote download is disabled. Error: %s",
+            DINO_MODEL_NAME,
+            settings.MODEL_CACHE_DIR,
+            e,
+        )
         return None, None
 
 
 def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
-    """Compute DINOv2 embeddings for a list of images.
+    """Compute DINOv3 embeddings for a list of images.
 
     Args:
         images: List of PIL Images
 
     Returns:
-        NxD array of embeddings (D=768 for dinov2-base)
+        NxD array of embeddings (D=768 for dinov3-vitb16)
     """
     model, transform = _load_dinov2()
 
     if model is None:
         # Random embeddings make clustering non-deterministic and unreliable.
         raise RuntimeError(
-            "DINOv2 model is unavailable. Refusing random embedding fallback "
+            "DINOv3 model is unavailable. Refusing random embedding fallback "
             "because it causes inconsistent clustering."
         )
 
@@ -169,7 +279,7 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
                 if not is_mps_op_gap:
                     raise
                 logger.warning(
-                    "DINOv2 MPS op unsupported, falling back to CPU for embeddings: %s",
+                    "DINOv3 MPS op unsupported, falling back to CPU for embeddings: %s",
                     err_msg.splitlines()[0] if err_msg else "unknown",
                 )
                 model = model.to(torch.device("cpu"))
@@ -183,7 +293,7 @@ def compute_dinov2_embeddings(images: List[Image.Image]) -> np.ndarray:
 
     elapsed_ms = (time.perf_counter() - t_start) * 1000.0
     logger.info(
-        "DINOv2 embedding timing: photos=%s batch_size=%s total_ms=%.1f avg_ms=%.2f device=%s",
+        "DINOv3 embedding timing: photos=%s batch_size=%s total_ms=%.1f avg_ms=%.2f device=%s",
         len(images),
         batch_size,
         elapsed_ms,
@@ -199,7 +309,7 @@ def cluster_by_dinov2(
     max_cluster_size: int = 15,
     min_cluster_size: int = 2,
 ) -> List[List[int]]:
-    """Cluster images using DINOv2 embeddings.
+    """Cluster images using DINOv3-backed semantic embeddings.
 
     Uses HDBSCAN for robust clustering that automatically determines
     the number of clusters.
@@ -221,7 +331,7 @@ def cluster_by_dinov2(
         return [photo_ids]
 
     # Compute embeddings
-    logger.info(f"Computing DINOv2 embeddings for {n} images...")
+    logger.info(f"Computing DINOv3 embeddings for {n} images...")
     embeddings = compute_dinov2_embeddings(images)
 
     # Normalize for cosine distance
@@ -274,7 +384,7 @@ def cluster_by_dinov2(
         else:
             final_clusters.append(cluster)
 
-    logger.info(f"DINOv2 clustering: {n} images -> {len(final_clusters)} clusters")
+    logger.info(f"DINOv3 clustering: {n} images -> {len(final_clusters)} clusters")
     for i, cluster in enumerate(final_clusters):
         logger.debug(f"  Cluster {i}: {len(cluster)} images")
 
@@ -322,7 +432,7 @@ MIN_INLIERS_VERY_FAR = 35              # Enforce stronger geometry for very-far 
 MIN_SCORE_VERY_FAR = 0.45              # Reject weak-overlap scores for very-far pairs
 
 # Adaptive geometric matching thresholds
-DEFAULT_LOFTR_INPUT_SIZE = (768, 576)  # width, height
+DEFAULT_LOFTR_INPUT_SIZE = (768, 576)  # width, height; longest side is used
 DEFAULT_PRODUCTION_MATCHER = "loftr_kornia_indoor_native"
 LOFTR_NATIVE_CONFIDENCE_THRESHOLD = 0.20
 NATIVE_SCORE_COUNT_ZERO = 80
@@ -489,19 +599,21 @@ def _resize_by_longest_side_and_pad(
     target_long_side: int,
     multiple: int = 8,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
-    """Resize preserving aspect ratio and pad (right/bottom) to multiple-of-N."""
+    """Resize down to target longest side, preserve aspect ratio, then pad."""
     h0, w0 = image_gray.shape[:2]
     if h0 <= 0 or w0 <= 0:
         return image_gray, {"content_w": max(1, w0), "content_h": max(1, h0), "pad_w": 0, "pad_h": 0}
 
     long_side = max(h0, w0)
     target = max(64, int(target_long_side))
-    scale = float(target) / float(long_side)
+    scale = min(1.0, float(target) / float(long_side))
 
     new_w = max(1, int(round(w0 * scale)))
     new_h = max(1, int(round(h0 * scale)))
-    interp = cv2.INTER_LINEAR if scale >= 1.0 else cv2.INTER_AREA
-    resized = cv2.resize(image_gray, (new_w, new_h), interpolation=interp)
+    if scale < 1.0:
+        resized = cv2.resize(image_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        resized = image_gray
 
     pad_w = (multiple - (new_w % multiple)) % multiple
     pad_h = (multiple - (new_h % multiple)) % multiple
@@ -603,6 +715,13 @@ def _release_device_cache(device: torch.device) -> Dict[str, float]:
         return _mps_memory_stats_mb()
 
     return {}
+
+
+def _is_mps_oom_error(err: BaseException, device: torch.device) -> bool:
+    if device.type != "mps":
+        return False
+    message = str(err)
+    return "MPS backend out of memory" in message or "MPS allocated" in message
 
 
 def _compute_segment_scores(
@@ -3167,13 +3286,45 @@ def _match_loftr_kornia_indoor_native(
     tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
     tensor_device = str(tensor1.device)
     mps_mem_before = _mps_memory_stats_mb() if device.type == "mps" else {}
+    fallback_from_mps_oom = False
 
     loftr_started_at = time.perf_counter()
     batch = {"image0": tensor1, "image1": tensor2}
-    with torch.inference_mode():
-        raw_output = matcher(batch)
-        # ZJU LoFTR mutates batch in-place and returns None.
-        correspondences = raw_output if isinstance(raw_output, dict) else batch
+    try:
+        with torch.inference_mode():
+            raw_output = matcher(batch)
+            # ZJU LoFTR mutates batch in-place and returns None.
+            correspondences = raw_output if isinstance(raw_output, dict) else batch
+    except RuntimeError as err:
+        if not _is_mps_oom_error(err, device):
+            raise
+        logger.warning(
+            "LoFTR MPS OOM for input %sx%s, retrying on CPU once: %s",
+            int(meta0["content_w"] + meta0["pad_w"]),
+            int(meta0["content_h"] + meta0["pad_h"]),
+            str(err).splitlines()[0] if str(err) else "unknown",
+        )
+        fallback_from_mps_oom = True
+        try:
+            del batch
+        except Exception:
+            pass
+        del tensor1
+        del tensor2
+        _release_device_cache(device=device)
+        cpu_device = torch.device("cpu")
+        matcher = matcher.to(cpu_device)
+        matcher.eval()
+        device = cpu_device
+        tensor_transfer_started_at = time.perf_counter()
+        tensor1 = _build_native_tensor(img1_resized, device=device)
+        tensor2 = _build_native_tensor(img2_resized, device=device)
+        tensor_transfer_seconds += time.perf_counter() - tensor_transfer_started_at
+        tensor_device = str(tensor1.device)
+        batch = {"image0": tensor1, "image1": tensor2}
+        with torch.inference_mode():
+            raw_output = matcher(batch)
+            correspondences = raw_output if isinstance(raw_output, dict) else batch
     loftr_seconds = time.perf_counter() - loftr_started_at
 
     points0, points1, scores = _extract_loftr_points_and_scores(correspondences)
@@ -3233,6 +3384,7 @@ def _match_loftr_kornia_indoor_native(
         "model_device": str(device),
         "tensor_device": tensor_device,
         "model_cache_hit": bool(cache_hit),
+        "fallback_from_mps_oom": bool(fallback_from_mps_oom),
     }
     if mps_mem_before:
         timing_payload.update({
@@ -3277,12 +3429,45 @@ def _match_loftr_zju_variant_debug(
     tensor_transfer_seconds = time.perf_counter() - tensor_transfer_started_at
     tensor_device = str(tensor1.device)
     mps_mem_before = _mps_memory_stats_mb() if device.type == "mps" else {}
+    fallback_from_mps_oom = False
 
     loftr_started_at = time.perf_counter()
     batch: Dict[str, Any] = {"image0": tensor1, "image1": tensor2}
-    with torch.inference_mode():
-        raw_output = matcher(batch)
-        correspondences = raw_output if isinstance(raw_output, dict) else batch
+    try:
+        with torch.inference_mode():
+            raw_output = matcher(batch)
+            correspondences = raw_output if isinstance(raw_output, dict) else batch
+    except RuntimeError as err:
+        if not _is_mps_oom_error(err, device):
+            raise
+        logger.warning(
+            "ZJU LoFTR MPS OOM for variant=%s input %sx%s, retrying on CPU once: %s",
+            str(variant),
+            int(meta0["content_w"] + meta0["pad_w"]),
+            int(meta0["content_h"] + meta0["pad_h"]),
+            str(err).splitlines()[0] if str(err) else "unknown",
+        )
+        fallback_from_mps_oom = True
+        try:
+            del batch
+        except Exception:
+            pass
+        del tensor1
+        del tensor2
+        _release_device_cache(device=device)
+        cpu_device = torch.device("cpu")
+        matcher = matcher.to(cpu_device)
+        matcher.eval()
+        device = cpu_device
+        tensor_transfer_started_at = time.perf_counter()
+        tensor1 = _build_native_tensor(img1_resized, device=device)
+        tensor2 = _build_native_tensor(img2_resized, device=device)
+        tensor_transfer_seconds += time.perf_counter() - tensor_transfer_started_at
+        tensor_device = str(tensor1.device)
+        batch = {"image0": tensor1, "image1": tensor2}
+        with torch.inference_mode():
+            raw_output = matcher(batch)
+            correspondences = raw_output if isinstance(raw_output, dict) else batch
     loftr_seconds = time.perf_counter() - loftr_started_at
 
     points0, points1, scores = _extract_loftr_points_and_scores(correspondences)
@@ -3343,6 +3528,7 @@ def _match_loftr_zju_variant_debug(
         "model_device": str(device),
         "tensor_device": tensor_device,
         "model_cache_hit": True,
+        "fallback_from_mps_oom": bool(fallback_from_mps_oom),
     }
     if mps_mem_before:
         timing_payload.update({

@@ -10,6 +10,7 @@ from app.db.session import get_db_context
 from app.services.sqs.consumer import SQSConsumer
 from app.pipeline.orchestrator import PipelineOrchestrator
 from app.schemas.job import JobMessage
+from app.models.warmup import warmup_core_models
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -58,6 +59,10 @@ def main():
     """Main worker entry point."""
     logger.info(f"Starting {settings.WORKER_TYPE.upper()} worker...")
     logger.info(f"SQS Queue: {settings.SQS_QUEUE_URL}")
+    warmup_core_models(
+        context=f"worker:{settings.WORKER_TYPE}",
+        include_loftr=settings.WORKER_TYPE != "gpu",
+    )
 
     # Handle shutdown gracefully
     def signal_handler(sig, frame):

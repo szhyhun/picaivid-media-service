@@ -1,6 +1,6 @@
-"""OpenCLIP model for image embeddings and room classification."""
+"""OpenCLIP model for image embeddings and lightweight region classification."""
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -52,6 +52,7 @@ class OpenCLIPModel:
         self._tokenizer = None
         self._device = None
         self._text_features = None
+        self._prompt_feature_cache: Dict[tuple[str, ...], torch.Tensor] = {}
 
     def _ensure_loaded(self) -> None:
         """Lazy-load the model on first use."""
@@ -174,6 +175,54 @@ class OpenCLIPModel:
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         return image_features.cpu().numpy()
+
+    def score_labels(
+        self,
+        image: Image.Image,
+        labels: Sequence[str],
+        prompt_templates: Sequence[str] | None = None,
+    ) -> Dict[str, float]:
+        """Score an image against arbitrary text labels with CLIP cosine similarity."""
+        self._ensure_loaded()
+        unique_labels = tuple(str(label) for label in labels if str(label).strip())
+        if not unique_labels:
+            return {}
+
+        cache_key = tuple(unique_labels) + tuple(prompt_templates or ())
+        text_features = self._prompt_feature_cache.get(cache_key)
+        if text_features is None:
+            prompts: list[str] = []
+            for label in unique_labels:
+                if prompt_templates:
+                    prompts.extend(template.format(label=label) for template in prompt_templates)
+                else:
+                    prompts.append(f"a photo of a {label}")
+            with torch.no_grad():
+                text_tokens = self._tokenizer(prompts).to(self._device)
+                encoded = self._model.encode_text(text_tokens)
+                encoded = encoded / encoded.norm(dim=-1, keepdim=True)
+                if prompt_templates:
+                    grouped = []
+                    chunk = len(prompt_templates)
+                    for idx in range(0, encoded.shape[0], chunk):
+                        feature = encoded[idx : idx + chunk].mean(dim=0, keepdim=True)
+                        feature = feature / feature.norm(dim=-1, keepdim=True)
+                        grouped.append(feature)
+                    text_features = torch.cat(grouped, dim=0)
+                else:
+                    text_features = encoded
+            self._prompt_feature_cache[cache_key] = text_features
+
+        image_tensor = self._preprocess(image).unsqueeze(0).to(self._device)
+        with torch.no_grad():
+            image_features = self._model.encode_image(image_tensor)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            similarities = (image_features @ text_features.T).squeeze(0)
+
+        return {
+            label: float(similarities[idx].item())
+            for idx, label in enumerate(unique_labels)
+        }
 
 
 # Singleton instance

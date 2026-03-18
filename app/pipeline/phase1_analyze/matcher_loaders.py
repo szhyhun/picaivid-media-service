@@ -1,11 +1,17 @@
 import logging
 import os
+import shutil
 import sys
+import tarfile
+import tempfile
 import warnings
+import zipfile
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from typing import Any, Dict, Tuple
+from urllib.parse import urlparse
 
+import boto3
 import torch
 
 from app.core.config import settings
@@ -53,6 +59,100 @@ def _env_or_settings(name: str, default: str = "") -> str:
     return str(raw_settings).strip() or str(default)
 
 
+def _s3_client():
+    return boto3.client(
+        "s3",
+        region_name=settings.AWS_REGION,
+        endpoint_url=settings.S3_ENDPOINT,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    )
+
+
+def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
+    parsed = urlparse(str(s3_uri))
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path:
+        raise RuntimeError(f"Invalid S3 URI: {s3_uri}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _download_file_from_s3(target_path: str, s3_uri: str) -> str:
+    bucket, key = _parse_s3_uri(s3_uri)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = f"{target_path}.tmp"
+    client = _s3_client()
+    client.download_file(bucket, key, tmp_path)
+    os.replace(tmp_path, target_path)
+    return target_path
+
+
+def _extract_archive(archive_path: str, destination_dir: str) -> None:
+    if archive_path.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zip_ref:
+            zip_ref.extractall(destination_dir)
+        return
+    if archive_path.endswith((".tar.gz", ".tgz", ".tar")):
+        with tarfile.open(archive_path, "r:*") as tar_ref:
+            tar_ref.extractall(destination_dir)
+        return
+    raise RuntimeError(f"Unsupported matcher asset archive format: {archive_path}")
+
+
+def _hydrate_repo_from_s3(target_dir: str, archive_s3_uri: str) -> str:
+    if os.path.isdir(target_dir) and os.listdir(target_dir):
+        return target_dir
+    os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+    tmp_root = tempfile.mkdtemp(prefix="matcher_repo_")
+    try:
+        archive_name = os.path.basename(urlparse(str(archive_s3_uri)).path) or "matcher_repo.zip"
+        archive_path = os.path.join(tmp_root, archive_name)
+        _download_file_from_s3(archive_path, archive_s3_uri)
+        extracted_root = os.path.join(tmp_root, "extracted")
+        os.makedirs(extracted_root, exist_ok=True)
+        _extract_archive(archive_path, extracted_root)
+
+        entries = [os.path.join(extracted_root, entry) for entry in os.listdir(extracted_root)]
+        if len(entries) == 1 and os.path.isdir(entries[0]):
+            source_dir = entries[0]
+        else:
+            source_dir = extracted_root
+
+        tmp_target = f"{target_dir}.tmp"
+        if os.path.isdir(tmp_target):
+            shutil.rmtree(tmp_target)
+        shutil.copytree(source_dir, tmp_target)
+        if os.path.isdir(target_dir):
+            shutil.rmtree(target_dir)
+        os.replace(tmp_target, target_dir)
+        return target_dir
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _ensure_local_file(path_value: str, s3_uri_env: str) -> str:
+    if path_value and os.path.isfile(path_value):
+        return path_value
+    s3_uri = _env_or_settings(s3_uri_env, "")
+    if not path_value:
+        raise RuntimeError(f"Missing local path and no target path configured for {s3_uri_env}")
+    if not s3_uri:
+        raise RuntimeError(f"Required file not found locally and no S3 fallback configured: {path_value}")
+    logger.info("Hydrating matcher file from S3: %s -> %s", s3_uri, path_value)
+    return _download_file_from_s3(path_value, s3_uri)
+
+
+def _ensure_local_repo(path_value: str, s3_uri_env: str) -> str:
+    if path_value and os.path.isdir(path_value):
+        return path_value
+    s3_uri = _env_or_settings(s3_uri_env, "")
+    if not path_value:
+        raise RuntimeError(f"Missing local repo path and no target path configured for {s3_uri_env}")
+    if not s3_uri:
+        raise RuntimeError(f"Required repo not found locally and no S3 fallback configured: {path_value}")
+    logger.info("Hydrating matcher repo from S3: %s -> %s", s3_uri, path_value)
+    return _hydrate_repo_from_s3(path_value, s3_uri)
+
+
 def _cfg_to_lower_dict(config: Any) -> Any:
     if isinstance(config, dict):
         return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
@@ -62,6 +162,15 @@ def _cfg_to_lower_dict(config: Any) -> Any:
     if hasattr(config, "items"):
         return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
     return config
+
+
+def _purge_module_prefixes(*prefixes: str) -> None:
+    prefixes = tuple(str(prefix) for prefix in prefixes if str(prefix))
+    if not prefixes:
+        return
+    for module_name in list(sys.modules.keys()):
+        if any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes):
+            sys.modules.pop(module_name, None)
 
 
 def _matchformer_config_for_variant(cfg: Any, variant: str) -> Any:
@@ -154,9 +263,7 @@ class _ZJUDebugMatcherLoader(_BaseMatcherLoader):
         repo_dir = _env_or_settings("LOFTR_ZJU_REPO_DIR", "")
         if not repo_dir:
             raise RuntimeError("ZJU debug matcher is missing env LOFTR_ZJU_REPO_DIR")
-        if not os.path.isdir(repo_dir):
-            raise RuntimeError(f"ZJU debug matcher repo path not found: {repo_dir}")
-        return repo_dir
+        return _ensure_local_repo(repo_dir, "LOFTR_ZJU_REPO_ARCHIVE_S3_URI")
 
     def _checkpoint_path(self, variant: str) -> Tuple[str, str]:
         env_key = _ZJU_DEBUG_ENV_BY_VARIANT.get(str(variant))
@@ -165,9 +272,7 @@ class _ZJUDebugMatcherLoader(_BaseMatcherLoader):
         ckpt_path = _env_or_settings(env_key, "")
         if not ckpt_path:
             raise RuntimeError(f"ZJU debug matcher is missing env {env_key}")
-        if not os.path.isfile(ckpt_path):
-            raise RuntimeError(f"ZJU debug checkpoint not found for {variant}: {ckpt_path}")
-        return ckpt_path, env_key
+        return _ensure_local_file(ckpt_path, f"{env_key}_S3_URI"), env_key
 
     def _build(self, key: str, preferred: torch.device) -> Tuple[Any, Dict[str, str]]:
         repo_dir = self._repo_dir()
@@ -241,9 +346,7 @@ class _MatchFormerDebugMatcherLoader(_BaseMatcherLoader):
         repo_dir = _env_or_settings("MATCHFORMER_REPO_DIR", "")
         if not repo_dir:
             raise RuntimeError("MatchFormer debug matcher is missing env MATCHFORMER_REPO_DIR")
-        if not os.path.isdir(repo_dir):
-            raise RuntimeError(f"MatchFormer debug matcher repo path not found: {repo_dir}")
-        return repo_dir
+        return _ensure_local_repo(repo_dir, "MATCHFORMER_REPO_ARCHIVE_S3_URI")
 
     def _checkpoint_path(self, variant: str) -> Tuple[str, str]:
         env_key = _MATCHFORMER_DEBUG_ENV_BY_VARIANT.get(str(variant))
@@ -252,11 +355,7 @@ class _MatchFormerDebugMatcherLoader(_BaseMatcherLoader):
         ckpt_path = _env_or_settings(env_key, "")
         if not ckpt_path:
             raise RuntimeError(f"MatchFormer debug matcher is missing env {env_key}")
-        if not os.path.isfile(ckpt_path):
-            raise RuntimeError(
-                f"MatchFormer debug checkpoint not found for {variant}: {ckpt_path}"
-            )
-        return ckpt_path, env_key
+        return _ensure_local_file(ckpt_path, f"{env_key}_S3_URI"), env_key
 
     def _resolve_device(self, key: str) -> torch.device:
         requested_device = _env_or_settings("MATCHFORMER_DEBUG_DEVICE", "auto").lower()

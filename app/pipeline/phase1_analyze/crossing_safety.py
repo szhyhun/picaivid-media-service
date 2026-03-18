@@ -188,6 +188,7 @@ def analyze_crossing_safety(
     persistence_penalty = 0.0
     dominant_side_a = CENTER_BUCKET
     dominant_side_b = CENTER_BUCKET
+    dominant_support_fraction = 0.0
     strong_side_flip = False
 
     for idx, cluster_a in enumerate(near_clusters_a):
@@ -203,6 +204,7 @@ def analyze_crossing_safety(
         if idx == 0:
             dominant_side_a = int(metrics["side_a"])
             dominant_side_b = int(metrics["side_b"])
+            dominant_support_fraction = support_fraction
         if support_fraction >= 0.20 and {int(metrics["side_a"]), int(metrics["side_b"])} == {LEFT_BUCKET, RIGHT_BUCKET}:
             strong_side_flip = True
             dominant_side_shift_penalty = max(dominant_side_shift_penalty, 1.0)
@@ -218,6 +220,15 @@ def analyze_crossing_safety(
         and not strong_side_flip
     ):
         dominant_side_shift_penalty *= 0.15
+    elif (
+        split_score <= 0.1
+        and dominant_side_a == CENTER_BUCKET
+        and dominant_side_b in {LEFT_BUCKET, RIGHT_BUCKET}
+        and dominant_support_fraction >= 0.18
+        and not strong_side_flip
+    ):
+        dominant_side_shift_penalty *= 0.45
+        persistence_penalty *= 0.65
 
     crossing_penalty = float(
         max(

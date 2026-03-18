@@ -36,6 +36,15 @@ class Settings(BaseSettings):
 
     # ML Models
     MODEL_CACHE_DIR: str = "./ml_models"
+    DINO_V3_CACHE_ARCHIVE_S3_URI: str | None = None
+    DINO_V3_ALLOW_REMOTE_FALLBACK: bool = True
+    SEMANTIC_REGIONS_ENABLED: bool = True
+    SEMANTIC_REGIONS_BACKEND: str = "sam2_clip"
+    SEMANTIC_MATCH_EDGE_DILATION_PX: int = 6
+    SEMANTIC_REMOTE_FALLBACK: bool = False
+    SAM2_REPO_DIR: str | None = None
+    SAM2_CHECKPOINT: str | None = None
+    SAM2_CONFIG: str | None = None
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
     ROMA_DEBUG_DEVICE: str = "auto"
@@ -43,16 +52,25 @@ class Settings(BaseSettings):
 
     # ZJU LoFTR strict debug settings
     LOFTR_ZJU_REPO_DIR: str | None = None
+    LOFTR_ZJU_REPO_ARCHIVE_S3_URI: str | None = None
     LOFTR_ZJU_INDOOR_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_CKPT_S3_URI: str | None = None
     LOFTR_ZJU_INDOOR_DS_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_DS_CKPT_S3_URI: str | None = None
     LOFTR_ZJU_INDOOR_OT_CKPT: str | None = None
+    LOFTR_ZJU_INDOOR_OT_CKPT_S3_URI: str | None = None
     LOFTR_ZJU_OUTDOOR_DS_CKPT: str | None = None
+    LOFTR_ZJU_OUTDOOR_DS_CKPT_S3_URI: str | None = None
     LOFTR_ZJU_OUTDOOR_OT_CKPT: str | None = None
+    LOFTR_ZJU_OUTDOOR_OT_CKPT_S3_URI: str | None = None
 
     # MatchFormer strict debug settings
     MATCHFORMER_REPO_DIR: str | None = None
+    MATCHFORMER_REPO_ARCHIVE_S3_URI: str | None = None
     MATCHFORMER_INDOOR_CKPT: str | None = None
+    MATCHFORMER_INDOOR_CKPT_S3_URI: str | None = None
     MATCHFORMER_OUTDOOR_CKPT: str | None = None
+    MATCHFORMER_OUTDOOR_CKPT_S3_URI: str | None = None
 
     # Clustering behavior
     DELETE_OBVIOUS_DUPLICATES: bool = True

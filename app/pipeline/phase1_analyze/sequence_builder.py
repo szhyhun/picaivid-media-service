@@ -7,6 +7,20 @@ from typing import Any
 import numpy as np
 
 
+SOFT_COMPATIBLE_ROOM_GROUPS = (
+    {
+        "living room",
+        "family room",
+        "dining room",
+        "kitchen",
+        "entrance",
+        "entryway",
+        "foyer",
+        "hallway",
+    },
+)
+
+
 def _edge_key(a: int, b: int) -> tuple[int, int]:
     return (min(a, b), max(a, b))
 
@@ -17,6 +31,8 @@ def _room_compatible(room_a: str | None, room_b: str | None) -> bool:
     if not left or left == "unknown":
         return True
     if not right or right == "unknown":
+        return True
+    if any(left in group and right in group for group in SOFT_COMPATIBLE_ROOM_GROUPS):
         return True
     return left == right
 

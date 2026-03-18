@@ -8,10 +8,23 @@ import numpy as np
 from sklearn.preprocessing import normalize
 
 
-TOP_K = 10
+TOP_K = 8
 MIN_DINO_SIMILARITY = 0.50
 STRONG_ONE_WAY_DINO_SIMILARITY = 0.65
 LOCAL_ADJACENCY_MAX_GAP = 1
+
+SOFT_COMPATIBLE_ROOM_GROUPS = (
+    {
+        "living room",
+        "family room",
+        "dining room",
+        "kitchen",
+        "entrance",
+        "entryway",
+        "foyer",
+        "hallway",
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -26,12 +39,26 @@ def normalize_room_label(value: Optional[str]) -> str:
     return (value or "").strip().lower().replace("_", " ")
 
 
+def rooms_soft_compatible(room_a: Optional[str], room_b: Optional[str]) -> bool:
+    normalized_a = normalize_room_label(room_a)
+    normalized_b = normalize_room_label(room_b)
+    if not normalized_a or normalized_a == "unknown":
+        return True
+    if not normalized_b or normalized_b == "unknown":
+        return True
+    if normalized_a == normalized_b:
+        return True
+    return any(normalized_a in group and normalized_b in group for group in SOFT_COMPATIBLE_ROOM_GROUPS)
+
+
 def rooms_explicitly_incompatible(room_a: Optional[str], room_b: Optional[str]) -> bool:
     normalized_a = normalize_room_label(room_a)
     normalized_b = normalize_room_label(room_b)
     if not normalized_a or normalized_a == "unknown":
         return False
     if not normalized_b or normalized_b == "unknown":
+        return False
+    if rooms_soft_compatible(normalized_a, normalized_b):
         return False
     return normalized_a != normalized_b
 
