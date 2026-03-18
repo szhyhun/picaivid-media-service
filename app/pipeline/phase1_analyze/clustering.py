@@ -833,8 +833,16 @@ def _order_clusters_for_story(
     cluster_photo_groups: List[List[JobPhoto]],
     duplicate_of_map: Dict[int, int] | None = None,
 ) -> List[List[JobPhoto]]:
-    """Order clusters in a real-estate story arc with upload-order continuity."""
+    """Order clusters primarily by upload order, grouped into local same-room runs.
+
+    Policy:
+    - upload order is dominant
+    - if nearby clusters belong to the same base room, keep them together
+    - inside a same-room run, multi-photo clusters come before singleton clusters
+    - preserve local upload order within those buckets
+    """
     duplicate_of_map = duplicate_of_map or {}
+    ROOM_RUN_GAP = 6
 
     descriptors = []
     for photos in cluster_photo_groups:
@@ -843,58 +851,50 @@ def _order_clusters_for_story(
 
         room_labels = [p.room_override or p.room_label or "unknown" for p in photos]
         room_type = max(set(room_labels), key=room_labels.count)
-        bucket = _room_bucket(room_type)
-        story_bucket = "service_room" if bucket in {"bathroom", "laundry"} else bucket
-
         positions = [p.position or 0 for p in photos]
+        min_pos = min(positions) if positions else 0
+        max_pos = max(positions) if positions else 0
         pos_center = float(np.median(positions)) if positions else 0.0
         quality = float(np.mean([p.final_score or 0.0 for p in photos]))
-        master_priority = max(_master_priority(p) for p in photos)
-        is_duplicate_cluster = all(p.id in duplicate_of_map for p in photos)
-        stage = _story_stage(bucket, is_duplicate_cluster)
+        base_room_name = _room_instance_base_label(room_type)
+        multi_photo = len(photos) > 1
 
         descriptors.append(
             {
                 "photos": photos,
-                "room_bucket": bucket,
-                "story_bucket": story_bucket,
-                "stage": stage,
+                "room_type": room_type,
+                "base_room_name": base_room_name,
+                "min_pos": min_pos,
+                "max_pos": max_pos,
                 "pos_center": pos_center,
                 "quality": quality,
-                "master_priority": master_priority,
+                "multi_photo": multi_photo,
             }
         )
 
-    grouped = defaultdict(list)
+    descriptors.sort(key=lambda d: (d["min_pos"], d["pos_center"], -d["quality"]))
+
+    room_runs: List[List[Dict[str, Any]]] = []
     for desc in descriptors:
-        grouped[desc["stage"]].append(desc)
+        if not room_runs:
+            room_runs.append([desc])
+            continue
+        previous_run = room_runs[-1]
+        previous_desc = previous_run[-1]
+        same_room = desc["base_room_name"] == previous_desc["base_room_name"]
+        close_in_order = int(desc["min_pos"]) - int(previous_desc["max_pos"]) <= ROOM_RUN_GAP
+        if same_room and close_in_order:
+            previous_run.append(desc)
+        else:
+            room_runs.append([desc])
 
-    ordered = []
-    for stage in sorted(grouped.keys()):
-        group = grouped[stage]
-        masters = [d for d in group if d["master_priority"] > 0]
-        normals = [d for d in group if d["master_priority"] == 0]
-
-        masters.sort(
-            key=lambda d: (
-                -d["master_priority"],
-                _bucket_priority(d["story_bucket"]),
-                d["pos_center"],
-                -d["quality"],
-            )
-        )
-
-        normals_by_bucket = defaultdict(list)
-        for desc in normals:
-            normals_by_bucket[desc["story_bucket"]].append(desc)
-
-        ordered_normals = []
-        for bucket in sorted(normals_by_bucket.keys(), key=_bucket_priority):
-            bucket_normals = normals_by_bucket[bucket]
-            bucket_normals.sort(key=lambda d: (d["pos_center"], -d["quality"]))
-            ordered_normals.extend(bucket_normals)
-
-        ordered.extend(masters)
-        ordered.extend(ordered_normals)
+    ordered: List[Dict[str, Any]] = []
+    for run in room_runs:
+        multi_clusters = [desc for desc in run if desc["multi_photo"]]
+        single_clusters = [desc for desc in run if not desc["multi_photo"]]
+        multi_clusters.sort(key=lambda d: (d["min_pos"], d["pos_center"], -d["quality"]))
+        single_clusters.sort(key=lambda d: (d["min_pos"], d["pos_center"], -d["quality"]))
+        ordered.extend(multi_clusters)
+        ordered.extend(single_clusters)
 
     return [desc["photos"] for desc in ordered]
