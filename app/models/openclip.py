@@ -17,6 +17,7 @@ ROOM_TYPES = [
     "kitchen",
     "laundry room",
     "bathroom",
+    "storage",
     "dining room",
     "office",
     "garage",
@@ -39,6 +40,21 @@ ROOM_PROMPTS = {
         "a photo of a laundry room",
         "a photo of a utility room with washer and dryer",
         "a photo of a washer and dryer in a laundry area",
+    ],
+    "bathroom": [
+        "a photo of a bathroom",
+        "a real estate photo of a bathroom with sink vanity mirror shower or toilet",
+        "an interior listing photo of a bathroom",
+    ],
+    "storage": [
+        "a photo of a storage room",
+        "a photo of a storage closet with shelves and boxes",
+        "an interior listing photo of a storage room",
+    ],
+    "garage": [
+        "a photo of a garage",
+        "a photo of a garage with storage and tools",
+        "an interior listing photo of a garage",
     ],
 }
 

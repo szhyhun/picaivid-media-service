@@ -106,7 +106,7 @@ class Phase1Analyzer:
 
             # Step 5c: Correct common interior label confusions using
             # local sequence context (kitchen/living/dining).
-            self._postprocess_interior_room_labels(job_photos)
+            self._postprocess_interior_room_labels(job_photos, image_cache=image_cache)
             self.db.commit()
 
             # Step 6: Compute quality scores
@@ -124,7 +124,7 @@ class Phase1Analyzer:
 
             # Step 7b: Refine interior labels using verified geometric links
             # (e.g., living vs dining confusion in adjacent shots).
-            self._postprocess_interior_room_labels(job_photos, job_id=job.id)
+            self._postprocess_interior_room_labels(job_photos, job_id=job.id, image_cache=image_cache)
             self.db.commit()
 
             # Step 8: Plan motion for each cluster
@@ -383,7 +383,12 @@ class Phase1Analyzer:
         if changed:
             logger.info("Exterior room-label postprocess changed %s photos", changed)
 
-    def _postprocess_interior_room_labels(self, photos: List[JobPhoto], job_id: int | None = None) -> None:
+    def _postprocess_interior_room_labels(
+        self,
+        photos: List[JobPhoto],
+        job_id: int | None = None,
+        image_cache: Dict[int, Image.Image] | None = None,
+    ) -> None:
         """Correct common interior room label confusions.
 
         Sequence-context rules:
@@ -409,19 +414,19 @@ class Phase1Analyzer:
             "pool",
         }
         interior_social = {"living room", "dining room", "kitchen", "entrance", "hallway"}
+        service_like = {"laundry", "laundry room", "bathroom", "storage", "garage"}
 
         changed = 0
 
-        # Rule 0: laundry->bathroom recovery for adjacent service-room shots.
-        # Conservative: only relabel when metadata does not indicate laundry.
+        # Rule 0: focused service-room relabel.
+        # Uses richer CLIP prompts plus local context to separate:
+        # bathroom vs laundry room vs storage vs garage.
         for idx, photo in enumerate(ordered):
             if photo.room_override:
                 continue
 
             current = _normalize_room_label(photo.room_label)
-            if current not in {"laundry", "laundry room"}:
-                continue
-            if _looks_like_laundry(photo):
+            if current not in service_like:
                 continue
 
             window = ordered[max(0, idx - 2): min(n, idx + 3)]
@@ -432,17 +437,47 @@ class Phase1Analyzer:
             ]
             bathroom_votes = sum(label == "bathroom" for label in neighbor_labels)
             laundry_votes = sum(label in {"laundry", "laundry room"} for label in neighbor_labels)
+            storage_votes = sum(label == "storage" for label in neighbor_labels)
             depth_var = float(photo.depth_variance or 0.0)
+            has_laundry_hint = _looks_like_laundry(photo)
+            image = self._get_cached_image(photo, image_cache or {})
+            service_scores = _score_service_room_labels(image)
+            bathroom_score = float(service_scores.get("bathroom", 0.0))
+            laundry_score = float(service_scores.get("laundry room", 0.0))
+            storage_score = float(service_scores.get("storage", 0.0))
+            garage_score = float(service_scores.get("garage", 0.0))
 
-            if bathroom_votes >= 1 and laundry_votes == 0 and depth_var <= 0.10:
-                photo.room_label = "bathroom"
+            updated_label: str | None = None
+            if garage_score >= max(storage_score, laundry_score, bathroom_score) + 0.02:
+                updated_label = "garage"
+            elif current in {"laundry", "laundry room"} and not has_laundry_hint:
+                if bathroom_score >= laundry_score - 0.01 and (bathroom_votes >= 1 or bathroom_score >= storage_score + 0.01):
+                    updated_label = "bathroom"
+                elif storage_score >= laundry_score - 0.025:
+                    updated_label = "storage"
+            elif current == "bathroom" and not has_laundry_hint:
+                if storage_score >= bathroom_score + 0.03:
+                    updated_label = "storage"
+            elif current == "storage" and has_laundry_hint and laundry_score >= storage_score - 0.01:
+                updated_label = "laundry room"
+
+            if updated_label and updated_label != photo.room_label:
+                photo.room_label = updated_label
                 changed += 1
                 logger.info(
-                    "Photo %s room relabel: %s -> bathroom (adjacent bathroom context, bathroom_votes=%s, depth_var=%.3f)",
+                    "Photo %s room relabel: %s -> %s (service-room focused relabel: scores bath=%.3f laundry=%.3f storage=%.3f garage=%.3f, votes bath=%s laundry=%s storage=%s, depth_var=%.3f, laundry_hint=%s)",
                     photo.id,
                     current,
+                    updated_label,
+                    bathroom_score,
+                    laundry_score,
+                    storage_score,
+                    garage_score,
                     bathroom_votes,
+                    laundry_votes,
+                    storage_votes,
                     depth_var,
+                    "yes" if has_laundry_hint else "no",
                 )
 
         # Rule 1: recover interior kitchen shots mislabeled as patio/exterior.
@@ -561,6 +596,29 @@ def _looks_like_laundry(photo: JobPhoto) -> bool:
 
 def _normalize_room_label(room: str | None) -> str:
     return (room or "").strip().lower().replace("_", " ")
+
+
+SERVICE_ROOM_LABEL_PROMPTS = {
+    "bathroom": "bathroom with sink vanity mirror toilet shower",
+    "laundry room": "laundry room with washer dryer laundry machine utility sink",
+    "storage": "storage room or storage closet with shelves boxes household storage",
+    "garage": "garage with parking storage tools concrete floor",
+}
+
+
+def _score_service_room_labels(image: Image.Image) -> Dict[str, float]:
+    raw_scores = openclip_model.score_labels(
+        image,
+        list(SERVICE_ROOM_LABEL_PROMPTS.values()),
+        prompt_templates=[
+            "a real estate photo of a {label}",
+            "an interior listing photo of a {label}",
+        ],
+    )
+    return {
+        canonical: float(raw_scores.get(prompt_label, 0.0))
+        for canonical, prompt_label in SERVICE_ROOM_LABEL_PROMPTS.items()
+    }
 
 
 def _is_aerial_label(room: str) -> bool:
