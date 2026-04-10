@@ -30,10 +30,3 @@ cd /Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service
   --project-id <project_uuid> \
   --fail-on-f1-below 0.92
 ```
-
-## Oracle Modes
-
-Set `KORNIA_ORACLE_MODE` before running worker:
-- `off` (baseline)
-- `shadow` (observe only)
-- `gate` (enforced)

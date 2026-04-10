@@ -1,12 +1,7 @@
-"""Room clustering using DINOv3-backed semantics + LoFTR geometric verification.
+"""Room clustering using the MASt3R phase-1 graph pipeline.
 
-Optimized 3-stage pipeline:
-1. DINOv3-backed semantic clustering: Group by visual similarity (fast)
-2. LoFTR: Verify geometric overlap within clusters (accurate)
-3. (Optional) COLMAP: SfM for clusters with 3+ images
-
-This keeps most work in cheap Stage 1 while ensuring clusters contain
-photos that can actually be interpolated.
+MASt3R owns graph retrieval, pair matching, sparse alignment, and edge scoring.
+This module persists the selected 2-photo clusters into RoomCluster rows.
 """
 import logging
 from collections import defaultdict
@@ -38,12 +33,7 @@ UTILITY_ROOM_LABELS = {
     "boiler room",
 }
 
-# Try to import the optimized pipeline (DINOv3-backed semantics + LoFTR).
-try:
-    from app.pipeline.phase1_analyze.learned_matching import cluster_photos_optimized
-    USE_LEARNED_MATCHING = True
-except ImportError:
-    USE_LEARNED_MATCHING = False
+from app.pipeline.phase1_analyze.precision_pipeline import cluster_photos_precision_first
 
 # Fallback imports (ORB-based)
 from app.pipeline.phase1_analyze.overlap_detector import (
@@ -63,12 +53,8 @@ def cluster_photos_by_room(
 ) -> List[RoomCluster]:
     """Cluster photos by room type with visual overlap detection.
 
-    Uses optimized 3-stage pipeline when available:
-    1. DINOv3-backed semantic clustering: Group by visual similarity (fast)
-    2. LoFTR: Verify geometric overlap (accurate)
-    3. (Optional) COLMAP: SfM for high-quality clusters
-
-    Falls back to ORB-based clustering if learned models unavailable.
+    Uses MASt3R as the production clustering path. The ORB branch remains only
+    for explicitly disabled overlap detection in local development.
 
     Args:
         db: Database session
@@ -90,9 +76,8 @@ def cluster_photos_by_room(
 
     _reset_photo_clustering_state(active_photos)
 
-    # Try optimized pipeline (DINOv3-backed semantics + LoFTR)
-    if USE_LEARNED_MATCHING and use_overlap_detection and s3_client:
-        return _cluster_with_learned_matching(
+    if use_overlap_detection and s3_client:
+        return _cluster_with_mast3r(
             db,
             job,
             active_photos,
@@ -104,15 +89,15 @@ def cluster_photos_by_room(
     return _cluster_with_orb(db, job, active_photos, s3_client, use_overlap_detection)
 
 
-def _cluster_with_learned_matching(
+def _cluster_with_mast3r(
     db: Session,
     job: Job,
     photos: List[JobPhoto],
     s3_client,
     preloaded_images: Optional[Dict[int, Image.Image]] = None,
 ) -> List[RoomCluster]:
-    """Cluster using optimized DINOv3-backed semantics + LoFTR pipeline."""
-    logger.info("Using optimized DINOv3-backed semantics + LoFTR pipeline")
+    """Cluster using the MASt3R graph pipeline."""
+    logger.info("Using MASt3R graph pipeline")
 
     # Download all images and collect room labels
     images = []
@@ -142,8 +127,8 @@ def _cluster_with_learned_matching(
         # Not enough images for clustering
         return _create_single_cluster(db, job, photos)
 
-    # Run optimized clustering (pass db_session and job_id to save similarity records)
-    cluster_result = cluster_photos_optimized(
+    # Run MASt3R clustering (pass db_session and job_id to save similarity records).
+    cluster_result = cluster_photos_precision_first(
         images, photo_ids, s3_client,
         db_session=db, job_id=job.id,
         room_labels=room_labels,
@@ -157,11 +142,12 @@ def _cluster_with_learned_matching(
     duplicate_of_map: Dict[int, int] = metadata.get("duplicate_of_map", {})
     duplicates_dropped = bool(metadata.get("duplicates_dropped", False))
     transition_sequences = metadata.get("transition_sequences", [])
-    utility_excluded_ids = {
+    utility_excluded_ids = set(int(photo_id) for photo_id in metadata.get("utility_excluded_ids", []) or [])
+    utility_excluded_ids.update({
         int(photo.id)
         for photo in photo_map.values()
         if _should_exclude_utility_room(photo)
-    }
+    })
 
     # Mark duplicate metadata on JobPhoto records.
     for photo in photo_map.values():

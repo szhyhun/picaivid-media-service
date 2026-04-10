@@ -15,14 +15,21 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from app.db.models import JobPhoto, PhotoSimilarity
-from app.pipeline.phase1_analyze.candidate_retrieval import build_candidate_pairs
-from app.pipeline.phase1_analyze.pair_verification import verify_pair_precision_first
-from app.pipeline.phase1_analyze.sequence_builder import build_transition_sequences
+from app.pipeline.phase1_analyze.mast3r_pipeline import run_mast3r_phase1
 
 logger = logging.getLogger(__name__)
 PRE_PIPELINE_DUPLICATE_SIMILARITY_THRESHOLD = 0.99
 PRE_PIPELINE_DUPLICATE_MAX_GAP = 4
 PRE_PIPELINE_DUPLICATE_PHASH_MAX_DISTANCE = 8
+PRE_PIPELINE_UTILITY_ROOM_LABELS = {
+    "garage",
+    "storage",
+    "storage room",
+    "laundry room",
+    "utility room",
+    "mechanical room",
+    "boiler room",
+}
 
 
 def _normalize_embedding(value: object) -> list[float] | None:
@@ -83,6 +90,50 @@ def _photo_quality_score(row: JobPhoto | None) -> float:
     exposure = float(row.exposure_score or 0.0)
     composition = float(row.composition_score or 0.0)
     return 0.45 * base_score + 0.20 * sharpness + 0.20 * exposure + 0.15 * composition
+
+
+def _prefilter_utility_rooms(
+    image_list: list[object],
+    photo_ids: list[int],
+    positions: list[int],
+    room_labels: list[str],
+    embeddings: np.ndarray | None,
+    quality_scores: list[float],
+) -> tuple[list[object], list[int], list[int], list[str], np.ndarray | None, list[float], list[int]]:
+    excluded_indices: list[int] = []
+    excluded_photo_ids: list[int] = []
+    for idx, room_label in enumerate(room_labels):
+        normalized = (room_label or "").strip().lower().replace("_", " ")
+        if normalized in PRE_PIPELINE_UTILITY_ROOM_LABELS:
+            excluded_indices.append(idx)
+            excluded_photo_ids.append(int(photo_ids[idx]))
+
+    if not excluded_indices:
+        return image_list, photo_ids, positions, room_labels, embeddings, quality_scores, []
+
+    excluded_set = set(excluded_indices)
+    keep_indices = [idx for idx in range(len(photo_ids)) if idx not in excluded_set]
+    filtered_images = [image_list[idx] for idx in keep_indices]
+    filtered_photo_ids = [int(photo_ids[idx]) for idx in keep_indices]
+    filtered_positions = [int(positions[idx]) for idx in keep_indices]
+    filtered_rooms = [room_labels[idx] for idx in keep_indices]
+    filtered_quality = [float(quality_scores[idx]) for idx in keep_indices]
+    filtered_embeddings = embeddings[keep_indices] if embeddings is not None else None
+    logger.info(
+        "Precision prefilter removed utility photos before retrieval: removed=%s kept=%s ids=%s",
+        len(excluded_photo_ids),
+        len(filtered_photo_ids),
+        excluded_photo_ids,
+    )
+    return (
+        filtered_images,
+        filtered_photo_ids,
+        filtered_positions,
+        filtered_rooms,
+        filtered_embeddings,
+        filtered_quality,
+        excluded_photo_ids,
+    )
 
 
 def _prefilter_obvious_duplicates(
@@ -226,7 +277,7 @@ def _persist_embeddings(db_session, photo_ids: list[int], embeddings: np.ndarray
 def _persist_pair_records(db_session, job_id: int, pair_records: list[dict[str, Any]]) -> None:
     if db_session is None or job_id is None:
         return
-    db_session.query(PhotoSimilarity).filter(PhotoSimilarity.job_id == int(job_id)).delete()
+    db_session.query(PhotoSimilarity).filter(PhotoSimilarity.job_id == int(job_id)).delete(synchronize_session=False)
     if not pair_records:
         db_session.flush()
         return
@@ -260,12 +311,13 @@ def _build_clusters(
     eligible.sort(
         key=lambda row: (
             float(row.get("pair_rank", 0.0) or 0.0),
+            float(row.get("overlap_ratio", 0.0) or 0.0),
+            float(row.get("combined_geometry_score", 0.0) or 0.0),
+            float(row.get("reciprocal_match_count", 0.0) or 0.0),
             float(row.get("order_proximity", 0.0) or 0.0),
-            float(row.get("dinov2_similarity", 0.0) or 0.0),
         ),
         reverse=True,
     )
-
     assigned: set[int] = set()
     clusters: list[list[int]] = []
     for record in eligible:
@@ -273,20 +325,21 @@ def _build_clusters(
         right = int(record["photo_b_id"])
         if left in assigned or right in assigned:
             continue
-        room_left = (room_by_photo.get(left) or "").strip().lower()
-        room_right = (room_by_photo.get(right) or "").strip().lower()
-        if room_left and room_right and room_left != "unknown" and room_right != "unknown" and room_left != room_right:
+        room_left = normalize_room_label(room_by_photo.get(left))
+        room_right = normalize_room_label(room_by_photo.get(right))
+        if not room_left or room_left == "unknown":
             continue
-        pair = sorted([left, right], key=lambda photo_id: positions_by_photo.get(photo_id, 0))
-        clusters.append(pair)
+        if room_left != room_right:
+            continue
+        clusters.append(sorted([left, right], key=lambda photo_id: positions_by_photo.get(photo_id, 0)))
         assigned.add(left)
         assigned.add(right)
 
-    for photo_id in sorted(photo_ids, key=lambda value: positions_by_photo.get(value, 0)):
-        if photo_id not in assigned:
+    for photo_id in photo_ids:
+        if int(photo_id) not in assigned:
             clusters.append([int(photo_id)])
 
-    clusters.sort(key=lambda cluster: min(positions_by_photo.get(photo_id, 0) for photo_id in cluster))
+    clusters.sort(key=lambda cluster: positions_by_photo.get(cluster[0], 0))
     return clusters
 
 
@@ -298,7 +351,7 @@ def cluster_photos_precision_first(
     room_labels: list[str] | None = None,
     return_metadata: bool = False,
 ) -> list[list[int]] | tuple[list[list[int]], dict[str, object]]:
-    """Run the precision-first candidate -> verify -> certify pipeline."""
+    """Run the MASt3R-first graph pipeline with conservative 2-photo clustering."""
     image_list = list(images)
     if len(image_list) <= 1:
         clusters = [photo_ids] if photo_ids else []
@@ -306,12 +359,21 @@ def cluster_photos_precision_first(
             return clusters, {"duplicate_of_map": {}, "duplicates_dropped": False, "transition_sequences": []}
         return clusters
 
-    logger.info("Precision-first pipeline start: photos=%s job_id=%s", len(photo_ids), job_id)
+    logger.info("MASt3R graph pipeline start: photos=%s job_id=%s", len(photo_ids), job_id)
 
     positions, resolved_room_labels, persisted_embeddings, quality_scores = _load_job_photo_context(
         db_session=db_session,
         photo_ids=photo_ids,
         room_labels=room_labels,
+    )
+    utility_excluded_photo_ids: list[int] = []
+    image_list, photo_ids, positions, resolved_room_labels, persisted_embeddings, quality_scores, utility_excluded_photo_ids = _prefilter_utility_rooms(
+        image_list=image_list,
+        photo_ids=photo_ids,
+        positions=positions,
+        room_labels=resolved_room_labels,
+        embeddings=persisted_embeddings,
+        quality_scores=quality_scores,
     )
     pre_pipeline_duplicate_of_map: dict[int, int] = {}
     image_list, photo_ids, positions, resolved_room_labels, persisted_embeddings, pre_pipeline_duplicate_of_map = _prefilter_obvious_duplicates(
@@ -322,119 +384,29 @@ def cluster_photos_precision_first(
         embeddings=persisted_embeddings,
         quality_scores=quality_scores,
     )
-    candidate_stage_started_at = time.perf_counter()
-    embeddings, similarity, candidates = build_candidate_pairs(
-        image_list,
+    _persist_embeddings(db_session, photo_ids, persisted_embeddings) if persisted_embeddings is not None else None
+    pipeline_started_at = time.perf_counter()
+    final_clusters, pair_records, pose_rows, similarity, transition_sequences = run_mast3r_phase1(
+        images=image_list,
+        photo_ids=photo_ids,
         positions=positions,
         room_labels=resolved_room_labels,
-        embeddings=persisted_embeddings,
+        db_session=db_session,
+        job_id=job_id,
     )
-    logger.info(
-        "Precision-first candidate retrieval complete: candidates=%s elapsed_ms=%.1f",
-        len(candidates),
-        (time.perf_counter() - candidate_stage_started_at) * 1000.0,
-    )
-    _persist_embeddings(db_session, photo_ids, embeddings)
-
-    depth_cache: dict[int, np.ndarray] = {}
-    preprocessed_cache: dict[int, dict[str, Any]] = {}
-    repeated_room_cue_cache: dict[int, dict[str, Any]] = {}
-    semantic_region_cache: dict[int, dict[str, Any]] = {}
-    pair_records: list[dict[str, Any]] = []
-    total_candidates = len(candidates)
-    for idx, candidate in enumerate(candidates, start=1):
-        photo_a_id = int(photo_ids[candidate.left_idx])
-        photo_b_id = int(photo_ids[candidate.right_idx])
-        pair_started_at = time.perf_counter()
-        logger.info(
-            "Precision-first pair %s/%s: %s <-> %s source=%s dino=%.3f",
-            idx,
-            total_candidates,
-            photo_a_id,
-            photo_b_id,
-            candidate.pair_source,
-            float(candidate.dinov2_similarity),
-        )
-        result = verify_pair_precision_first(
-            photo_a_id=photo_a_id,
-            photo_b_id=photo_b_id,
-            image_a=image_list[candidate.left_idx],
-            image_b=image_list[candidate.right_idx],
-            dinov2_similarity=float(candidate.dinov2_similarity),
-            position_a=int(positions[candidate.left_idx]),
-            position_b=int(positions[candidate.right_idx]),
-            room_label_a=resolved_room_labels[candidate.left_idx],
-            room_label_b=resolved_room_labels[candidate.right_idx],
-            depth_cache=depth_cache,
-            preprocessed_cache=preprocessed_cache,
-            repeated_room_cue_cache=repeated_room_cue_cache,
-            semantic_region_cache=semantic_region_cache,
-        )
-        result["pair_source"] = candidate.pair_source
-        result["photo_a_id"] = min(photo_a_id, photo_b_id)
-        result["photo_b_id"] = max(photo_a_id, photo_b_id)
-        compact_result = {
-            key: value
-            for key, value in result.items()
-            if key not in {"raw_matches_payload", "inlier_matches_payload", "semantic_regions_left", "semantic_regions_right"}
-        }
-        pair_records.append(compact_result)
-        logger.info(
-            "Precision-first result %s/%s: %s <-> %s status=%s rank=%.3f inliers=%s overlap=%.3f crossing=%.3f elapsed_ms=%.1f",
-            idx,
-            total_candidates,
-            photo_a_id,
-            photo_b_id,
-            str(compact_result.get("certification_status") or "reject"),
-            float(compact_result.get("pair_rank", 0.0) or 0.0),
-            int(compact_result.get("f_inliers", 0) or 0),
-            float(compact_result.get("overlap_ratio", 0.0) or 0.0),
-            float(compact_result.get("crossing_penalty", 0.0) or 0.0),
-            (time.perf_counter() - pair_started_at) * 1000.0,
-        )
-
-    # Release per-photo caches so GPU tensors and numpy arrays are freed before
-    # the clustering/sequence steps that follow.  preprocessed_cache is the most
-    # important because it holds LoFTR native tensors which may occupy GPU VRAM.
-    preprocessed_cache.clear()
-    depth_cache.clear()
-    semantic_region_cache.clear()
-    repeated_room_cue_cache.clear()
-    if _HAS_TORCH:
-        try:
-            if _torch.cuda.is_available():
-                _torch.cuda.synchronize()
-                _torch.cuda.empty_cache()
-        except Exception:
-            pass
-    logger.debug("Cleared per-photo caches and released device cache after pair loop")
-
     _persist_pair_records(db_session, job_id, pair_records)
-
-    positions_by_photo = {int(photo_ids[idx]): int(positions[idx]) for idx in range(len(photo_ids))}
-    room_by_photo = {int(photo_ids[idx]): resolved_room_labels[idx] for idx in range(len(photo_ids))}
-    final_clusters = _build_clusters(
-        photo_ids=photo_ids,
-        pair_records=pair_records,
-        positions_by_photo=positions_by_photo,
-        room_by_photo=room_by_photo,
-    )
-    cluster_by_photo: dict[int, int] = {}
-    for cluster_index, cluster in enumerate(final_clusters):
-        for photo_id in cluster:
-            cluster_by_photo[int(photo_id)] = cluster_index
-
-    transition_sequences = build_transition_sequences(
-        photo_ids=[int(photo_id) for photo_id in photo_ids],
-        pair_records=pair_records,
-        room_labels=room_by_photo,
-        cluster_by_photo=cluster_by_photo,
+    logger.info(
+        "MASt3R graph inference complete: photos=%s edges=%s poses=%s elapsed_ms=%.1f",
+        len(photo_ids),
+        len(pair_records),
+        len(pose_rows),
+        (time.perf_counter() - pipeline_started_at) * 1000.0,
     )
 
     logger.info(
-        "Precision-first clustering complete: photos=%s candidates=%s certified=%s clusters=%s sequences=%s",
+        "MASt3R clustering complete: photos=%s edges=%s certified=%s clusters=%s sequences=%s",
         len(photo_ids),
-        len(candidates),
+        len(pair_records),
         sum(1 for record in pair_records if str(record.get("certification_status")) in {"strong", "usable"}),
         len(final_clusters),
         len(transition_sequences),
@@ -444,6 +416,7 @@ def cluster_photos_precision_first(
         return final_clusters, {
             "duplicate_of_map": pre_pipeline_duplicate_of_map,
             "duplicates_dropped": bool(pre_pipeline_duplicate_of_map),
+            "utility_excluded_ids": utility_excluded_photo_ids,
             "pair_records": pair_records,
             "transition_sequences": transition_sequences,
             "similarity_matrix": similarity,

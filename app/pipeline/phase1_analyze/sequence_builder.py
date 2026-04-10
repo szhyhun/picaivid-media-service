@@ -40,21 +40,18 @@ def _room_compatible(room_a: str | None, room_b: str | None) -> bool:
 def _sequence_score(path_edges: list[dict[str, Any]], positions: dict[int, int], blob_centers: list[float]) -> float:
     pair_ranks = [float(edge.get("pair_rank", 0.0) or 0.0) for edge in path_edges]
     overlaps = [float(edge.get("overlap_ratio", 0.0) or 0.0) for edge in path_edges]
-    coverages = [float(edge.get("coverage_4x4", 0.0) or 0.0) for edge in path_edges]
     crossings = [1.0 - float(edge.get("crossing_penalty", 0.0) or 0.0) for edge in path_edges]
     order_steps = []
     for edge in path_edges:
         order_steps.append(float(edge.get("order_proximity", 0.0) or 0.0))
     overlap_stability = 1.0 - float(np.std(overlaps)) if len(overlaps) > 1 else (overlaps[0] if overlaps else 0.0)
-    coverage_stability = 1.0 - float(np.std(coverages)) if len(coverages) > 1 else (coverages[0] if coverages else 0.0)
     order_smoothness = float(np.mean(order_steps)) if order_steps else 0.0
     crossing_safety = float(np.mean(crossings)) if crossings else 0.0
     anchor_persistence = 1.0 - float(np.var(blob_centers)) if len(blob_centers) > 1 else 1.0
     return float(
         np.clip(
             0.35 * float(np.mean(pair_ranks))
-            + 0.20 * overlap_stability
-            + 0.15 * coverage_stability
+            + 0.35 * overlap_stability
             + 0.15 * order_smoothness
             + 0.10 * crossing_safety
             + 0.05 * anchor_persistence,

@@ -11,6 +11,35 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+_PLACEHOLDER_CREDENTIALS = {
+    "",
+    "use-instance-role-or-set-if-needed",
+    "unset",
+    "none",
+    "null",
+}
+
+
+def _optional_setting(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _aws_credentials_kwargs() -> dict[str, str]:
+    access_key = _optional_setting(settings.AWS_ACCESS_KEY_ID)
+    secret_key = _optional_setting(settings.AWS_SECRET_ACCESS_KEY)
+    if (
+        not access_key
+        or not secret_key
+        or access_key.lower() in _PLACEHOLDER_CREDENTIALS
+        or secret_key.lower() in _PLACEHOLDER_CREDENTIALS
+    ):
+        return {}
+    return {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
+
 
 class S3Client:
     """S3 client wrapper for MinIO/S3 compatible storage."""
@@ -27,14 +56,15 @@ class S3Client:
                 signature_version='s3v4',
                 s3={'addressing_style': 'path'}
             )
-            self._client = boto3.client(
-                's3',
-                endpoint_url=settings.S3_ENDPOINT,
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-                region_name=settings.AWS_REGION,
-                config=config,
-            )
+            kwargs = {
+                "region_name": settings.AWS_REGION,
+                "config": config,
+                **_aws_credentials_kwargs(),
+            }
+            endpoint_url = _optional_setting(settings.S3_ENDPOINT)
+            if endpoint_url:
+                kwargs["endpoint_url"] = endpoint_url
+            self._client = boto3.client('s3', **kwargs)
         return self._client
 
     def download_image(self, s3_uri: str) -> Image.Image:

@@ -15,18 +15,16 @@ class Settings(BaseSettings):
     # Database (Postgres is system of record)
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/picaivid_development"
 
-    # AWS S3 (MinIO for local)
+    # AWS S3 (set credentials/endpoints explicitly for local MinIO; omit for AWS IAM roles)
     AWS_REGION: str = "us-east-1"
-    AWS_ACCESS_KEY_ID: str = "minioadmin"
-    AWS_SECRET_ACCESS_KEY: str = "minioadmin"
+    AWS_ACCESS_KEY_ID: str | None = None
+    AWS_SECRET_ACCESS_KEY: str | None = None
     S3_BUCKET: str = "picaivid-dev"
-    S3_ENDPOINT: str | None = "http://localhost:9000"
+    S3_ENDPOINT: str | None = None
 
-    # AWS SQS (LocalStack for local)
-    SQS_ENDPOINT: str | None = "http://localhost:4566"
+    # AWS SQS (set endpoint explicitly for local LocalStack; omit for AWS)
+    SQS_ENDPOINT: str | None = None
     SQS_QUEUE_URL: str = "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/picaivid-jobs"
-    SQS_ACCESS_KEY_ID: str = "localstack"
-    SQS_SECRET_ACCESS_KEY: str = "localstack"
 
     # Rails webhook URL for status updates
     RAILS_WEBHOOK_URL: str | None = "http://localhost:3000"
@@ -36,41 +34,32 @@ class Settings(BaseSettings):
 
     # ML Models
     MODEL_CACHE_DIR: str = "./ml_models"
-    DINO_V3_CACHE_ARCHIVE_S3_URI: str | None = None
-    DINO_V3_ALLOW_REMOTE_FALLBACK: bool = True
-    SEMANTIC_REGIONS_ENABLED: bool = True
-    SEMANTIC_REGIONS_BACKEND: str = "sam2_clip"
-    SEMANTIC_MATCH_EDGE_DILATION_PX: int = 6
-    SEMANTIC_REMOTE_FALLBACK: bool = False
-    SAM2_REPO_DIR: str | None = None
-    SAM2_CHECKPOINT: str | None = None
-    SAM2_CONFIG: str | None = None
+    ANALYSIS_MATCH_ENGINE: str = "mast3r_graph"
+    MAST3R_REPO_DIR: str | None = None
+    MAST3R_REPO_ARCHIVE_S3_URI: str | None = None
+    MAST3R_MODEL_CHECKPOINT: str | None = None
+    MAST3R_MODEL_CHECKPOINT_S3_URI: str | None = None
+    MAST3R_RETRIEVAL_CHECKPOINT: str | None = None
+    MAST3R_RETRIEVAL_CHECKPOINT_S3_URI: str | None = None
+    MAST3R_RETRIEVAL_CODEBOOK: str | None = None
+    MAST3R_RETRIEVAL_CODEBOOK_S3_URI: str | None = None
+    MAST3R_IMAGE_SIZE: int = 512
+    MAST3R_SCENE_GRAPH_ANCHORS: int = 20
+    MAST3R_SCENE_GRAPH_K: int = 10
+    MAST3R_MATCHING_CONFIDENCE_THRESHOLD: float = 5.0
+    MAST3R_LR1: float = 0.07
+    MAST3R_NITER1: int = 300
+    MAST3R_LR2: float = 0.01
+    MAST3R_NITER2: int = 300
+    MAST3R_SHARED_INTRINSICS: bool = False
+    MAST3R_MIN_RETRIEVAL_SCORE: float = 0.15
+    MAST3R_MIN_RECIPROCAL_MATCHES: int = 24
+    MAST3R_MIN_POINTMAP_CONSISTENCY: float = 0.25
+    MAST3R_MIN_PARALLAX_SCORE: float = 0.015
+    MAST3R_MIN_GRAPH_EDGE_SCORE: float = 0.34
+    MAST3R_SUGGESTION_MIN_EDGE_SCORE: float = 0.24
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
-    ROMA_DEBUG_DEVICE: str = "auto"
-    MATCHFORMER_DEBUG_DEVICE: str = "auto"
-
-    # ZJU LoFTR strict debug settings
-    LOFTR_ZJU_REPO_DIR: str | None = None
-    LOFTR_ZJU_REPO_ARCHIVE_S3_URI: str | None = None
-    LOFTR_ZJU_INDOOR_CKPT: str | None = None
-    LOFTR_ZJU_INDOOR_CKPT_S3_URI: str | None = None
-    LOFTR_ZJU_INDOOR_DS_CKPT: str | None = None
-    LOFTR_ZJU_INDOOR_DS_CKPT_S3_URI: str | None = None
-    LOFTR_ZJU_INDOOR_OT_CKPT: str | None = None
-    LOFTR_ZJU_INDOOR_OT_CKPT_S3_URI: str | None = None
-    LOFTR_ZJU_OUTDOOR_DS_CKPT: str | None = None
-    LOFTR_ZJU_OUTDOOR_DS_CKPT_S3_URI: str | None = None
-    LOFTR_ZJU_OUTDOOR_OT_CKPT: str | None = None
-    LOFTR_ZJU_OUTDOOR_OT_CKPT_S3_URI: str | None = None
-
-    # MatchFormer strict debug settings
-    MATCHFORMER_REPO_DIR: str | None = None
-    MATCHFORMER_REPO_ARCHIVE_S3_URI: str | None = None
-    MATCHFORMER_INDOOR_CKPT: str | None = None
-    MATCHFORMER_INDOOR_CKPT_S3_URI: str | None = None
-    MATCHFORMER_OUTDOOR_CKPT: str | None = None
-    MATCHFORMER_OUTDOOR_CKPT_S3_URI: str | None = None
 
     # Clustering behavior
     DELETE_OBVIOUS_DUPLICATES: bool = True
@@ -93,15 +82,6 @@ class Settings(BaseSettings):
     COMPONENT_AMBIGUOUS_SAME_LABEL_MIN: float = 0.82
     COMPONENT_CROSS_LABEL_ADJ_MIN: float = 0.84
     COMPONENT_CROSS_LABEL_DIST2_MIN: float = 0.88
-
-    # Kornia geometric oracle (A/B)
-    # off: disabled, shadow: log-only, gate: enforce oracle pass for geometric edges
-    KORNIA_ORACLE_MODE: str = "off"
-    KORNIA_ORACLE_MIN_OVERLAP_RATIO: float = 0.08
-    KORNIA_ORACLE_MIN_SIDE_OVERLAP: float = 0.06
-    KORNIA_ORACLE_MIN_CENTER_OVERLAP: float = 0.09
-    KORNIA_ORACLE_MIN_INLIER_RATIO: float = 0.20
-    KORNIA_ORACLE_INLIER_THRESHOLD_PX: float = 2.0
 
     # Logging
     LOG_LEVEL: str = "INFO"

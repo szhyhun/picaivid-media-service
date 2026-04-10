@@ -10,6 +10,46 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+_PLACEHOLDER_CREDENTIALS = {
+    "",
+    "use-instance-role-or-set-if-needed",
+    "unset",
+    "none",
+    "null",
+}
+
+
+def _optional_setting(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _aws_credentials_kwargs() -> dict[str, str]:
+    access_key = _optional_setting(settings.AWS_ACCESS_KEY_ID)
+    secret_key = _optional_setting(settings.AWS_SECRET_ACCESS_KEY)
+    if (
+        not access_key
+        or not secret_key
+        or access_key.lower() in _PLACEHOLDER_CREDENTIALS
+        or secret_key.lower() in _PLACEHOLDER_CREDENTIALS
+    ):
+        return {}
+    return {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
+
+
+def _sqs_client_kwargs() -> dict:
+    kwargs = {
+        "region_name": settings.AWS_REGION,
+        **_aws_credentials_kwargs(),
+    }
+    endpoint_url = _optional_setting(settings.SQS_ENDPOINT)
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    return kwargs
+
 
 class SQSConsumer:
     """SQS message consumer for job processing."""
@@ -32,13 +72,7 @@ class SQSConsumer:
     def client(self):
         """Lazy-load SQS client."""
         if self._client is None:
-            self._client = boto3.client(
-                'sqs',
-                endpoint_url=settings.SQS_ENDPOINT,
-                aws_access_key_id=settings.SQS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.SQS_SECRET_ACCESS_KEY,
-                region_name=settings.AWS_REGION,
-            )
+            self._client = boto3.client('sqs', **_sqs_client_kwargs())
         return self._client
 
     def start(self) -> None:
@@ -111,13 +145,7 @@ def send_message(message: dict, queue_url: Optional[str] = None) -> str:
     Returns:
         Message ID
     """
-    client = boto3.client(
-        'sqs',
-        endpoint_url=settings.SQS_ENDPOINT,
-        aws_access_key_id=settings.SQS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.SQS_SECRET_ACCESS_KEY,
-        region_name=settings.AWS_REGION,
-    )
+    client = boto3.client('sqs', **_sqs_client_kwargs())
 
     url = queue_url or settings.SQS_QUEUE_URL
     response = client.send_message(

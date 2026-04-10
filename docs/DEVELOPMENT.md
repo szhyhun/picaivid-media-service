@@ -48,7 +48,7 @@ alembic upgrade head
 ## Common Checks
 
 ```bash
-./venv/bin/python -m py_compile app/main.py app/pipeline/phase1_analyze/learned_matching.py
+./venv/bin/python -m py_compile app/main.py app/pipeline/phase1_analyze/mast3r_pipeline.py
 ```
 
 If clustering logic changed, run baseline comparison from `scripts/baselines/README.md`.
@@ -58,9 +58,8 @@ If clustering logic changed, run baseline comparison from `scripts/baselines/REA
 When testing pair-debug latency, use `pair_debug_timing` logs from media-service.
 Key fields:
 
-- `model_loftr_ms` (inference time)
 - `model_device`, `tensor_device`
 - `cuda_available`, `preferred_device`
+- `model_mast3r_inference_ms`
 
-On local Mac, CPU or MPS may be used.
-On AWS production, target must be CUDA (`model_device=cuda`).
+MASt3R phase 1 and live pair debug require CUDA. On AWS, target must be `model_device=cuda`.

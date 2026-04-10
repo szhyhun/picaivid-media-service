@@ -524,8 +524,8 @@ class Phase1Analyzer:
                 self.db.query(PhotoSimilarity)
                 .filter(PhotoSimilarity.job_id == job_id)
                 .filter(PhotoSimilarity.is_connected == 1)
-                .filter(PhotoSimilarity.f_inliers.isnot(None))
-                .filter(PhotoSimilarity.f_inliers >= 20)
+                .filter(PhotoSimilarity.reciprocal_match_count.isnot(None))
+                .filter(PhotoSimilarity.reciprocal_match_count >= 20)
                 .filter(PhotoSimilarity.pair_rank.isnot(None))
                 .filter(PhotoSimilarity.pair_rank >= 0.30)
                 .all()
@@ -567,7 +567,7 @@ class Phase1Analyzer:
                         "Photo %s room relabel: living room -> dining room (strong certified dining link to %s, inliers=%s, rank=%.3f)",
                         candidate.id,
                         other.id,
-                        int(sim.f_inliers or 0),
+                        int(sim.reciprocal_match_count or 0),
                         float(sim.pair_rank or 0.0),
                     )
 

@@ -1,52 +1,49 @@
+"""Local/S3 artifact hydration helpers for phase-1 model assets."""
+from __future__ import annotations
+
 import logging
 import os
 import shutil
-import sys
 import tarfile
 import tempfile
-import warnings
 import zipfile
-from abc import ABC, abstractmethod
-from copy import deepcopy
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 from urllib.parse import urlparse
 
 import boto3
-import torch
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_ZJU_DEBUG_ENV_BY_VARIANT: Dict[str, str] = {
-    "indoor_ds": "LOFTR_ZJU_INDOOR_DS_CKPT",
-    "indoor_ot": "LOFTR_ZJU_INDOOR_OT_CKPT",
+_PLACEHOLDER_CREDENTIALS = {
+    "",
+    "use-instance-role-or-set-if-needed",
+    "unset",
+    "none",
+    "null",
 }
-_MATCHFORMER_DEBUG_ENV_BY_VARIANT: Dict[str, str] = {
-    "indoor": "MATCHFORMER_INDOOR_CKPT",
-    "outdoor": "MATCHFORMER_OUTDOOR_CKPT",
-}
 
 
-def _preferred_torch_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    mps_backend = getattr(torch.backends, "mps", None)
-    if mps_backend is not None and bool(mps_backend.is_available()):
-        return torch.device("mps")
-    return torch.device("cpu")
+def _optional_setting(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
-def _same_torch_device(a: torch.device, b: torch.device) -> bool:
-    if a.type != b.type:
-        return False
-    if a.type in {"cpu", "mps"}:
-        return True
-    if a.type == "cuda":
-        if a.index is None or b.index is None:
-            return True
-        return a.index == b.index
-    return a == b
+def _aws_credentials_kwargs() -> Dict[str, str]:
+    access_key = _optional_setting(settings.AWS_ACCESS_KEY_ID)
+    secret_key = _optional_setting(settings.AWS_SECRET_ACCESS_KEY)
+    if (
+        not access_key
+        or not secret_key
+        or access_key.lower() in _PLACEHOLDER_CREDENTIALS
+        or secret_key.lower() in _PLACEHOLDER_CREDENTIALS
+    ):
+        return {}
+    return {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
 
 
 def _env_or_settings(name: str, default: str = "") -> str:
@@ -60,13 +57,14 @@ def _env_or_settings(name: str, default: str = "") -> str:
 
 
 def _s3_client():
-    return boto3.client(
-        "s3",
-        region_name=settings.AWS_REGION,
-        endpoint_url=settings.S3_ENDPOINT,
-        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    )
+    kwargs = {
+        "region_name": settings.AWS_REGION,
+        **_aws_credentials_kwargs(),
+    }
+    endpoint_url = _optional_setting(settings.S3_ENDPOINT)
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    return boto3.client("s3", **kwargs)
 
 
 def _parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
@@ -98,15 +96,22 @@ def _extract_archive(archive_path: str, destination_dir: str) -> None:
     raise RuntimeError(f"Unsupported matcher asset archive format: {archive_path}")
 
 
-def _hydrate_repo_from_s3(target_dir: str, archive_s3_uri: str) -> str:
-    if os.path.isdir(target_dir) and os.listdir(target_dir):
-        return target_dir
-    os.makedirs(os.path.dirname(target_dir), exist_ok=True)
-    tmp_root = tempfile.mkdtemp(prefix="matcher_repo_")
+def _ensure_local_repo(path_value: str, s3_uri_env: str) -> str:
+    if path_value and os.path.isdir(path_value):
+        return path_value
+    s3_uri = _env_or_settings(s3_uri_env, "")
+    if not path_value:
+        raise RuntimeError(f"Missing local repo path and no target path configured for {s3_uri_env}")
+    if not s3_uri:
+        raise RuntimeError(f"Required repo not found locally and no S3 fallback configured: {path_value}")
+
+    logger.info("Hydrating model repo from S3: %s -> %s", s3_uri, path_value)
+    os.makedirs(os.path.dirname(path_value), exist_ok=True)
+    tmp_root = tempfile.mkdtemp(prefix="model_repo_")
     try:
-        archive_name = os.path.basename(urlparse(str(archive_s3_uri)).path) or "matcher_repo.zip"
+        archive_name = os.path.basename(urlparse(str(s3_uri)).path) or "model_repo.zip"
         archive_path = os.path.join(tmp_root, archive_name)
-        _download_file_from_s3(archive_path, archive_s3_uri)
+        _download_file_from_s3(archive_path, s3_uri)
         extracted_root = os.path.join(tmp_root, "extracted")
         os.makedirs(extracted_root, exist_ok=True)
         _extract_archive(archive_path, extracted_root)
@@ -117,14 +122,14 @@ def _hydrate_repo_from_s3(target_dir: str, archive_s3_uri: str) -> str:
         else:
             source_dir = extracted_root
 
-        tmp_target = f"{target_dir}.tmp"
+        tmp_target = f"{path_value}.tmp"
         if os.path.isdir(tmp_target):
             shutil.rmtree(tmp_target)
         shutil.copytree(source_dir, tmp_target)
-        if os.path.isdir(target_dir):
-            shutil.rmtree(target_dir)
-        os.replace(tmp_target, target_dir)
-        return target_dir
+        if os.path.isdir(path_value):
+            shutil.rmtree(path_value)
+        os.replace(tmp_target, path_value)
+        return path_value
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -137,449 +142,5 @@ def _ensure_local_file(path_value: str, s3_uri_env: str) -> str:
         raise RuntimeError(f"Missing local path and no target path configured for {s3_uri_env}")
     if not s3_uri:
         raise RuntimeError(f"Required file not found locally and no S3 fallback configured: {path_value}")
-    logger.info("Hydrating matcher file from S3: %s -> %s", s3_uri, path_value)
+    logger.info("Hydrating model file from S3: %s -> %s", s3_uri, path_value)
     return _download_file_from_s3(path_value, s3_uri)
-
-
-def _ensure_local_repo(path_value: str, s3_uri_env: str) -> str:
-    if path_value and os.path.isdir(path_value):
-        return path_value
-    s3_uri = _env_or_settings(s3_uri_env, "")
-    if not path_value:
-        raise RuntimeError(f"Missing local repo path and no target path configured for {s3_uri_env}")
-    if not s3_uri:
-        raise RuntimeError(f"Required repo not found locally and no S3 fallback configured: {path_value}")
-    logger.info("Hydrating matcher repo from S3: %s -> %s", s3_uri, path_value)
-    return _hydrate_repo_from_s3(path_value, s3_uri)
-
-
-def _cfg_to_lower_dict(config: Any) -> Any:
-    if isinstance(config, dict):
-        return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
-    if isinstance(config, (list, tuple)):
-        converted = [_cfg_to_lower_dict(v) for v in config]
-        return type(config)(converted) if isinstance(config, tuple) else converted
-    if hasattr(config, "items"):
-        return {str(k).lower(): _cfg_to_lower_dict(v) for k, v in config.items()}
-    return config
-
-
-def _purge_module_prefixes(*prefixes: str) -> None:
-    prefixes = tuple(str(prefix) for prefix in prefixes if str(prefix))
-    if not prefixes:
-        return
-    for module_name in list(sys.modules.keys()):
-        if any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes):
-            sys.modules.pop(module_name, None)
-
-
-def _matchformer_config_for_variant(cfg: Any, variant: str) -> Any:
-    if variant == "indoor":
-        cfg.MATCHFORMER.BACKBONE_TYPE = "largesea"
-        cfg.MATCHFORMER.SCENS = "indoor"
-    elif variant == "outdoor":
-        cfg.MATCHFORMER.BACKBONE_TYPE = "largela"
-        cfg.MATCHFORMER.SCENS = "outdoor"
-    else:
-        raise RuntimeError(f"Unsupported MatchFormer debug variant '{variant}'")
-
-    cfg.MATCHFORMER.RESOLUTION = (8, 2)
-    cfg.MATCHFORMER.COARSE.D_MODEL = 256
-    cfg.MATCHFORMER.COARSE.D_FFN = 256
-    return cfg
-
-
-class _BaseMatcherLoader(ABC):
-    def __init__(self) -> None:
-        self._cache: Dict[str, Any] = {}
-        self._meta_cache: Dict[str, Dict[str, str]] = {}
-
-    def is_cached(self, key: str) -> bool:
-        return str(key) in self._cache
-
-    def load(self, key: str) -> Tuple[Any, Dict[str, str]]:
-        cache_key = str(key)
-        preferred = self._resolve_device(cache_key)
-        if cache_key in self._cache:
-            matcher = self._cache[cache_key]
-            matcher = self._move_cached_matcher(cache_key, matcher, preferred)
-            return matcher, dict(self._meta_cache.get(cache_key, {}))
-
-        matcher, meta = self._build(cache_key, preferred)
-        matcher = matcher.to(preferred)
-        matcher.eval()
-        self._cache[cache_key] = matcher
-        self._meta_cache[cache_key] = dict(meta)
-        self._log_loaded(cache_key, preferred)
-        return matcher, dict(self._meta_cache[cache_key])
-
-    def _move_cached_matcher(self, key: str, matcher: Any, preferred: torch.device) -> Any:
-        current = self._matcher_device(matcher)
-        if not _same_torch_device(current, preferred):
-            matcher = matcher.to(preferred)
-            matcher.eval()
-            self._cache[key] = matcher
-            self._log_moved(key, current, preferred)
-        return matcher
-
-    def _matcher_device(self, matcher: Any) -> torch.device:
-        try:
-            return next(matcher.parameters()).device
-        except Exception:
-            return torch.device("cpu")
-
-    def _resolve_device(self, key: str) -> torch.device:
-        return _preferred_torch_device()
-
-    @abstractmethod
-    def _build(self, key: str, preferred: torch.device) -> Tuple[Any, Dict[str, str]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _log_loaded(self, key: str, preferred: torch.device) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _log_moved(self, key: str, current: torch.device, preferred: torch.device) -> None:
-        raise NotImplementedError
-
-
-class _KorniaLoFTRLoader(_BaseMatcherLoader):
-    def _build(self, key: str, preferred: torch.device) -> Tuple[Any, Dict[str, str]]:
-        from kornia.feature import LoFTR
-
-        matcher = LoFTR(pretrained=key)
-        return matcher, {"checkpoint": key}
-
-    def _log_loaded(self, key: str, preferred: torch.device) -> None:
-        logger.info("Loaded LoFTR matcher (%s) on %s", key, preferred)
-
-    def _log_moved(self, key: str, current: torch.device, preferred: torch.device) -> None:
-        logger.info("Moved cached LoFTR matcher (%s) from %s to %s", key, current, preferred)
-
-
-class _ZJUDebugMatcherLoader(_BaseMatcherLoader):
-    def _repo_dir(self) -> str:
-        repo_dir = _env_or_settings("LOFTR_ZJU_REPO_DIR", "")
-        if not repo_dir:
-            raise RuntimeError("ZJU debug matcher is missing env LOFTR_ZJU_REPO_DIR")
-        return _ensure_local_repo(repo_dir, "LOFTR_ZJU_REPO_ARCHIVE_S3_URI")
-
-    def _checkpoint_path(self, variant: str) -> Tuple[str, str]:
-        env_key = _ZJU_DEBUG_ENV_BY_VARIANT.get(str(variant))
-        if not env_key:
-            raise RuntimeError(f"Unsupported ZJU debug variant '{variant}'")
-        ckpt_path = _env_or_settings(env_key, "")
-        if not ckpt_path:
-            raise RuntimeError(f"ZJU debug matcher is missing env {env_key}")
-        return _ensure_local_file(ckpt_path, f"{env_key}_S3_URI"), env_key
-
-    def _build(self, key: str, preferred: torch.device) -> Tuple[Any, Dict[str, str]]:
-        repo_dir = self._repo_dir()
-        ckpt_path, env_key = self._checkpoint_path(key)
-        if repo_dir not in sys.path:
-            sys.path.insert(0, repo_dir)
-        try:
-            from src.loftr import LoFTR as ZJULoFTR, default_cfg as zju_default_cfg
-        except Exception as exc:
-            raise RuntimeError(
-                f"ZJU debug matcher failed importing repo modules from {repo_dir}: {exc}"
-            ) from exc
-
-        cfg = deepcopy(zju_default_cfg)
-        if isinstance(cfg.get("match_coarse"), dict):
-            cfg["match_coarse"].setdefault("sparse_spvs", False)
-
-        matcher = ZJULoFTR(config=cfg)
-        try:
-            checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
-        except Exception as exc:
-            raise RuntimeError(
-                f"ZJU debug matcher failed loading checkpoint '{ckpt_path}': {exc}"
-            ) from exc
-
-        state_dict = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else checkpoint
-        if not isinstance(state_dict, dict):
-            raise RuntimeError(
-                f"ZJU debug matcher checkpoint has invalid state_dict format: {ckpt_path}"
-            )
-
-        try:
-            incompatible = matcher.load_state_dict(state_dict, strict=False)
-        except Exception as exc:
-            raise RuntimeError(
-                f"ZJU debug matcher failed loading state_dict for {key}: {exc}"
-            ) from exc
-
-        return matcher, {
-            "variant": key,
-            "repo_dir": repo_dir,
-            "ckpt_path": ckpt_path,
-            "env_key": env_key,
-            "model_class": matcher.__class__.__name__,
-            "missing_keys": str(len(getattr(incompatible, "missing_keys", []) or [])),
-            "unexpected_keys": str(len(getattr(incompatible, "unexpected_keys", []) or [])),
-        }
-
-    def _log_loaded(self, key: str, preferred: torch.device) -> None:
-        meta = self._meta_cache[key]
-        logger.info(
-            "Loaded ZJU LoFTR debug matcher (%s) from %s on %s [missing=%s unexpected=%s]",
-            key,
-            meta["ckpt_path"],
-            preferred,
-            meta["missing_keys"],
-            meta["unexpected_keys"],
-        )
-
-    def _log_moved(self, key: str, current: torch.device, preferred: torch.device) -> None:
-        logger.info(
-            "Moved cached ZJU LoFTR debug matcher (%s) from %s to %s",
-            key,
-            current,
-            preferred,
-        )
-
-
-class _MatchFormerDebugMatcherLoader(_BaseMatcherLoader):
-    def _repo_dir(self) -> str:
-        repo_dir = _env_or_settings("MATCHFORMER_REPO_DIR", "")
-        if not repo_dir:
-            raise RuntimeError("MatchFormer debug matcher is missing env MATCHFORMER_REPO_DIR")
-        return _ensure_local_repo(repo_dir, "MATCHFORMER_REPO_ARCHIVE_S3_URI")
-
-    def _checkpoint_path(self, variant: str) -> Tuple[str, str]:
-        env_key = _MATCHFORMER_DEBUG_ENV_BY_VARIANT.get(str(variant))
-        if not env_key:
-            raise RuntimeError(f"Unsupported MatchFormer debug variant '{variant}'")
-        ckpt_path = _env_or_settings(env_key, "")
-        if not ckpt_path:
-            raise RuntimeError(f"MatchFormer debug matcher is missing env {env_key}")
-        return _ensure_local_file(ckpt_path, f"{env_key}_S3_URI"), env_key
-
-    def _resolve_device(self, key: str) -> torch.device:
-        requested_device = _env_or_settings("MATCHFORMER_DEBUG_DEVICE", "auto").lower()
-        preferred = _preferred_torch_device()
-        if requested_device in {"", "auto"}:
-            return torch.device("cpu") if preferred.type == "mps" else preferred
-        if requested_device == "cpu":
-            return torch.device("cpu")
-        if requested_device == "mps":
-            mps_backend = getattr(torch.backends, "mps", None)
-            if mps_backend is None or not bool(mps_backend.is_available()):
-                raise RuntimeError(
-                    "MatchFormer debug matcher requested MATCHFORMER_DEBUG_DEVICE=mps but MPS is unavailable"
-                )
-            return torch.device("mps")
-        if requested_device == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "MatchFormer debug matcher requested MATCHFORMER_DEBUG_DEVICE=cuda but CUDA is unavailable"
-                )
-            return torch.device("cuda")
-        raise RuntimeError(
-            f"MatchFormer debug matcher has invalid MATCHFORMER_DEBUG_DEVICE='{requested_device}'. "
-            "Use one of: auto, cpu, mps, cuda."
-        )
-
-    def _build(self, key: str, preferred: torch.device) -> Tuple[Any, Dict[str, str]]:
-        repo_dir = self._repo_dir()
-        ckpt_path, env_key = self._checkpoint_path(key)
-        if repo_dir not in sys.path:
-            sys.path.insert(0, repo_dir)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"Importing from timm\.models\.layers is deprecated, please import via timm\.layers",
-                    category=FutureWarning,
-                )
-                from config.defaultmf import get_cfg_defaults
-                from model.matchformer import Matchformer
-        except Exception as exc:
-            raise RuntimeError(
-                f"MatchFormer debug matcher failed importing repo modules from {repo_dir}: {exc}"
-            ) from exc
-
-        try:
-            cfg = get_cfg_defaults()
-        except Exception as exc:
-            raise RuntimeError(
-                f"MatchFormer debug matcher failed building default config: {exc}"
-            ) from exc
-        cfg = _matchformer_config_for_variant(cfg, key)
-        cfg_lower = _cfg_to_lower_dict(cfg)
-        model_cfg = cfg_lower.get("matchformer")
-        if not isinstance(model_cfg, dict):
-            raise RuntimeError("MatchFormer debug matcher config is invalid: missing 'matchformer' block")
-
-        matcher = Matchformer(config=model_cfg)
-        try:
-            checkpoint = torch.load(
-                ckpt_path,
-                map_location=torch.device("cpu"),
-                weights_only=False,
-            )
-        except TypeError:
-            checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
-        except Exception as exc:
-            raise RuntimeError(
-                f"MatchFormer debug matcher failed loading checkpoint '{ckpt_path}': {exc}"
-            ) from exc
-
-        if isinstance(checkpoint, dict):
-            nested_state = checkpoint.get("state_dict")
-            state_dict = nested_state if isinstance(nested_state, dict) else checkpoint
-        else:
-            state_dict = checkpoint
-        if not isinstance(state_dict, dict):
-            raise RuntimeError(
-                f"MatchFormer debug matcher checkpoint has invalid state_dict format: {ckpt_path}"
-            )
-
-        model_state_dict: Dict[str, Any] = {}
-        for raw_key, value in state_dict.items():
-            normalized_key = str(raw_key)
-            if normalized_key.startswith("matcher."):
-                normalized_key = normalized_key[len("matcher."):]
-            elif normalized_key.startswith("model.matcher."):
-                normalized_key = normalized_key[len("model.matcher."):]
-            elif normalized_key.startswith("model."):
-                normalized_key = normalized_key[len("model."):]
-            model_state_dict[normalized_key] = value
-
-        try:
-            incompatible = matcher.load_state_dict(model_state_dict, strict=False)
-        except Exception as exc:
-            raise RuntimeError(
-                f"MatchFormer debug matcher failed loading state_dict for {key}: {exc}"
-            ) from exc
-
-        requested_device = _env_or_settings("MATCHFORMER_DEBUG_DEVICE", "auto").lower() or "auto"
-        return matcher, {
-            "variant": key,
-            "repo_dir": repo_dir,
-            "ckpt_path": ckpt_path,
-            "env_key": env_key,
-            "model_class": matcher.__class__.__name__,
-            "requested_device": requested_device,
-            "missing_keys": str(len(getattr(incompatible, "missing_keys", []) or [])),
-            "unexpected_keys": str(len(getattr(incompatible, "unexpected_keys", []) or [])),
-        }
-
-    def _log_loaded(self, key: str, preferred: torch.device) -> None:
-        meta = self._meta_cache[key]
-        logger.info(
-            "Loaded MatchFormer debug matcher (%s) from %s on %s (requested=%s) [missing=%s unexpected=%s]",
-            key,
-            meta["ckpt_path"],
-            preferred,
-            meta["requested_device"],
-            meta["missing_keys"],
-            meta["unexpected_keys"],
-        )
-
-    def _log_moved(self, key: str, current: torch.device, preferred: torch.device) -> None:
-        logger.info(
-            "Moved cached MatchFormer debug matcher (%s) from %s to %s",
-            key,
-            current,
-            preferred,
-        )
-
-
-class _RomaDebugMatcherLoader(_BaseMatcherLoader):
-    def _resolve_device(self, key: str) -> torch.device:
-        requested_device = _env_or_settings("ROMA_DEBUG_DEVICE", "auto").lower()
-        preferred_device = _preferred_torch_device()
-        if requested_device in {"", "auto"}:
-            return torch.device("cpu") if preferred_device.type == "mps" else preferred_device
-        if requested_device == "cpu":
-            return torch.device("cpu")
-        if requested_device == "mps":
-            mps_backend = getattr(torch.backends, "mps", None)
-            if mps_backend is None or not bool(mps_backend.is_available()):
-                raise RuntimeError("RoMa-v2 debug matcher requested ROMA_DEBUG_DEVICE=mps but MPS is unavailable")
-            return torch.device("mps")
-        if requested_device == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError("RoMa-v2 debug matcher requested ROMA_DEBUG_DEVICE=cuda but CUDA is unavailable")
-            return torch.device("cuda")
-        raise RuntimeError(
-            f"RoMa-v2 debug matcher has invalid ROMA_DEBUG_DEVICE='{requested_device}'. "
-            "Use one of: auto, cpu, mps, cuda."
-        )
-
-    def _build(self, key: str, preferred: torch.device) -> Tuple[Any, Dict[str, str]]:
-        try:
-            from romatch import roma_outdoor
-        except Exception as exc:
-            raise RuntimeError(
-                "RoMa-v2 debug matcher requires package 'romatch'. Install it in media-service venv first."
-            ) from exc
-
-        try:
-            matcher = roma_outdoor(device=str(preferred))
-        except TypeError:
-            matcher = roma_outdoor(device=preferred)
-        except Exception as exc:
-            raise RuntimeError(f"RoMa-v2 debug matcher failed to initialize: {exc}") from exc
-
-        requested_device = _env_or_settings("ROMA_DEBUG_DEVICE", "auto").lower() or "auto"
-        return matcher, {
-            "variant": "outdoor",
-            "model_class": matcher.__class__.__name__,
-            "device": str(preferred),
-            "requested_device": requested_device,
-        }
-
-    def _log_loaded(self, key: str, preferred: torch.device) -> None:
-        meta = self._meta_cache[key]
-        logger.info(
-            "Loaded RoMa-v2 debug matcher (outdoor) on %s (requested=%s)",
-            preferred,
-            meta["requested_device"],
-        )
-
-    def _log_moved(self, key: str, current: torch.device, preferred: torch.device) -> None:
-        logger.info(
-            "Moved cached RoMa-v2 debug matcher (%s) from %s to %s",
-            key,
-            current,
-            preferred,
-        )
-
-
-_kornia_loftr_loader = _KorniaLoFTRLoader()
-_zju_debug_loader = _ZJUDebugMatcherLoader()
-_matchformer_debug_loader = _MatchFormerDebugMatcherLoader()
-_roma_debug_loader = _RomaDebugMatcherLoader()
-
-
-def kornia_loftr_cache_hit(checkpoint: str) -> bool:
-    return _kornia_loftr_loader.is_cached(str(checkpoint))
-
-
-def load_loftr_checkpoint(checkpoint: str) -> Any:
-    matcher, _ = _kornia_loftr_loader.load(str(checkpoint))
-    return matcher
-
-
-def load_zju_loftr_debug_variant(variant: str) -> Tuple[Any, Dict[str, str]]:
-    return _zju_debug_loader.load(str(variant))
-
-
-def matchformer_debug_cache_hit(variant: str) -> bool:
-    return _matchformer_debug_loader.is_cached(str(variant))
-
-
-def load_matchformer_debug_variant(variant: str) -> Tuple[Any, Dict[str, str]]:
-    return _matchformer_debug_loader.load(str(variant))
-
-
-def roma_debug_cache_hit() -> bool:
-    return _roma_debug_loader.is_cached("outdoor")
-
-
-def load_roma_v2_debug_matcher() -> Tuple[Any, Dict[str, str]]:
-    return _roma_debug_loader.load("outdoor")

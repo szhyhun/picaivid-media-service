@@ -16,9 +16,8 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 # Phases each worker type handles
-CPU_PHASES = [1, 3, 4]  # Analyze, Timeline, Assembly
-GPU_PHASES = [2]         # Render clips
-DEV_PHASES = [1, 2]  # Phase 1+2 for development (Phase 3/4 not implemented yet)
+CPU_PHASES = [3, 4]   # Timeline, Assembly
+GPU_PHASES = [1, 2]   # MASt3R analyze, Render clips
 
 
 def process_message(message: dict) -> None:
@@ -32,10 +31,9 @@ def process_message(message: dict) -> None:
     # Parse message
     job_message = JobMessage(**message)
 
-    # In development, run all phases (Phase 2 uses mock mode on CPU)
-    # In production, GPU workers handle Phase 2
+    # MASt3R phase 1 now belongs to GPU workers in all environments.
     if settings.ENVIRONMENT == "development":
-        allowed_phases = DEV_PHASES
+        allowed_phases = GPU_PHASES if settings.WORKER_TYPE == "gpu" else CPU_PHASES
     elif settings.WORKER_TYPE == "gpu":
         allowed_phases = GPU_PHASES
     else:
@@ -61,7 +59,8 @@ def main():
     logger.info(f"SQS Queue: {settings.SQS_QUEUE_URL}")
     warmup_core_models(
         context=f"worker:{settings.WORKER_TYPE}",
-        include_loftr=settings.WORKER_TYPE != "gpu",
+        include_mast3r=settings.WORKER_TYPE == "gpu",
+        include_legacy=False,
     )
 
     # Handle shutdown gracefully

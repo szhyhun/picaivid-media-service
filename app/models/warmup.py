@@ -4,52 +4,52 @@ from __future__ import annotations
 import logging
 import time
 
-from app.models.midas import midas_model
-from app.models.openclip import openclip_model
-
 logger = logging.getLogger(__name__)
 
 
-def warmup_core_models(context: str, *, include_loftr: bool = False) -> None:
-    """Load core semantic/depth models once per process.
+def warmup_core_models(
+    context: str,
+    *,
+    include_mast3r: bool = False,
+    include_legacy: bool = False,
+) -> None:
+    """Load process-start models once per process.
 
     Warmup failures are logged but do not stop process startup.
     """
     started_at = time.perf_counter()
     logger.info("Model warmup start: context=%s", context)
 
-    try:
-        openclip_model._ensure_loaded()  # internal singleton warmup
-        logger.info("Model warmup loaded: openclip context=%s", context)
-    except Exception:
-        logger.exception("Model warmup failed: openclip context=%s", context)
-
-    try:
-        from app.pipeline.phase1_analyze.learned_matching import _load_dinov2
-
-        _load_dinov2()
-        logger.info("Model warmup loaded: dinov3 context=%s", context)
-    except Exception:
-        logger.exception("Model warmup failed: dinov3 context=%s", context)
-
-    try:
-        midas_model._ensure_loaded()  # internal singleton warmup
-        logger.info("Model warmup loaded: midas context=%s", context)
-    except Exception:
-        logger.exception("Model warmup failed: midas context=%s", context)
-
-    if include_loftr:
+    if include_legacy:
         try:
-            from app.pipeline.phase1_analyze.matcher_loaders import load_loftr_checkpoint
+            from app.models.openclip import openclip_model
 
-            load_loftr_checkpoint("indoor")
-            logger.info("Model warmup loaded: loftr_indoor context=%s", context)
+            openclip_model._ensure_loaded()  # internal singleton warmup
+            logger.info("Model warmup loaded: openclip context=%s", context)
         except Exception:
-            logger.exception("Model warmup failed: loftr_indoor context=%s", context)
+            logger.exception("Model warmup failed: openclip context=%s", context)
+
+        try:
+            from app.models.midas import midas_model
+
+            midas_model._ensure_loaded()  # internal singleton warmup
+            logger.info("Model warmup loaded: midas context=%s", context)
+        except Exception:
+            logger.exception("Model warmup failed: midas context=%s", context)
+
+    if include_mast3r:
+        try:
+            from app.pipeline.phase1_analyze.mast3r_pipeline import warmup_mast3r
+
+            warmup_mast3r()
+            logger.info("Model warmup loaded: mast3r context=%s", context)
+        except Exception:
+            logger.exception("Model warmup failed: mast3r context=%s", context)
 
     logger.info(
-        "Model warmup complete: context=%s include_loftr=%s elapsed_ms=%.1f",
+        "Model warmup complete: context=%s include_mast3r=%s include_legacy=%s elapsed_ms=%.1f",
         context,
-        include_loftr,
+        include_mast3r,
+        include_legacy,
         (time.perf_counter() - started_at) * 1000.0,
     )

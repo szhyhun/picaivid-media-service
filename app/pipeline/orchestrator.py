@@ -13,14 +13,14 @@ from app.services.rails_webhook import notify_render_complete, notify_render_fai
 logger = logging.getLogger(__name__)
 
 # Phases each worker type handles
-CPU_PHASES = [1, 3, 4]  # Analyze, Timeline, Assembly
-GPU_PHASES = [2]         # Render clips
+CPU_PHASES = [3, 4]   # Timeline, Assembly
+GPU_PHASES = [1, 2]   # MASt3R analyze, Render clips
 
 
 class PipelineOrchestrator:
     """Orchestrates phased pipeline execution.
 
-    Phase 1: Analyze and Plan (CPU)
+    Phase 1: Analyze and Plan (GPU / MASt3R)
     Phase 2: Render Clips (GPU)
     Phase 3: Timeline and Beat Sync (CPU)
     Phase 4: Final Assembly (CPU)

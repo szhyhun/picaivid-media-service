@@ -1,352 +1,328 @@
-# AWS Deployment (Cost-First, Simple CD)
+# AWS Deployment: MASt3R Staging
 
-This guide is the practical path for running all 3 apps on AWS with the lowest operational complexity and controlled cost.
+This guide is the operational runbook for deploying the current MASt3R media-service staging setup on AWS.
 
 Scope:
-- `picaivid-rails` (API/orchestration)
-- `picaivid-react` (UI)
-- `picaivid-media-service` (GPU-heavy matching/processing)
 
-## 1) Recommended Architecture
+- `picaivid-rails` API/orchestration
+- `picaivid-react` UI
+- `picaivid-media-service` API/worker
 
-- Region: pick one and keep everything there. Examples below use the active production region.
-- S3: one bucket for photos/renders/artifacts.
-- SQS: one main queue for jobs (DLQ can be added next).
-- EC2 app instance (small, always on):
-  - Runs Rails API + React app (+ optional Postgres if minimizing cost).
-- EC2 GPU instance (Spot, started only when needed):
-  - Runs media-service worker.
-  - Optionally runs media-service API for pair-debug sessions.
+## 1) Target Architecture
 
-This is simpler and cheaper than ECS/Kubernetes for your current stage.
+Staging defaults:
 
-## 2) Cost Targets and Instance Choice
+- Region: `us-west-2`
+- S3 bucket: `picaivid-staging-media`
+- SQS queue: `picaivid-staging-jobs`
+- App instance: `t3a.small`, 40 GB `gp3`
+- GPU worker: `g6.2xlarge` Spot, 100-200 GB `gp3`
+- GPU fallback: `g5.xlarge` Spot
+- Avoid: `g6f.*`, `g4ad.*`, CPU-only workers
+- Deployment model: EC2 + systemd + SSM
+- Initial GPU scale: one worker instance
+- Max staging GPU scale: four separate worker instances after the first worker is stable
 
-### Rails + React
+The app host runs Rails + React. The GPU host runs `picaivid-media-worker`; the media API can run on the app host only if pair-debug must be available while the GPU worker is stopped.
 
-Use x86 burstable first for compatibility:
-- `t3a.small` or `t3a.medium`.
-- Verify current price in your chosen region before launch.
+## 2) Instance Sizing
 
-If you want Graviton later, migrate to `t4g.*` after confirming gem/node native deps.
+### App Host
 
-### Media GPU
+Use `t3a.small` for staging by default.
 
-Use NVIDIA CUDA-capable family:
-- `g4dn.xlarge` Spot (primary recommendation).
+Use `t3a.medium` only if Rails + React + optional staging Postgres are memory constrained.
 
-Important:
-- CUDA-compatible NVIDIA is the requirement for your LoFTR workload.
-- `g4ad` is cheaper on-demand in AWS tables, but AMD GPU (no CUDA), so not suitable.
-- To stay under `$0.50/hr`, run GPU as Spot and stop when idle.
+### GPU Worker
 
-Check live Spot price before launch:
+Use `g6.2xlarge` Spot first.
+
+Reasoning:
+
+- `g6.xlarge` and `g6.2xlarge` both provide one NVIDIA L4 with 24 GB GPU memory.
+- `g6.2xlarge` has better CPU/RAM headroom for image loading, MASt3R retrieval graph construction, sparse global alignment, temp files, DB writes, and Python overhead.
+- Staging cost should be controlled by stopping GPU workers when idle, not by under-sizing the MASt3R worker.
+
+Use `g5.xlarge` Spot only as a fallback when `g6.2xlarge` is unavailable.
+
+Check availability:
 
 ```bash
-aws ec2 describe-spot-price-history \
-  --instance-types g4dn.xlarge \
-  --product-descriptions "Linux/UNIX" \
-  --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --region "${AWS_REGION:-us-west-2}" \
-  --max-items 20 \
-  --query 'SpotPriceHistory[].{AZ:AvailabilityZone,Price:SpotPrice,Time:Timestamp}' \
+aws ec2 describe-instance-type-offerings \
+  --location-type availability-zone \
+  --filters Name=instance-type,Values=g6.2xlarge,g5.xlarge \
+  --region "$AWS_REGION" \
   --output table
 ```
 
-## 3) Account Setup (Day 0)
+## 3) Credentials and IAM
 
-1. Create AWS account.
-2. Secure root user immediately:
-   - enable MFA
-   - do not use root for daily work
-3. Create IAM admin user/role for yourself.
-4. Configure AWS Budgets alerts:
-   - monthly total budget (example `$150`)
-   - alert at 50%, 80%, 100%
-5. Choose one region and use it consistently.
-
-## 4) Core AWS Resources
-
-## 4.1 S3
-
-Create bucket, example:
-- `picaivid-prod-media`
-
-Recommended:
-- keep versioning off unless you explicitly need rollback/delete protection
-- add lifecycle policies once object growth becomes material
-
-## 4.2 SQS
-
-Create queue:
-- `picaivid-jobs`
-
-For now:
-- standard queue
-- visibility timeout aligned with job duration
-
-Next step (recommended soon):
-- attach DLQ with `maxReceiveCount=2` (initial + one retry)
-
-## 4.3 EC2 Instances
-
-Create:
-- `picaivid-app` (`t3a.small` or `t3a.medium`, on-demand)
-- `picaivid-media-gpu` (`g4dn.xlarge`, Spot)
-
-Tags:
-- `Project=picaivid`
-- `Env=prod`
-- `Role=app` / `Role=media-gpu`
-- `AutoStop=true` (if using scheduler)
-
-## 5) Networking and Transfer Cost Rules
-
-To keep transfer cost low:
-- Keep EC2 + S3 + SQS in the same region.
-- Upload once to S3 and process from S3 inside AWS.
-- Avoid cross-region copies.
-- Serve final assets via CloudFront only when needed.
-
-Cost facts from AWS docs:
-- S3 -> AWS service in same region is not charged as internet transfer.
-- First 100 GB/month internet egress is free aggregate across eligible services.
-
-## 6) Media-Service GPU Runtime (Critical)
-
-Do not rely on CPU Torch wheels on GPU hosts.
-
-Install CUDA-enabled torch explicitly on the GPU instance/container:
+Local provisioning credentials:
 
 ```bash
-pip uninstall -y torch torchvision torchaudio
-pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+aws configure sso
+aws sts get-caller-identity --profile YOUR_PROFILE
+export AWS_PROFILE=YOUR_PROFILE
+export AWS_REGION=us-west-2
 ```
 
-Expected runtime logs:
-- `Loaded LoFTR matcher (indoor) on cuda`
-- `model_device=cuda`
+AWS CLI stores these locally in:
 
-If logs show CPU, performance will be dramatically worse.
+- `~/.aws/config`
+- `~/.aws/credentials`
 
-## 7) Deployment Model (Simple CD)
+Do not copy those values into the repo.
 
-Use GitHub Actions + AWS OIDC + SSM Run Command.
+Runtime credentials:
 
-Why this path:
-- no static AWS keys in GitHub
-- no inbound SSH needed
-- simple restart flow per push
+- Use EC2 IAM instance profiles.
+- Do not set `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` in `/etc/picaivid/*.env`.
+- The media-service boto clients use the instance role when static credentials are absent.
+- `S3_ENDPOINT` and `SQS_ENDPOINT` are local-only for MinIO/LocalStack and should be omitted on AWS.
 
-Flow:
-1. GitHub Action assumes AWS IAM role via OIDC.
-2. Action triggers SSM command on target EC2.
-3. Instance runs:
-   - `git pull`
-   - dependency sync
-   - service restart (`systemd`)
+Suggested runtime roles:
 
-Keep separate workflows per repo:
-- rails deploy -> app instance
-- react deploy -> app instance
-- media-service deploy -> gpu instance (or both app+gpu if API also there)
+- App role: SSM, CloudWatch Logs, S3 read/write for media bucket as needed.
+- Media role: SSM, CloudWatch Logs, S3 artifact/media read/write, SQS consume/delete/change-visibility/send as needed.
 
-Included workflow files:
-- `picaivid-rails/.github/workflows/deploy.yml`
-- `picaivid-react/.github/workflows/deploy.yml`
-- `picaivid-media-service/.github/workflows/deploy.yml`
+## 4) Core Resources
 
-### 7.1 GitHub OIDC + IAM (one-time)
-
-Create one IAM role trusted by GitHub OIDC provider for each repo environment (or one shared role if you prefer).
-
-Trust policy must allow:
-- provider: `token.actions.githubusercontent.com`
-- audience: `sts.amazonaws.com`
-- subject restricted to your repo (example `repo:ORG/REPO:*`)
-
-Minimum IAM permissions for the deploy role:
-- `ssm:SendCommand`
-- `ssm:GetCommandInvocation`
-- `ssm:ListCommandInvocations`
-- `ec2:DescribeInstances`
-
-The EC2 instances themselves must have instance profile permission:
-- `AmazonSSMManagedInstanceCore`
-
-### 7.2 Repository Secrets/Variables
-
-Each repo needs:
-
-- Secret:
-  - `AWS_DEPLOY_ROLE_ARN`
-
-- Variables:
-  - `AWS_REGION`
-
-Rails repo (`picaivid-rails`) variables:
-- `EC2_APP_INSTANCE_ID`
-- `RAILS_DEPLOY_PATH` (example `/srv/picaivid/picaivid-rails`)
-
-React repo (`picaivid-react`) variables:
-- `EC2_APP_INSTANCE_ID`
-- `REACT_DEPLOY_PATH` (example `/srv/picaivid/picaivid-react`)
-
-Media repo (`picaivid-media-service`) variables:
-- `EC2_MEDIA_INSTANCE_ID`
-- `MEDIA_DEPLOY_PATH` (example `/srv/picaivid/picaivid-media-service`)
-- `MEDIA_RESTART_API` (`0` or `1`)
-
-## 8) Service Management on Instances
-
-Use `systemd` units:
-- `picaivid-rails.service`
-- `picaivid-react.service`
-- `picaivid-media-api.service` (optional on app host)
-- `picaivid-media-worker.service` (on GPU host)
-
-For GPU host, keep worker disabled by default and start only when required.
-
-Included `systemd` templates:
-- Rails: `picaivid-rails/deploy/systemd/picaivid-rails.service`
-- React: `picaivid-react/deploy/systemd/picaivid-react.service`
-- Media API: `deploy/systemd/picaivid-media-api.service`
-- Media worker: `deploy/systemd/picaivid-media-worker.service`
-
-### 8.1 Install `systemd` units (one-time per host)
-
-App host (Rails + React):
+Create the staging bucket and queue if missing:
 
 ```bash
-sudo mkdir -p /etc/picaivid
-sudo cp /srv/picaivid/picaivid-rails/deploy/systemd/picaivid-rails.service /etc/systemd/system/
-sudo cp /srv/picaivid/picaivid-react/deploy/systemd/picaivid-react.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable picaivid-rails picaivid-react
-sudo systemctl start picaivid-rails picaivid-react
+aws s3 mb s3://picaivid-staging-media --region "$AWS_REGION"
+
+aws sqs create-queue \
+  --queue-name picaivid-staging-jobs \
+  --attributes VisibilityTimeout=3600 \
+  --region "$AWS_REGION"
 ```
 
-GPU host (worker, optional API):
+List resources:
 
 ```bash
-sudo mkdir -p /etc/picaivid
-sudo cp /srv/picaivid/picaivid-media-service/deploy/systemd/picaivid-media-worker.service /etc/systemd/system/
-sudo cp /srv/picaivid/picaivid-media-service/deploy/systemd/picaivid-media-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable picaivid-media-worker
-sudo systemctl start picaivid-media-worker
+aws s3 ls
+aws sqs list-queues --region "$AWS_REGION"
+aws rds describe-db-instances --region "$AWS_REGION" --output table
+aws ec2 describe-instances --filters "Name=tag:Project,Values=picaivid" --region "$AWS_REGION" --output table
+aws iam list-instance-profiles --query 'InstanceProfiles[].InstanceProfileName' --output table
+aws logs describe-log-groups --log-group-name-prefix /picaivid --region "$AWS_REGION" --output table
 ```
 
-Create env files referenced by units:
+Use RDS PostgreSQL if available. For early staging only, a DB on the app host is acceptable temporarily.
+
+## 5) Artifact Storage
+
+MASt3R is the phase-1 matching/reconstruction engine. Runtime must load local or S3-hydrated artifacts; live model downloads are not a deployment path.
+
+S3 artifact prefixes:
+
+- `s3://picaivid-staging-media/artifacts/mast3r`
+- `s3://picaivid-staging-media/artifacts/dinov3-vitb16-pretrain-lvd1689m` temporarily, until DINO analyzer dependencies are fully removed
+- `s3://picaivid-staging-media/artifacts/sam2` only if SAM2 remains enabled
+
+Upload artifacts:
+
+```bash
+aws s3 sync /Users/serhiizhyhun/Desktop/projects/picaivid/third_party/mast3r \
+  s3://picaivid-staging-media/artifacts/mast3r
+
+aws s3 sync /Users/serhiizhyhun/Desktop/projects/picaivid/third_party/dinov3-vitb16-pretrain-lvd1689m \
+  s3://picaivid-staging-media/artifacts/dinov3-vitb16-pretrain-lvd1689m
+```
+
+Hydrate artifacts on the GPU instance:
+
+```bash
+sudo mkdir -p /srv/picaivid/third_party
+aws s3 sync s3://picaivid-staging-media/artifacts/mast3r /srv/picaivid/third_party/mast3r
+aws s3 sync s3://picaivid-staging-media/artifacts/dinov3-vitb16-pretrain-lvd1689m /srv/picaivid/third_party/dinov3-vitb16-pretrain-lvd1689m
+```
+
+Required MASt3R files:
+
+- `/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`
+- `/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth`
+- `/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl`
+
+## 6) Launch Instances
+
+Console path:
+
+- EC2 -> Launch instance
+- App instance type: `t3a.small`
+- GPU instance type: `g6.2xlarge` Spot
+- GPU fallback type: `g5.xlarge` Spot
+- App storage: 40 GB `gp3`
+- GPU storage: 100-200 GB `gp3`
+- IAM instance profile: app role or media role
+- Tags: `Project=picaivid`, `Env=staging`, `Role=app` or `Role=media-gpu`
+
+Prefer SSM Session Manager over SSH. Use an NVIDIA/CUDA-ready AMI for the GPU host where possible. Otherwise bootstrap CUDA-enabled PyTorch explicitly and validate CUDA before starting the worker.
+
+CLI launch commands should be added after AMI, subnet, security group, IAM instance profile, and SSM/SSH preference are chosen.
+
+## 7) Instance Env Files
+
+Real env files live only on instances:
+
 - `/etc/picaivid/rails.env`
 - `/etc/picaivid/react.env`
 - `/etc/picaivid/media-api.env`
 - `/etc/picaivid/media-worker.env`
 
-Templates provided:
-- `picaivid-rails/deploy/env/rails.env.example`
-- `picaivid-react/deploy/env/react.env.example`
+Repo files remain examples only:
+
 - `deploy/env/media-api.env.example`
 - `deploy/env/media-worker.env.example`
 
-## 8.2 One Bootstrap Script Per Repo
-
-Use repo-local bootstrap scripts instead of manual package/service steps:
-
-App host:
+Important media worker values:
 
 ```bash
-cd /srv/picaivid/picaivid-rails
-chmod +x scripts/aws/bootstrap-ec2.sh
-./scripts/aws/bootstrap-ec2.sh --repo-dir /srv/picaivid/picaivid-rails --run-migrate 1
-
-cd /srv/picaivid/picaivid-react
-chmod +x scripts/aws/bootstrap-ec2.sh
-./scripts/aws/bootstrap-ec2.sh --repo-dir /srv/picaivid/picaivid-react
+WORKER_TYPE=gpu
+ANALYSIS_MATCH_ENGINE=mast3r_graph
+AWS_REGION=us-west-2
+S3_BUCKET=picaivid-staging-media
+SQS_QUEUE_URL=https://sqs.us-west-2.amazonaws.com/ACCOUNT_ID/picaivid-staging-jobs
+MODEL_CACHE_DIR=/srv/picaivid/model-cache
+MAST3R_REPO_DIR=/srv/picaivid/third_party/mast3r
+MAST3R_MODEL_CHECKPOINT=/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+MAST3R_RETRIEVAL_CHECKPOINT=/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth
+MAST3R_RETRIEVAL_CODEBOOK=/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl
 ```
 
-GPU host:
+Do not set on AWS:
 
 ```bash
-cd /srv/picaivid/picaivid-media-service
-chmod +x scripts/aws/bootstrap-ec2.sh
-./scripts/aws/bootstrap-ec2.sh --repo-dir /srv/picaivid/picaivid-media-service --enable-api 0
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+S3_ENDPOINT
+SQS_ENDPOINT
 ```
 
-Scripts:
-- `picaivid-rails/scripts/aws/bootstrap-ec2.sh`
-- `picaivid-react/scripts/aws/bootstrap-ec2.sh`
-- `scripts/aws/bootstrap-ec2.sh`
+## 8) Systemd Services
 
-## 9) Start/Stop GPU to Save Cost
+Use these systemd units:
 
-Use provided scripts in `scripts/aws/`:
-- `scripts/aws/gpu-start.sh`
-- `scripts/aws/gpu-stop.sh`
-- `scripts/aws/gpu-status.sh`
+- `picaivid-rails.service`
+- `picaivid-react.service`
+- `picaivid-media-api.service` optional
+- `picaivid-media-worker.service` on the GPU host
 
-Usage:
+Install media worker unit:
 
 ```bash
+sudo mkdir -p /etc/picaivid
+sudo cp /srv/picaivid/picaivid-media-service/deploy/systemd/picaivid-media-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable picaivid-media-worker
+sudo systemctl start picaivid-media-worker
+```
+
+Check worker:
+
+```bash
+sudo systemctl status picaivid-media-worker
+journalctl -u picaivid-media-worker -f
+```
+
+## 9) GPU Runtime Validation
+
+Install CUDA-enabled Torch on the GPU host if the AMI does not already provide a working CUDA PyTorch environment:
+
+```bash
+pip uninstall -y torch torchvision torchaudio
+pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+nvidia-smi
+```
+
+Expected service signals:
+
+- `Loaded MASt3R model checkpoint=... device=cuda`
+- `Loaded MASt3R retriever checkpoint=...`
+- `match_engine=mast3r_graph`
+- no LoFTR/DINO production matcher path
+
+## 10) Start/Stop GPU to Save Cost
+
+Use the existing scripts from `scripts/aws/`:
+
+```bash
+export AWS_PROFILE=YOUR_PROFILE
 export AWS_REGION=us-west-2
 export GPU_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx
-./scripts/aws/gpu-start.sh
 ./scripts/aws/gpu-status.sh
+./scripts/aws/gpu-start.sh
 ./scripts/aws/gpu-stop.sh
 ```
 
-Optional automation:
-- Systems Manager Quick Setup can schedule stop/start windows.
+The start script starts the EC2 instance and best-effort starts `picaivid-media-worker` via SSM. The stop script best-effort stops the worker, then stops the instance.
 
-## 10) Minimal Rollout Plan
+Use SSM shell access:
 
-1. Create account + IAM + budgets.
-2. Create S3 + SQS.
-3. Launch app EC2 and deploy Rails/React.
-4. Launch GPU Spot EC2 and deploy media worker.
-5. Verify media logs show CUDA backend.
-6. Add GitHub Actions OIDC + SSM deploy jobs.
-7. Add GPU stop/start operational routine (manual first, then scheduler).
-8. Add DLQ + one retry policy in SQS consumer rollout.
+```bash
+aws ssm start-session --target "$GPU_INSTANCE_ID" --region "$AWS_REGION"
+```
 
-## 11) What to Watch (Cost + Reliability)
+## 11) Monitoring
 
-- Cost Explorer:
-  - EC2-Instances
-  - DataTransfer
-  - S3-Requests and S3-Storage
-- CloudWatch:
-  - queue depth
-  - worker failures
-  - spot interruption events
-- Spot interruptions:
-  - handle graceful shutdown and idempotent jobs
+Queue depth:
 
----
+```bash
+aws sqs get-queue-attributes \
+  --queue-url "$SQS_QUEUE_URL" \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible ApproximateAgeOfOldestMessage \
+  --region "$AWS_REGION"
+```
 
-## Sources
+Worker health:
 
-- AWS root user security best practices:
-  - https://docs.aws.amazon.com/IAM/latest/UserGuide/root-user-best-practices.html
-- AWS Budgets:
-  - https://docs.aws.amazon.com/cost-management/latest/userguide/create-cost-budget.html
-- EC2 on-demand/data transfer pricing:
-  - https://aws.amazon.com/ec2/pricing/on-demand/
-- EC2 T3 instance pricing table (reference):
-  - https://aws.amazon.com/ec2/instance-types/t3/
-- EC2 G4 family overview (CUDA-capable G4dn, AMD-based G4ad table):
-  - https://aws.amazon.com/ec2/instance-types/g4/
-- S3 pricing and transfer notes:
-  - https://aws.amazon.com/s3/pricing/
-- Spot interruption notices:
-  - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html
-- Spot best practices:
-  - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-best-practices.html
-- SQS DLQ:
-  - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
-- EC2 start/stop scheduling with Systems Manager Quick Setup:
-  - https://docs.aws.amazon.com/systems-manager/latest/userguide/quick-setup-scheduler.html
-- GitHub OIDC to AWS:
-  - https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
-  - https://github.com/aws-actions/configure-aws-credentials
+```bash
+sudo systemctl status picaivid-media-worker
+journalctl -u picaivid-media-worker -f
+nvidia-smi
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+CloudWatch:
+
+```bash
+aws logs describe-log-groups --log-group-name-prefix /picaivid --region "$AWS_REGION" --output table
+```
+
+Cost controls:
+
+- Create an AWS Budget for staging.
+- Stop GPU instances when idle.
+- Start with one GPU instance only.
+- Scale to 2-4 GPU workers only after the first worker completes staging jobs reliably.
+
+## 12) Validation Checklist
+
+- `aws sts get-caller-identity` succeeds locally.
+- Staging S3 bucket exists.
+- Staging SQS queue URL resolves.
+- App and media EC2 instances use IAM instance profiles.
+- No static AWS keys are present in `/etc/picaivid/*.env`.
+- SSM session works.
+- `nvidia-smi` works on the GPU host.
+- CUDA Torch check returns `True`.
+- MASt3R artifacts are present on local disk after S3 hydration.
+- One small staging job completes.
+- `photo_similarities.match_engine = mast3r_graph`.
+- `photo_pose_alignments` rows are written.
+- Final clusters are max 2 photos.
+- Same-component photos appear only as debug suggestions.
+
+## 13) Deferred Cleanup
+
+After the MASt3R staging path is verified, remove legacy deployment/config surface for:
+
+- DINO analyzer dependencies that are no longer used
+- LoFTR
+- MatchFormer
+- RoMa
+- stale CLIP/SAM acceptance logic if it remains in active deployment config
+
+Until that cleanup is complete, DINO may remain as a temporary artifact entry only; it is not a production fallback matcher.

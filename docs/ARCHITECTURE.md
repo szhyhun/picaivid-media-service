@@ -27,7 +27,7 @@ Those are owned by `picaivid-rails` and `picaivid-react`.
 ## Pipeline Shape
 
 1. Phase 1 analyze
-   - Semantic signals + geometry matching
+   - MASt3R retrieval graph + geometry matching
    - Room clusters + pair diagnostics
 2. Phase 2 render
    - Clip generation and media outputs
@@ -35,7 +35,7 @@ Those are owned by `picaivid-rails` and `picaivid-react`.
 
 ## Geometry/Clustering Notes
 
-- Production matcher default: `loftr_kornia_indoor_native`
+- Production matcher default: `mast3r_graph`
 - Edge acceptance is strict-gated by geometry quality and model constraints
 - Pair debug is intended for diagnosing pair-level failures, not changing business flow
 

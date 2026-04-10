@@ -327,8 +327,8 @@ def _build_direction_prompt_guidance(
                 SELECT
                     direction_dx,
                     direction_dy,
-                    dinov2_similarity,
-                    f_inliers
+                    retrieval_score,
+                    reciprocal_match_count
                 FROM photo_similarities
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a_id
@@ -358,16 +358,16 @@ def _build_direction_prompt_guidance(
             dx = float(dx)
             dy = float(dy)
 
-        sem = row[2]
-        inliers = row[3]
+        retrieval_score = row[2]
+        matches = row[3]
         rec = _camera_direction_recommendation(
             dx,
             dy,
-            int(inliers) if inliers is not None else None,
+            int(matches) if matches is not None else None,
         )
-        sem_txt = f"{float(sem):.3f}" if sem is not None else "N/A"
-        inliers_txt = str(int(inliers)) if inliers is not None else "N/A"
-        lines.append(f"{from_id} -> {to_id}: {rec} (sem={sem_txt}, inliers={inliers_txt}).")
+        retrieval_txt = f"{float(retrieval_score):.3f}" if retrieval_score is not None else "N/A"
+        matches_txt = str(int(matches)) if matches is not None else "N/A"
+        lines.append(f"{from_id} -> {to_id}: {rec} (retrieval={retrieval_txt}, reciprocal_matches={matches_txt}).")
 
     if not lines:
         return ""

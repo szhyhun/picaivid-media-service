@@ -2,6 +2,103 @@
 
 FastAPI + worker service for photo analysis, clustering, transition scoring, and video clip generation.
 
+## Current Runtime Behavior
+
+### Legacy semantic embedding backend
+
+Phase 1 no longer uses DINO as the matching/reconstruction engine. The active phase-1 path is MASt3R-only.
+
+DINO remains documented here only as a temporary auxiliary analyzer/debug artifact until the legacy analyzer cleanup is complete:
+
+- local artifact path: `/Users/serhiizhyhun/Desktop/projects/picaivid/third_party/dinov3-vitb16-pretrain-lvd1689m`
+- expected artifact: `facebook/dinov3-vitb16-pretrain-lvd1689m`
+- the snapshot must contain the real `model.safetensors`, not a Git LFS pointer file
+- if the local artifact is missing, fix artifact hydration; do not use live model download
+
+### Semantic region backend
+
+- Semantic regions use `SAM2 + OpenCLIP` when SAM2 is available locally.
+- If SAM2 is unavailable or fails, the pipeline falls back to heuristic anchor/window/background regions.
+- On Apple Silicon, SAM2 runs on `CPU` intentionally because the required path is not reliable on `MPS`.
+- SAM2 is expensive. Regions are cached per photo per run, but full-project analysis still slows down materially on a laptop.
+- The semantic labeler now uses room-specific allowed/forbidden labels plus bbox sanity checks, not raw CLIP prompts alone.
+- Current semantic labels include:
+  - anchor/furniture: `bed`, `table`, `chair`, `seating_cluster`, `sofa`, `island_or_counter`, `vanity`, `desk`, `appliance_core`, `fireplace`
+  - bathroom: `toilet`, `shower`, `bath`, `mirror`
+  - secondary objects: `plant`, `cabinet`, `artwork`, `rug`, `tv`, `lighting_fixture`, `shelving`, `counter_stool`, `door`
+  - openings/background: `window`, `glass_door`, `wall`, `floor`, `ceiling`, `sky`
+  - outdoor areas: `patio`, `deck`, `balcony`
+
+### Phase 1 clustering policy
+
+Phase 1 is now a **MASt3R-only** graph pipeline.
+
+Current behavior:
+
+- obvious duplicates are removed **before** MASt3R retrieval
+- utility rooms are removed **before** MASt3R retrieval
+- MASt3R retrieval builds the scene graph
+- MASt3R pair inference + sparse global alignment produce edge quality and component state
+- final user-facing clusters are capped at **2 photos**
+- unmatched photos remain singleton clusters
+- additional same-component photos are exposed only as **debug suggestions**
+
+This is deliberate: the system is optimizing for strongest parallax pairs, not large connected components.
+
+Current phase-1 flow:
+
+```text
+images
+-> duplicate filter
+-> utility-room filter
+-> MASt3R retrieval graph
+-> MASt3R pair inference
+-> sparse global alignment
+-> edge scoring
+-> best disjoint pair selection
+-> final 2-photo clusters + singleton leftovers
+```
+
+Main pair score inputs:
+
+- retrieval overlap strength
+- reciprocal match count
+- pointmap consistency
+- alignment residual / reprojection quality
+- parallax score
+- upload-order proximity
+
+CLIP/SAM fine labels are no longer part of acceptance logic in the MASt3R path.
+
+## Pair Debug
+
+Pair debug is now MASt3R-native.
+
+It exposes:
+
+- match engine
+- retrieval score
+- reciprocal match count
+- pointmap consistency
+- alignment residual
+- reprojection error
+- parallax score
+- graph edge score
+- graph component id when a stored row exists
+- MASt3R timing
+
+Cluster debug also exposes:
+
+- final selected pair
+- same-component suggested photos
+- per-suggestion score
+- exclusion reason:
+  - `lower than chosen edge`
+  - `already consumed by a stronger pair`
+  - `failed pair safety threshold`
+
+Semantic overlays remain available for auxiliary inspection, but the active pair-debug matcher path is MASt3R.
+
 ## Quick Start
 
 ```bash
@@ -25,81 +122,68 @@ source venv/bin/activate
 python -m app.worker
 ```
 
-## Deployment Note (LoFTR Geometry)
+## Deployment Note (MASt3R)
 
-For cloud deployment, LoFTR must run on CUDA to keep pair-level geometry fast.
+Phase 1 now requires a **CUDA GPU**. CPU workers should not run phase 1.
 Validate with logs:
 
-- `Loaded LoFTR matcher (indoor) on cuda`
+- `Loaded MASt3R model checkpoint=... device=cuda`
+- `Loaded MASt3R retriever checkpoint=...`
 - `pair_debug_timing ... model_device=cuda ... preferred_device=cuda`
 
-## Debug Matcher Dependencies
+Startup warmup behavior:
 
-- `loftr_kornia_indoor_native` uses the Kornia checkpoint cached by Torch locally:
-  - `~/.cache/torch/hub/checkpoints/loftr_indoor.ckpt`
-  - `~/.cache/torch/hub/checkpoints/loftr_indoor_ds_new.ckpt`
-  - if these cache files are deleted, Kornia will re-download them on first use
-- `loftr_zju_indoor_ds_debug` / `loftr_zju_indoor_ot_debug` require:
-  - `LOFTR_ZJU_REPO_DIR`
-  - `LOFTR_ZJU_INDOOR_DS_CKPT`
-  - `LOFTR_ZJU_INDOOR_OT_CKPT`
-- `roma_v2_debug` requires `romatch` (already included in `requirements.txt` and `requirements.lock.txt`).
-- Optional RoMa device override:
-  - `ROMA_DEBUG_DEVICE=auto|cpu|mps|cuda`
-  - default `auto`: uses `cuda` when available; on macOS `mps` defaults to `cpu` for stability
-- Optional MatchFormer device override:
-  - `MATCHFORMER_DEBUG_DEVICE=auto|cpu|mps|cuda`
-  - default `auto`: uses `cuda` when available; on macOS `mps` defaults to `cpu` for stability
-- `matchformer_indoor_debug` / `matchformer_outdoor_debug` require:
-  - `MATCHFORMER_REPO_DIR`
-  - `MATCHFORMER_INDOOR_CKPT`
-  - `MATCHFORMER_OUTDOOR_CKPT`
+- API and GPU worker startup now warm **MASt3R only**
+- legacy semantic/depth models (`DINO`, `OpenCLIP`, `MiDaS`) are no longer preloaded during normal startup
+- those legacy models are now lazy-loaded only if an auxiliary legacy/debug path explicitly touches them
+- this avoids paying old startup cost and avoids carrying stale legacy runtime state into the MASt3R main path
+
+Required MASt3R local artifacts:
+
+- `MAST3R_REPO_DIR`
+- `MAST3R_MODEL_CHECKPOINT`
+- `MAST3R_RETRIEVAL_CHECKPOINT`
+- `MAST3R_RETRIEVAL_CODEBOOK`
+
+Recommended local layout:
+
+- repo:
+  - `/Users/serhiizhyhun/Desktop/projects/picaivid/third_party/mast3r`
+- checkpoints under that repo:
+  - `checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`
+  - `checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth`
+  - `checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl`
 
 ### AWS Asset Hydration Rule
 
 Do not depend on workstation-specific absolute paths in cloud environments.
 
-On AWS rollout, all external matcher repos, checkpoints, and Hugging Face model caches must be hydrated from S3 into local disk before they are used. Do not rely on live internet downloads in production.
+On AWS rollout, all MASt3R artifacts and model caches must be hydrated from S3 into local disk before they are used. Do not rely on live internet downloads in staging or production.
 
-For semantic/depth models, the service is now expected to load from the local Hugging Face cache only. In particular:
+The current staging artifact layout is:
 
-- DINOv3 semantic model:
-  - `facebook/dinov3-vitb16-pretrain-lvd1689m`
-- MiDaS / DPT depth model
-- any other Hugging Face-hosted model used by the service
+- `s3://picaivid-staging-media/artifacts/mast3r`
+- `s3://picaivid-staging-media/artifacts/dinov3-vitb16-pretrain-lvd1689m` temporarily, until DINO analyzer dependencies are fully removed
+- `s3://picaivid-staging-media/artifacts/sam2` only if SAM2 remains enabled
 
-These must exist under the configured model cache directory before startup:
+Upload and hydrate the DINO snapshot only while legacy auxiliary/debug paths still need it. It is not a MASt3R fallback and it is not an active phase-1 matcher.
 
-- `MODEL_CACHE_DIR` (defaults to `./ml_models`)
-- optional DINOv3 S3 hydrate source:
-  - `DINO_V3_CACHE_ARCHIVE_S3_URI`
-- optional last-resort remote fallback:
-  - `DINO_V3_ALLOW_REMOTE_FALLBACK=true|false`
+For MASt3R, the loader supports S3 hydration directly:
 
-Recommended pattern for AWS:
-
-- pre-build the Hugging Face cache locally once
-- upload the relevant cached model directories to S3
-- hydrate them onto the instance under `MODEL_CACHE_DIR` during bootstrap
-- start API/worker only after the cache is present
-
-For external geometry matchers, the loader supports S3 hydration directly:
-
-- repo archives:
-  - `LOFTR_ZJU_REPO_ARCHIVE_S3_URI`
-  - `MATCHFORMER_REPO_ARCHIVE_S3_URI`
+- repo archive:
+  - `MAST3R_REPO_ARCHIVE_S3_URI`
 - checkpoint objects:
-  - `LOFTR_ZJU_*_CKPT_S3_URI`
-  - `MATCHFORMER_*_CKPT_S3_URI`
+  - `MAST3R_MODEL_CHECKPOINT_S3_URI`
+  - `MAST3R_RETRIEVAL_CHECKPOINT_S3_URI`
+  - `MAST3R_RETRIEVAL_CODEBOOK_S3_URI`
 
 Behavior:
 
 - if the configured local repo/checkpoint path exists, the loader uses it
 - if the local path is missing and the matching `*_S3_URI` is set, the loader downloads/extracts the asset from S3 into the configured local path
-- if neither local asset nor S3 fallback exists, matcher loading fails fast with a clear error
-- if the DINOv3 local cache is missing and `DINO_V3_CACHE_ARCHIVE_S3_URI` is set, the service hydrates the cache from S3 into `MODEL_CACHE_DIR`
-- if the DINOv3 local cache is missing and S3 hydration is not configured, the service may fall back to remote model download only when `DINO_V3_ALLOW_REMOTE_FALLBACK=true`
-- for AWS, prefer `local -> S3 hydrate -> load locally`; keep URL fallback as recovery only, not the normal path
+- if neither local asset nor S3 fallback exists, MASt3R loading fails fast with a clear error
+- if an auxiliary legacy DINO path is touched and the local DINO artifact is missing, the service fails that path instead of downloading from the internet
+- for AWS, use `local -> S3 hydrate -> load locally`; live URL fallback is not a runtime path
 
 For semantic region extraction, SAM2 should follow the same policy:
 
@@ -109,11 +193,6 @@ For semantic region extraction, SAM2 should follow the same policy:
   - `SAM2_CHECKPOINT`
 - local config:
   - `SAM2_CONFIG`
-- semantic stage controls:
-  - `SEMANTIC_REGIONS_ENABLED`
-  - `SEMANTIC_REGIONS_BACKEND`
-  - `SEMANTIC_MATCH_EDGE_DILATION_PX`
-  - `SEMANTIC_REMOTE_FALLBACK`
 
 Local development layout used here:
 

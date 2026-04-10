@@ -43,14 +43,12 @@ class ClipTransitionStep(BaseModel):
     to_photo_id: int
     from_filename: Optional[str] = None
     to_filename: Optional[str] = None
-    dinov2_similarity: Optional[float] = None
     geometric_inliers: Optional[int] = None
     geometric_score: Optional[float] = None
     pair_rank: Optional[float] = None
     certification_status: Optional[str] = None
     rejection_reason: Optional[str] = None
     overlap_ratio: Optional[float] = None
-    coverage_4x4: Optional[float] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
     recommendation: Optional[str] = None
@@ -67,11 +65,6 @@ class ClipTransitionStep(BaseModel):
     cross_left_to_right_score: Optional[float] = None
     cross_right_to_left_score: Optional[float] = None
     cross_center_to_center_score: Optional[float] = None
-    kornia_overlap_ratio: Optional[float] = None
-    kornia_side_overlap: Optional[float] = None
-    kornia_center_overlap: Optional[float] = None
-    kornia_inlier_ratio: Optional[float] = None
-    kornia_transition_overlap_ok: Optional[bool] = None
 
 
 class TransitionSequenceStepInfo(BaseModel):
@@ -143,26 +136,19 @@ class PhotoSimilarityInfo(BaseModel):
     photo_b_id: int
     photo_a_filename: Optional[str] = None
     photo_b_filename: Optional[str] = None
-    pair_source: Optional[str] = None  # dinov2_topk, temporal_window, both
-    dinov2_similarity: Optional[float] = None
+    pair_source: Optional[str] = None  # mast3r_retrieval_graph
+    match_engine: Optional[str] = None
+    retrieval_score: Optional[float] = None
+    reciprocal_match_count: Optional[int] = None
+    pointmap_consistency: Optional[float] = None
+    alignment_residual: Optional[float] = None
+    reprojection_error: Optional[float] = None
+    parallax_score: Optional[float] = None
+    graph_component_id: Optional[int] = None
+    graph_edge_score: Optional[float] = None
     raw_matches: Optional[int] = None
-    f_inliers: Optional[int] = None
-    f_inlier_ratio: Optional[float] = None
-    coverage_4x4: Optional[float] = None
-    grid_entropy: Optional[float] = None
     overlap_ratio: Optional[float] = None
-    homography_ratio: Optional[float] = None
-    median_epipolar_error: Optional[float] = None
-    median_flow_magnitude: Optional[float] = None
     combined_geometry_score: Optional[float] = None
-    near_positive_ratio: Optional[float] = None
-    near_negative_ratio: Optional[float] = None
-    split_score: Optional[float] = None
-    depth_monotonicity_score: Optional[float] = None
-    dominant_foreground_side_a: Optional[int] = None
-    dominant_foreground_side_b: Optional[int] = None
-    foreground_support_persistence_penalty: Optional[float] = None
-    crossing_penalty: Optional[float] = None
     effective_overlap: Optional[float] = None
     repeated_room_scope: Optional[str] = None
     repeated_room_penalty_weight: Optional[float] = None
@@ -212,6 +198,15 @@ class PhotoDebugInfo(BaseModel):
     similarities: List[PhotoSimilarityInfo] = []
 
 
+class ClusterSuggestionInfo(BaseModel):
+    photo_id: int
+    filename: Optional[str] = None
+    room_label: Optional[str] = None
+    score: Optional[float] = None
+    related_to_photo_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
 class ClusterDebugResponse(BaseModel):
     """Debug info for a cluster - shows why photos were grouped."""
     cluster_id: int
@@ -222,10 +217,10 @@ class ClusterDebugResponse(BaseModel):
     total_photos: int
     sequence_order: Optional[int] = None
     # Summary stats
-    avg_dinov2_similarity: Optional[float] = None
     avg_pair_rank: Optional[float] = None
     has_direction_info: bool = False
     sequences: List[TransitionSequenceInfo] = []
+    suggestions: List[ClusterSuggestionInfo] = []
 
 
 class ClusterListDebugResponse(BaseModel):
@@ -244,12 +239,7 @@ class PairDebugRequest(BaseModel):
     confidence_threshold: Optional[float] = Field(default=None, ge=0.1, le=1.0)
     matcher: Literal[
         "current",
-        "loftr_kornia_indoor_native",
-        "loftr_zju_indoor_ds_debug",
-        "loftr_zju_indoor_ot_debug",
-        "roma_v2_debug",
-        "matchformer_indoor_debug",
-        "matchformer_outdoor_debug",
+        "mast3r_graph",
     ] = "current"
 
 
@@ -273,12 +263,18 @@ class PairDebugPoint(BaseModel):
     dy: float
     label_a: Optional[str] = None
     label_b: Optional[str] = None
+    region_id_a: Optional[int] = None
+    region_id_b: Optional[int] = None
     region_type_a: Optional[str] = None
     region_type_b: Optional[str] = None
     is_anchor_match: Optional[bool] = None
     is_window_match: Optional[bool] = None
     is_background_match: Optional[bool] = None
     is_object_match: Optional[bool] = None
+    same_associated_object_match: Optional[bool] = None
+    anchor_object_match: Optional[bool] = None
+    cross_object_match: Optional[bool] = None
+    association_score: Optional[float] = None
     semantic_accept: Optional[bool] = None
 
 
@@ -294,27 +290,21 @@ class SemanticRegionInfo(BaseModel):
 
 class PairDebugStoredMetrics(BaseModel):
     pair_source: Optional[str] = None
-    dinov2_similarity: Optional[float] = None
-    semantic_similarity: Optional[float] = None
+    match_engine: Optional[str] = None
     semantic_backend: Optional[str] = None
     semantic_regions_available: Optional[bool] = None
+    retrieval_score: Optional[float] = None
+    reciprocal_match_count: Optional[int] = None
+    pointmap_consistency: Optional[float] = None
+    alignment_residual: Optional[float] = None
+    reprojection_error: Optional[float] = None
+    parallax_score: Optional[float] = None
+    graph_component_id: Optional[int] = None
+    graph_edge_score: Optional[float] = None
     raw_matches: Optional[int] = None
-    f_inliers: Optional[int] = None
-    f_inlier_ratio: Optional[float] = None
-    coverage_4x4: Optional[float] = None
-    grid_entropy: Optional[float] = None
     overlap_ratio: Optional[float] = None
     combined_geometry_score: Optional[float] = None
     geometry_soft_penalty: Optional[float] = None
-    median_flow_magnitude: Optional[float] = None
-    near_positive_ratio: Optional[float] = None
-    near_negative_ratio: Optional[float] = None
-    split_score: Optional[float] = None
-    depth_monotonicity_score: Optional[float] = None
-    dominant_foreground_side_a: Optional[int] = None
-    dominant_foreground_side_b: Optional[int] = None
-    foreground_support_persistence_penalty: Optional[float] = None
-    crossing_penalty: Optional[float] = None
     effective_overlap: Optional[float] = None
     repeated_room_scope: Optional[str] = None
     repeated_room_penalty_weight: Optional[float] = None
@@ -342,6 +332,22 @@ class PairDebugStoredMetrics(BaseModel):
     window_match_ratio: Optional[float] = None
     same_anchor_label_ratio: Optional[float] = None
     cross_label_object_ratio: Optional[float] = None
+    same_object_match_ratio: Optional[float] = None
+    same_object_inlier_ratio: Optional[float] = None
+    anchor_object_match_ratio: Optional[float] = None
+    cross_object_ratio: Optional[float] = None
+    semantic_accept_ratio: Optional[float] = None
+    low_information_match_ratio: Optional[float] = None
+    low_information_penalty: Optional[float] = None
+    window_view_leak_penalty: Optional[float] = None
+    object_support_signal: Optional[float] = None
+    object_set_similarity: Optional[float] = None
+    object_association_confidence: Optional[float] = None
+    mean_association_score: Optional[float] = None
+    matched_region_count: Optional[int] = None
+    unmatched_anchor_count: Optional[int] = None
+    unmatched_anchor_penalty: Optional[float] = None
+    cross_object_penalty: Optional[float] = None
     anchor_mismatch_penalty: Optional[float] = None
     window_match_density_a: Optional[float] = None
     window_match_density_b: Optional[float] = None
@@ -349,7 +355,11 @@ class PairDebugStoredMetrics(BaseModel):
     window_dominance_penalty: Optional[float] = None
     repeated_room_instance_penalty: Optional[float] = None
     semantic_match_counts: Optional[Dict[str, int]] = None
+    associated_object_pairs: Optional[List[Dict[str, Any]]] = None
+    best_anchor_pair: Optional[Dict[str, Any]] = None
     order_proximity: Optional[float] = None
+    continuity_bonus: Optional[float] = None
+    crossing_weight: Optional[float] = None
     pair_rank: Optional[float] = None
     certification_status: Optional[str] = None
     rejection_reason: Optional[str] = None
@@ -361,17 +371,22 @@ class PairDebugStoredMetrics(BaseModel):
 class PairDebugLiveMetrics(BaseModel):
     matcher: Optional[str] = None
     checkpoint: Optional[str] = None
-    dinov2_similarity: Optional[float] = None
-    semantic_similarity: Optional[float] = None
+    match_engine: Optional[str] = None
     semantic_backend: Optional[str] = None
     semantic_regions_available: Optional[bool] = None
+    retrieval_score: Optional[float] = None
+    reciprocal_match_count: Optional[int] = None
+    pointmap_consistency: Optional[float] = None
+    alignment_residual: Optional[float] = None
+    reprojection_error: Optional[float] = None
+    parallax_score: Optional[float] = None
+    graph_component_id: Optional[int] = None
+    graph_edge_score: Optional[float] = None
     confidence_threshold: Optional[float] = None
     geometry_model: Optional[str] = None
     raw_correspondence_count: Optional[int] = None
     raw_matches: List[PairDebugPoint] = []
     threshold_trials: List[Dict[str, Any]] = []
-    loftr_input_width: Optional[int] = None
-    loftr_input_height: Optional[int] = None
     ransac_reproj_threshold: Optional[float] = None
     num_matches: int = 0
     threshold_match_count: int = 0
@@ -381,20 +396,9 @@ class PairDebugLiveMetrics(BaseModel):
     pair_rank: float = 0.0
     certification_status: Optional[str] = None
     rejection_reason: Optional[str] = None
-    coverage_4x4: Optional[float] = None
-    grid_entropy: Optional[float] = None
     overlap_ratio: Optional[float] = None
     combined_geometry_score: Optional[float] = None
     geometry_soft_penalty: Optional[float] = None
-    median_flow_magnitude: Optional[float] = None
-    near_positive_ratio: Optional[float] = None
-    near_negative_ratio: Optional[float] = None
-    split_score: Optional[float] = None
-    depth_monotonicity_score: Optional[float] = None
-    dominant_foreground_side_a: Optional[int] = None
-    dominant_foreground_side_b: Optional[int] = None
-    foreground_support_persistence_penalty: Optional[float] = None
-    crossing_penalty: Optional[float] = None
     effective_overlap: Optional[float] = None
     repeated_room_scope: Optional[str] = None
     repeated_room_penalty_weight: Optional[float] = None
@@ -422,6 +426,22 @@ class PairDebugLiveMetrics(BaseModel):
     window_match_ratio: Optional[float] = None
     same_anchor_label_ratio: Optional[float] = None
     cross_label_object_ratio: Optional[float] = None
+    same_object_match_ratio: Optional[float] = None
+    same_object_inlier_ratio: Optional[float] = None
+    anchor_object_match_ratio: Optional[float] = None
+    cross_object_ratio: Optional[float] = None
+    semantic_accept_ratio: Optional[float] = None
+    low_information_match_ratio: Optional[float] = None
+    low_information_penalty: Optional[float] = None
+    window_view_leak_penalty: Optional[float] = None
+    object_support_signal: Optional[float] = None
+    object_set_similarity: Optional[float] = None
+    object_association_confidence: Optional[float] = None
+    mean_association_score: Optional[float] = None
+    matched_region_count: Optional[int] = None
+    unmatched_anchor_count: Optional[int] = None
+    unmatched_anchor_penalty: Optional[float] = None
+    cross_object_penalty: Optional[float] = None
     anchor_mismatch_penalty: Optional[float] = None
     window_match_density_a: Optional[float] = None
     window_match_density_b: Optional[float] = None
@@ -429,11 +449,15 @@ class PairDebugLiveMetrics(BaseModel):
     window_dominance_penalty: Optional[float] = None
     repeated_room_instance_penalty: Optional[float] = None
     semantic_match_counts: Dict[str, int] = {}
+    associated_object_pairs: List[Dict[str, Any]] = []
+    best_anchor_pair: Optional[Dict[str, Any]] = None
     semantic_regions_left: List[SemanticRegionInfo] = []
     semantic_regions_right: List[SemanticRegionInfo] = []
     homography_penalty: Optional[float] = None
     low_flow_penalty: Optional[float] = None
     order_proximity: Optional[float] = None
+    continuity_bonus: Optional[float] = None
+    crossing_weight: Optional[float] = None
     motion_label: Optional[str] = None
     direction_dx: Optional[float] = None
     direction_dy: Optional[float] = None
