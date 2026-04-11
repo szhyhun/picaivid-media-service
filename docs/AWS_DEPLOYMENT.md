@@ -274,7 +274,7 @@ DATABASE_URL=postgresql://USER:PASSWORD@picaivid-db.cxsgsuwamdh3.us-west-2.rds.a
 AWS_REGION=us-west-2
 AWS_S3_BUCKET=picaivid-prod-media
 SQS_QUEUE_URL=https://sqs.us-west-2.amazonaws.com/250830192304/picaivid-jobs
-JWT_SECRET=replace-with-strong-secret
+SECRET_KEY_BASE=replace-with-strong-secret
 ```
 
 Minimal React values:
@@ -467,8 +467,33 @@ After the first manual deploy is stable, automate deploys from GitHub:
 - trigger on push to `master`
 - use GitHub Actions OIDC to assume an AWS deploy role
 - target the app host with SSM `send-command`
-- pull latest code, install dependencies if needed, run migrations, restart services
+- app-host deploy steps should be explicit:
+  - `git fetch` and `git reset --hard origin/master` only if the deploy worktree is dedicated to automation
+  - or `git pull --ff-only` if the deploy worktree is never edited manually
+  - Rails:
+    - ensure Ruby 3.3.0 is available
+    - `bundle install --without development test`
+    - `RAILS_ENV=production bundle exec rails db:migrate`
+    - `sudo systemctl restart picaivid-rails`
+  - React:
+    - ensure Node 20 is available
+    - `npm ci`
+    - `npm run build`
+    - `sudo systemctl restart picaivid-react`
+  - verify:
+    - `sudo systemctl status picaivid-rails --no-pager`
+    - `sudo systemctl status picaivid-react --no-pager`
 - add the GPU host later with the same mechanism
+
+GPU-host deploy steps later:
+
+- `git pull --ff-only` for `picaivid-media-service`
+- hydrate artifacts from S3 if the revision or model paths changed
+- install Python dependencies / sync venv if needed
+- `sudo systemctl restart picaivid-media-worker`
+- verify:
+  - `sudo systemctl status picaivid-media-worker --no-pager`
+  - `nvidia-smi`
 
 Do not use long-lived AWS access keys in GitHub secrets for deployment.
 
