@@ -1,12 +1,23 @@
-# AWS Setup: MASt3R Staging
+# AWS Setup
 
-This is the staging setup for the media service after the MASt3R phase-1 cutover.
+This guide covers the current AWS setup for the MASt3R cutover and the app-first deployment flow.
+
+Current live-first shape:
+
+- one `picaivid` AWS environment
+- Rails + React on one EC2 app host
+- PostgreSQL on RDS
+- one shared SQS queue
+- one shared S3 media bucket
+- GPU worker added only after the app deployment is stable
+
+If you later split this into separate staging and production environments, keep the same pattern and change the resource names.
 
 ## Target Shape
 
 - Region: us-west-2
-- S3 bucket: picaivid-staging-media
-- SQS queue: picaivid-staging-jobs
+- S3 bucket: picaivid-prod-media or a dedicated staging bucket
+- SQS queue: picaivid-jobs or a dedicated staging queue
 - App host: t3a.small, 40 GB gp3
 - GPU worker: g6.2xlarge Spot, 100-200 GB gp3
 - GPU fallback: g5.xlarge Spot
@@ -31,10 +42,18 @@ Use g6.2xlarge for staging because it keeps the same 24 GB NVIDIA L4 GPU memory 
 
 Local provisioning credentials live only on your workstation.
 
-    aws configure sso
+Preferred local auth:
+
+    aws login --profile YOUR_PROFILE
     aws sts get-caller-identity --profile YOUR_PROFILE
     export AWS_PROFILE=YOUR_PROFILE
     export AWS_REGION=us-west-2
+
+If your account uses IAM Identity Center instead of aws login:
+
+    aws configure sso
+    aws sso login --profile YOUR_PROFILE
+    aws sts get-caller-identity --profile YOUR_PROFILE
 
 The AWS CLI stores local credentials in:
 
@@ -51,6 +70,33 @@ Runtime credentials must come from EC2 IAM instance profiles. Do not set AWS_ACC
 - /etc/picaivid/react.env
 
 The repo contains only example env files. Real env files stay on the instance under /etc/picaivid/.
+
+## SSM Access
+
+Prefer AWS Systems Manager Session Manager over SSH.
+
+Local requirement:
+
+    brew install --cask session-manager-plugin
+
+Start a shell on an instance:
+
+    aws ssm start-session --target INSTANCE_ID_VALUE --region AWS_REGION_VALUE
+
+If the plugin is unavailable, use non-interactive commands:
+
+    aws ssm send-command \
+      --instance-ids INSTANCE_ID_VALUE \
+      --document-name AWS-RunShellScript \
+      --parameters commands='["uname -a","whoami","pwd"]' \
+      --region AWS_REGION_VALUE
+
+Use SSM for:
+
+- host inspection
+- bootstrap commands
+- service restarts
+- deploy automation from GitHub Actions later
 
 ## Git Ignore and Secrets
 
@@ -111,10 +157,10 @@ List services/resources:
     aws iam list-instance-profiles --query 'InstanceProfiles[].InstanceProfileName' --output table
     aws logs describe-log-groups --log-group-name-prefix /picaivid --region AWS_REGION_VALUE --output table
 
-Create staging bucket and queue if missing:
+Create bucket and queue if missing:
 
-    aws s3 mb s3://picaivid-staging-media --region AWS_REGION_VALUE
-    aws sqs create-queue --queue-name picaivid-staging-jobs --attributes VisibilityTimeout=3600 --region AWS_REGION_VALUE
+    aws s3 mb s3://BUCKET_NAME_VALUE --region AWS_REGION_VALUE
+    aws sqs create-queue --queue-name QUEUE_NAME_VALUE --attributes VisibilityTimeout=3600 --region AWS_REGION_VALUE
 
 Check GPU instance type availability:
 
@@ -157,6 +203,45 @@ Use the existing scripts:
     ./scripts/aws/gpu-stop.sh
 
 The start script starts the EC2 instance and best-effort starts picaivid-media-worker through SSM. The stop script best-effort stops the worker, then stops the instance.
+
+## App-First Deployment Order
+
+Deploy the app host before launching the GPU worker.
+
+1. Start the app EC2 instance.
+2. Attach an Elastic IP.
+3. Open an SSM shell.
+4. Clone or update `picaivid-rails` and `picaivid-react` under `/srv/picaivid/`.
+5. Run each repo bootstrap script.
+6. Create and fill:
+   - `/etc/picaivid/rails.env`
+   - `/etc/picaivid/react.env`
+7. Point Rails at:
+   - `DATABASE_URL=postgresql://...@picaivid-db.../picaivid`
+   - `SQS_QUEUE_URL=https://sqs.us-west-2.amazonaws.com/ACCOUNT_ID/picaivid-jobs`
+   - `AWS_REGION=us-west-2`
+   - `AWS_S3_BUCKET=picaivid-prod-media` or your chosen bucket
+8. Run Rails migrations.
+9. Start `picaivid-rails` and `picaivid-react`.
+10. Install nginx and proxy:
+    - `/` to React
+    - `/api` to Rails
+11. Point the domain to the app Elastic IP.
+12. Add HTTPS with Let's Encrypt.
+
+Do not launch the GPU worker until the app host is healthy and reachable through the domain.
+
+## GitHub Actions Follow-Up
+
+After the first manual deploy works, add CI/CD:
+
+- trigger on push to `master`
+- authenticate to AWS with GitHub OIDC
+- use SSM `send-command` to deploy to the app host
+- run migrations and restart services
+- extend the same pattern to the GPU worker later
+
+Do not store long-lived AWS keys in GitHub secrets for deployment.
 
 ## Worker Env
 

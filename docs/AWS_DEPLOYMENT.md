@@ -1,6 +1,6 @@
-# AWS Deployment: MASt3R Staging
+# AWS Deployment
 
-This guide is the operational runbook for deploying the current MASt3R media-service staging setup on AWS.
+This guide is the operational runbook for deploying the current MASt3R stack on AWS.
 
 Scope:
 
@@ -8,7 +8,26 @@ Scope:
 - `picaivid-react` UI
 - `picaivid-media-service` API/worker
 
-## 1) Target Architecture
+## 1) Current Deployment Order
+
+Use this order:
+
+1. Local AWS auth with `aws login` or IAM Identity Center.
+2. Verify AWS inventory and IAM instance profiles.
+3. Create or verify S3, SQS, RDS, security groups, and Elastic IP.
+4. Bring up the app host first.
+5. Deploy Rails + React manually over SSM.
+6. Point `picaivid.com` to the app Elastic IP and enable HTTPS.
+7. Launch the GPU worker only after the app host is stable.
+8. Add GitHub Actions with AWS OIDC and SSM after the first manual deploy works.
+
+For app-to-app traffic later:
+
+- browser traffic stays public through nginx
+- media-service to Rails traffic should use private VPC routing
+- DB access stays private through security groups
+
+## 2) Target Architecture
 
 Staging defaults:
 
@@ -25,7 +44,15 @@ Staging defaults:
 
 The app host runs Rails + React. The GPU host runs `picaivid-media-worker`; the media API can run on the app host only if pair-debug must be available while the GPU worker is stopped.
 
-## 2) Instance Sizing
+Current one-environment naming in use:
+
+- app EC2: `picaivid-app`
+- RDS: `picaivid-db`
+- SQS: `picaivid-jobs`
+- S3 bucket: `picaivid-prod-media`
+- domain: `picaivid.com`
+
+## 3) Instance Sizing
 
 ### App Host
 
@@ -55,12 +82,22 @@ aws ec2 describe-instance-type-offerings \
   --output table
 ```
 
-## 3) Credentials and IAM
+## 4) Credentials and IAM
 
 Local provisioning credentials:
 
 ```bash
+aws login --profile YOUR_PROFILE
+aws sts get-caller-identity --profile YOUR_PROFILE
+export AWS_PROFILE=YOUR_PROFILE
+export AWS_REGION=us-west-2
+```
+
+If `aws login` is not available for your account, use IAM Identity Center:
+
+```bash
 aws configure sso
+aws sso login --profile YOUR_PROFILE
 aws sts get-caller-identity --profile YOUR_PROFILE
 export AWS_PROFILE=YOUR_PROFILE
 export AWS_REGION=us-west-2
@@ -85,15 +122,39 @@ Suggested runtime roles:
 - App role: SSM, CloudWatch Logs, S3 read/write for media bucket as needed.
 - Media role: SSM, CloudWatch Logs, S3 artifact/media read/write, SQS consume/delete/change-visibility/send as needed.
 
-## 4) Core Resources
+## 5) SSM Access
 
-Create the staging bucket and queue if missing:
+Install the local Session Manager plugin on macOS:
 
 ```bash
-aws s3 mb s3://picaivid-staging-media --region "$AWS_REGION"
+brew install --cask session-manager-plugin
+```
+
+Interactive shell:
+
+```bash
+aws ssm start-session --target INSTANCE_ID_VALUE --region "$AWS_REGION"
+```
+
+Fallback without an interactive shell:
+
+```bash
+aws ssm send-command \
+  --instance-ids INSTANCE_ID_VALUE \
+  --document-name AWS-RunShellScript \
+  --parameters commands='["uname -a","whoami","pwd"]' \
+  --region "$AWS_REGION"
+```
+
+## 6) Core Resources
+
+Create the bucket and queue if missing:
+
+```bash
+aws s3 mb s3://BUCKET_NAME_VALUE --region "$AWS_REGION"
 
 aws sqs create-queue \
-  --queue-name picaivid-staging-jobs \
+  --queue-name QUEUE_NAME_VALUE \
   --attributes VisibilityTimeout=3600 \
   --region "$AWS_REGION"
 ```
@@ -111,7 +172,7 @@ aws logs describe-log-groups --log-group-name-prefix /picaivid --region "$AWS_RE
 
 Use RDS PostgreSQL if available. For early staging only, a DB on the app host is acceptable temporarily.
 
-## 5) Artifact Storage
+## 7) Artifact Storage
 
 MASt3R is the phase-1 matching/reconstruction engine. Runtime must load local or S3-hydrated artifacts; live model downloads are not a deployment path.
 
@@ -145,7 +206,7 @@ Required MASt3R files:
 - `/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth`
 - `/srv/picaivid/third_party/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl`
 
-## 6) Launch Instances
+## 8) Launch Instances
 
 Console path:
 
@@ -162,7 +223,91 @@ Prefer SSM Session Manager over SSH. Use an NVIDIA/CUDA-ready AMI for the GPU ho
 
 CLI launch commands should be added after AMI, subnet, security group, IAM instance profile, and SSM/SSH preference are chosen.
 
-## 7) Instance Env Files
+## 9) Manual App-First Deploy
+
+Bring up the app host before the GPU host.
+
+### Start and reach the host
+
+```bash
+aws ec2 start-instances --instance-ids APP_INSTANCE_ID --region "$AWS_REGION"
+aws ssm start-session --target APP_INSTANCE_ID --region "$AWS_REGION"
+```
+
+### Prepare the host
+
+Inside the host:
+
+```bash
+sudo mkdir -p /srv/picaivid
+sudo chown ubuntu:ubuntu /srv/picaivid
+cd /srv/picaivid
+git clone REPO_URL_FOR_RAILS picaivid-rails
+git clone REPO_URL_FOR_REACT picaivid-react
+```
+
+Run the repo bootstrap scripts:
+
+```bash
+cd /srv/picaivid/picaivid-rails
+./scripts/aws/bootstrap-ec2.sh --repo-dir /srv/picaivid/picaivid-rails --run-migrate 0
+
+cd /srv/picaivid/picaivid-react
+./scripts/aws/bootstrap-ec2.sh --repo-dir /srv/picaivid/picaivid-react
+```
+
+### Create real env files
+
+Fill these on the instance:
+
+- `/etc/picaivid/rails.env`
+- `/etc/picaivid/react.env`
+
+Rails should point at RDS, SQS, and S3. Do not set static AWS keys on AWS hosts.
+
+Minimal Rails values:
+
+```bash
+RAILS_ENV=production
+PORT=3000
+DATABASE_URL=postgresql://USER:PASSWORD@picaivid-db.cxsgsuwamdh3.us-west-2.rds.amazonaws.com:5432/picaivid
+AWS_REGION=us-west-2
+AWS_S3_BUCKET=picaivid-prod-media
+SQS_QUEUE_URL=https://sqs.us-west-2.amazonaws.com/250830192304/picaivid-jobs
+JWT_SECRET=replace-with-strong-secret
+```
+
+Minimal React values:
+
+```bash
+NODE_ENV=production
+PORT=3001
+NEXT_PUBLIC_API_URL=https://picaivid.com/api
+NEXT_PUBLIC_WS_URL=wss://picaivid.com
+NEXT_PUBLIC_MEDIA_SERVICE_URL=https://picaivid.com
+```
+
+### Run migrations and start services
+
+```bash
+cd /srv/picaivid/picaivid-rails
+RAILS_ENV=production bundle exec rails db:migrate
+sudo systemctl restart picaivid-rails
+sudo systemctl restart picaivid-react
+sudo systemctl status picaivid-rails
+sudo systemctl status picaivid-react
+```
+
+### Add nginx and public routing
+
+Use nginx on the app host:
+
+- `/` -> React on `localhost:3001`
+- `/api` -> Rails on `localhost:3000`
+
+Then point `picaivid.com` at the app Elastic IP and add HTTPS with Let's Encrypt.
+
+## 10) Instance Env Files
 
 Real env files live only on instances:
 
@@ -200,7 +345,7 @@ S3_ENDPOINT
 SQS_ENDPOINT
 ```
 
-## 8) Systemd Services
+## 11) Systemd Services
 
 Use these systemd units:
 
@@ -226,7 +371,7 @@ sudo systemctl status picaivid-media-worker
 journalctl -u picaivid-media-worker -f
 ```
 
-## 9) GPU Runtime Validation
+## 12) GPU Runtime Validation
 
 Install CUDA-enabled Torch on the GPU host if the AMI does not already provide a working CUDA PyTorch environment:
 
@@ -244,7 +389,7 @@ Expected service signals:
 - `match_engine=mast3r_graph`
 - no LoFTR/DINO production matcher path
 
-## 10) Start/Stop GPU to Save Cost
+## 13) Start/Stop GPU to Save Cost
 
 Use the existing scripts from `scripts/aws/`:
 
@@ -265,7 +410,7 @@ Use SSM shell access:
 aws ssm start-session --target "$GPU_INSTANCE_ID" --region "$AWS_REGION"
 ```
 
-## 11) Monitoring
+## 14) Monitoring
 
 Queue depth:
 
@@ -298,11 +443,11 @@ Cost controls:
 - Start with one GPU instance only.
 - Scale to 2-4 GPU workers only after the first worker completes staging jobs reliably.
 
-## 12) Validation Checklist
+## 15) Validation Checklist
 
 - `aws sts get-caller-identity` succeeds locally.
-- Staging S3 bucket exists.
-- Staging SQS queue URL resolves.
+- The chosen S3 bucket exists.
+- The chosen SQS queue URL resolves.
 - App and media EC2 instances use IAM instance profiles.
 - No static AWS keys are present in `/etc/picaivid/*.env`.
 - SSM session works.
@@ -315,7 +460,19 @@ Cost controls:
 - Final clusters are max 2 photos.
 - Same-component photos appear only as debug suggestions.
 
-## 13) Deferred Cleanup
+## 16) GitHub Actions Deployment
+
+After the first manual deploy is stable, automate deploys from GitHub:
+
+- trigger on push to `master`
+- use GitHub Actions OIDC to assume an AWS deploy role
+- target the app host with SSM `send-command`
+- pull latest code, install dependencies if needed, run migrations, restart services
+- add the GPU host later with the same mechanism
+
+Do not use long-lived AWS access keys in GitHub secrets for deployment.
+
+## 17) Deferred Cleanup
 
 After the MASt3R staging path is verified, remove legacy deployment/config surface for:
 
