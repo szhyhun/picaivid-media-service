@@ -446,7 +446,7 @@ def _infer_motion_from_matching(
     ordered_photos: List["JobPhoto"],
     allowed_motions: List[str],
 ) -> Tuple[str | None, str, Dict[str, Any]]:
-    """Infer dominant motion from geometric pair directions in this cluster."""
+    """Infer dominant motion from scene-relation directions in this cluster."""
     summary: Dict[str, Any] = {
         "total_transitions": max(0, len(ordered_photos) - 1),
         "evaluated_transitions": 0,
@@ -475,8 +475,8 @@ def _infer_motion_from_matching(
         row = db.execute(
             text(
                 """
-                SELECT direction_dx, direction_dy, reciprocal_match_count
-                FROM photo_similarities
+                SELECT direction_dx, direction_dy, track_support, relation_confidence
+                FROM photo_relations
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a
                   AND photo_b_id = :photo_b
@@ -490,21 +490,24 @@ def _infer_motion_from_matching(
 
         dx = row[0]
         dy = row[1]
-        inliers = row[2]
+        track_support = row[2]
+        relation_confidence = row[3]
         if dx is None or dy is None:
             continue
-        if inliers is None or int(inliers) < 8:
+        if track_support is None or float(track_support) < 0.35:
+            continue
+        if relation_confidence is None or float(relation_confidence) < 0.45:
             continue
 
         summary["verified_transitions"] += 1
-        verified_inliers += int(inliers)
+        verified_inliers += int(round(float(track_support) * 100.0))
         dx = float(dx)
         dy = float(dy)
         if left != photo_a:
             dx = -dx
             dy = -dy
 
-        weight = float(max(1, int(inliers)))
+        weight = float(max(1.0, float(track_support) * 100.0))
         weighted_dx += dx * weight
         weighted_dy += dy * weight
         total_weight += weight
@@ -540,12 +543,12 @@ def _infer_motion_from_matching(
         )
         return None, guidance, summary
 
-    guidance = (
-        "Match-guided camera direction: move camera "
-        f"{camera_dir} following verified geometric transitions "
-        f"({summary['verified_transitions']}/{summary['total_transitions']} verified, "
-        f"avg inliers {summary['avg_verified_inliers']:.1f}); keep motion smooth and consistent."
-    )
+        guidance = (
+            "Match-guided camera direction: move camera "
+            f"{camera_dir} following verified geometric transitions "
+            f"({summary['verified_transitions']}/{summary['total_transitions']} verified, "
+            f"avg support {summary['avg_verified_inliers']:.1f}); keep motion smooth and consistent."
+        )
     return inferred, guidance, summary
 
 

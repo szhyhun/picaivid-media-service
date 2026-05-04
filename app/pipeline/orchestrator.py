@@ -14,13 +14,13 @@ logger = logging.getLogger(__name__)
 
 # Phases each worker type handles
 CPU_PHASES = [3, 4]   # Timeline, Assembly
-GPU_PHASES = [1, 2]   # MASt3R analyze, Render clips
+GPU_PHASES = [1, 2]   # VGGT analyze, Render clips
 
 
 class PipelineOrchestrator:
     """Orchestrates phased pipeline execution.
 
-    Phase 1: Analyze and Plan (GPU / MASt3R)
+    Phase 1: Analyze and Plan (GPU / VGGT)
     Phase 2: Render Clips (GPU)
     Phase 3: Timeline and Beat Sync (CPU)
     Phase 4: Final Assembly (CPU)

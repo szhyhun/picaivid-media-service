@@ -12,12 +12,14 @@ class RoomCluster(Base):
 
     id = Column(Integer, primary_key=True)
     job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    scene_component_id = Column(Integer, ForeignKey("scene_components.id", ondelete="SET NULL"), nullable=True, index=True)
     room_type = Column(String(100))
     confidence_tier = Column(String(20))  # low, medium, high
     sfm_eligible = Column(Boolean, default=False)
     image_count = Column(Integer, default=0)
     overlap_score = Column(Float)
     depth_variance = Column(Float)
+    geometry_confidence = Column(Float, nullable=True)
     sequence_order = Column(Integer, nullable=True)
 
     # Hero photo selection (references job_photos table, not Rails photos)
@@ -30,6 +32,7 @@ class RoomCluster(Base):
 
     # Relationships
     job = relationship("Job", back_populates="room_clusters")
+    scene_component = relationship("SceneComponent", back_populates="room_clusters")
     photos = relationship("JobPhoto", back_populates="room_cluster", foreign_keys="JobPhoto.room_cluster_id")
     hero_photo = relationship("JobPhoto", foreign_keys=[hero_photo_id], post_update=True)
     analysis_results = relationship("AnalysisResult", back_populates="room_cluster", cascade="all, delete-orphan")

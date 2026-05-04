@@ -290,7 +290,7 @@ def _build_direction_prompt_guidance(
     if len(ordered_photo_ids) < 2:
         return ""
 
-    # Some environments may not have direction columns migrated yet.
+    # Some environments may not have relation rows yet during rollout.
     supports_direction = False
     try:
         col_rows = db.execute(
@@ -298,7 +298,7 @@ def _build_direction_prompt_guidance(
                 """
                 SELECT column_name
                 FROM information_schema.columns
-                WHERE table_name = 'photo_similarities'
+                WHERE table_name = 'photo_relations'
                   AND table_schema = current_schema()
                 """
             )
@@ -309,7 +309,7 @@ def _build_direction_prompt_guidance(
             "direction_dy",
         }.issubset(available_cols)
     except Exception as err:
-        logger.warning("Could not inspect photo_similarities schema for prompt guidance: %s", err)
+        logger.warning("Could not inspect photo_relations schema for prompt guidance: %s", err)
 
     if not supports_direction:
         return ""
@@ -327,9 +327,9 @@ def _build_direction_prompt_guidance(
                 SELECT
                     direction_dx,
                     direction_dy,
-                    retrieval_score,
-                    reciprocal_match_count
-                FROM photo_similarities
+                    relation_confidence,
+                    track_support
+                FROM photo_relations
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a_id
                   AND photo_b_id = :photo_b_id
@@ -358,16 +358,16 @@ def _build_direction_prompt_guidance(
             dx = float(dx)
             dy = float(dy)
 
-        retrieval_score = row[2]
-        matches = row[3]
+        relation_confidence = row[2]
+        track_support = row[3]
         rec = _camera_direction_recommendation(
             dx,
             dy,
-            int(matches) if matches is not None else None,
+            int(round(float(track_support or 0.0) * 100.0)) if track_support is not None else None,
         )
-        retrieval_txt = f"{float(retrieval_score):.3f}" if retrieval_score is not None else "N/A"
-        matches_txt = str(int(matches)) if matches is not None else "N/A"
-        lines.append(f"{from_id} -> {to_id}: {rec} (retrieval={retrieval_txt}, reciprocal_matches={matches_txt}).")
+        confidence_txt = f"{float(relation_confidence):.3f}" if relation_confidence is not None else "N/A"
+        support_txt = f"{float(track_support):.3f}" if track_support is not None else "N/A"
+        lines.append(f"{from_id} -> {to_id}: {rec} (relation_confidence={confidence_txt}, track_support={support_txt}).")
 
     if not lines:
         return ""

@@ -1,46 +1,30 @@
-"""Room clustering using the MASt3R phase-1 graph pipeline.
+"""Scene-component clustering using VGGT geometry outputs."""
+from __future__ import annotations
 
-MASt3R owns graph retrieval, pair matching, sparse alignment, and edge scoring.
-This module persists the selected 2-photo clusters into RoomCluster rows.
-"""
 import logging
-from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from typing import Dict, List, Optional
 
-import numpy as np
 from PIL import Image, ImageOps
-from sklearn.cluster import DBSCAN
 from sqlalchemy.orm import Session
 
-from app.db.models import Job, JobPhoto, RoomCluster, TransitionSequence, TransitionSequenceStep
+from app.db.models import (
+    Job,
+    JobPhoto,
+    RoomCluster,
+    SceneComponent,
+    SceneComponentMembership,
+    PhotoSceneGeometry,
+    PhotoRelation,
+)
+from app.pipeline.phase1_analyze.vggt_pipeline import (
+    SceneComponentResult,
+    PhotoGeometryResult,
+    PhotoRelationResult,
+    run_vggt_scene_pipeline,
+)
 
 logger = logging.getLogger(__name__)
-
-# Post-cluster shot caps (applied after geometry clustering, before RoomCluster rows).
-MAIN_ROOM_SHOT_CAP = 4       # living/kitchen/dining
-BEDROOM_SHOT_CAP = 2
-BATHROOM_SHOT_CAP_STRONG = 2
-BATHROOM_SHOT_CAP_WEAK = 1
-BATHROOM_STRONG_SCORE_THRESHOLD = 0.55
-ROOM_INSTANCE_POSITION_GAP = 10  # Same room name across nearby clusters; split only when far apart
-UTILITY_ROOM_LABELS = {
-    "garage",
-    "storage",
-    "storage room",
-    "laundry room",
-    "utility room",
-    "mechanical room",
-    "boiler room",
-}
-
-from app.pipeline.phase1_analyze.precision_pipeline import cluster_photos_precision_first
-
-# Fallback imports (ORB-based)
-from app.pipeline.phase1_analyze.overlap_detector import (
-    compute_overlap_for_photos,
-    cluster_by_overlap,
-    order_photos_by_overlap,
-)
 
 
 def cluster_photos_by_room(
@@ -51,863 +35,285 @@ def cluster_photos_by_room(
     use_overlap_detection: bool = True,
     preloaded_images: Optional[Dict[int, Image.Image]] = None,
 ) -> List[RoomCluster]:
-    """Cluster photos by room type with visual overlap detection.
-
-    Uses MASt3R as the production clustering path. The ORB branch remains only
-    for explicitly disabled overlap detection in local development.
-
-    Args:
-        db: Database session
-        job: Job instance
-        photos: List of JobPhoto instances with embeddings and room labels
-        s3_client: S3 client for downloading images (required for overlap detection)
-        use_overlap_detection: Whether to use visual overlap detection
-
-    Returns:
-        List of created RoomCluster instances
-    """
-    # Filter out excluded photos and SORT BY POSITION
-    # Position order is critical for temporal window matching (adjacent photos = same room)
-    active_photos = sorted([p for p in photos if not p.exclude], key=lambda p: p.position or 0)
-    logger.info(f"Clustering {len(active_photos)} photos for job {job.id}")
-
+    del use_overlap_detection  # geometry-first pipeline ignores the old flag
+    active_photos = sorted([photo for photo in photos if not photo.exclude], key=lambda photo: photo.position or 0)
+    logger.info("Clustering %s photos for job %s with VGGT scene graph", len(active_photos), job.id)
     if not active_photos:
         return []
 
-    _reset_photo_clustering_state(active_photos)
-
-    if use_overlap_detection and s3_client:
-        return _cluster_with_mast3r(
-            db,
-            job,
-            active_photos,
-            s3_client,
-            preloaded_images=preloaded_images,
-        )
-
-    # Fallback to original ORB-based pipeline
-    return _cluster_with_orb(db, job, active_photos, s3_client, use_overlap_detection)
-
-
-def _cluster_with_mast3r(
-    db: Session,
-    job: Job,
-    photos: List[JobPhoto],
-    s3_client,
-    preloaded_images: Optional[Dict[int, Image.Image]] = None,
-) -> List[RoomCluster]:
-    """Cluster using the MASt3R graph pipeline."""
-    logger.info("Using MASt3R graph pipeline")
-
-    # Download all images and collect room labels
-    images = []
-    photo_ids = []
-    room_labels = []  # Room labels for cross-room mismatch check
-    photo_map = {}  # id -> JobPhoto
-
-    for photo in photos:
+    images: list[Image.Image] = []
+    photo_ids: list[int] = []
+    room_labels: list[str] = []
+    positions: list[int] = []
+    photo_map: dict[int, JobPhoto] = {}
+    for photo in active_photos:
+        image = preloaded_images.get(photo.id) if preloaded_images is not None else None
+        if image is None:
+            image = s3_client.download_image(photo.s3_uri)
+            if preloaded_images is not None:
+                preloaded_images[photo.id] = image
         try:
-            img = preloaded_images.get(photo.id) if preloaded_images is not None else None
-            if img is None:
-                img = s3_client.download_image(photo.s3_uri)
-                if preloaded_images is not None:
-                    preloaded_images[photo.id] = img
-            try:
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                pass
-            images.append(img)
-            photo_ids.append(photo.id)
-            room_labels.append(photo.room_override or photo.room_label or "unknown")
-            photo_map[photo.id] = photo
-        except Exception as e:
-            logger.warning(f"Failed to download photo {photo.id}: {e}")
+            image = ImageOps.exif_transpose(image)
+        except Exception:
+            pass
+        images.append(image)
+        photo_ids.append(int(photo.id))
+        room_labels.append(photo.room_override or photo.room_label or "")
+        positions.append(int(photo.position or 0))
+        photo_map[int(photo.id)] = photo
+        photo.room_cluster_id = None
+        photo.cluster_order = None
 
-    if len(images) < 2:
-        # Not enough images for clustering
-        return _create_single_cluster(db, job, photos)
-
-    # Run MASt3R clustering (pass db_session and job_id to save similarity records).
-    cluster_result = cluster_photos_precision_first(
-        images, photo_ids, s3_client,
-        db_session=db, job_id=job.id,
+    geometries, relations, components = run_vggt_scene_pipeline(
+        images=images,
+        photo_ids=photo_ids,
         room_labels=room_labels,
-        return_metadata=True,
+        positions=positions,
+        job_id=int(job.id),
+        s3_client=s3_client,
     )
-    if isinstance(cluster_result, tuple):
-        cluster_id_lists, metadata = cluster_result
-    else:
-        cluster_id_lists = cluster_result
-        metadata = {}
-    duplicate_of_map: Dict[int, int] = metadata.get("duplicate_of_map", {})
-    duplicates_dropped = bool(metadata.get("duplicates_dropped", False))
-    transition_sequences = metadata.get("transition_sequences", [])
-    utility_excluded_ids = set(int(photo_id) for photo_id in metadata.get("utility_excluded_ids", []) or [])
-    utility_excluded_ids.update({
-        int(photo.id)
-        for photo in photo_map.values()
-        if _should_exclude_utility_room(photo)
-    })
 
-    # Mark duplicate metadata on JobPhoto records.
-    for photo in photo_map.values():
-        photo.is_duplicate = False
-        photo.duplicate_of_photo_id = None
-        if int(photo.id) in utility_excluded_ids:
-            photo.exclude = True
-            photo.room_cluster_id = None
-            photo.cluster_order = None
-    for dup_id, canonical_id in duplicate_of_map.items():
-        dup_photo = photo_map.get(dup_id)
-        if dup_photo is None:
-            continue
-        dup_photo.is_duplicate = True
-        dup_photo.duplicate_of_photo_id = canonical_id
-        if duplicates_dropped:
-            # Soft-delete from this job output: keep row for audit/debug, but remove
-            # it from downstream clustering/video generation.
-            dup_photo.exclude = True
-            dup_photo.room_cluster_id = None
-            dup_photo.cluster_order = None
-
-    if duplicates_dropped and duplicate_of_map:
-        logger.info("Excluded %s duplicate photos from downstream generation", len(duplicate_of_map))
-
-    raw_cluster_photo_groups = []
-    for cluster_ids in cluster_id_lists:
-        cluster_photos = [
-            photo_map[pid]
-            for pid in cluster_ids
-            if pid in photo_map and int(pid) not in utility_excluded_ids
-        ]
-        if cluster_photos:
-            raw_cluster_photo_groups.append(cluster_photos)
-
-    ordered_cluster_photo_groups = _order_clusters_for_story(
-        raw_cluster_photo_groups,
-        duplicate_of_map=duplicate_of_map,
-    )
-    ordered_cluster_photo_groups = _apply_post_cluster_shot_caps(ordered_cluster_photo_groups)
-
-    # Create RoomCluster records
-    clusters = []
-    room_instance_tracker: Dict[str, Dict[str, Any]] = {}
-    photo_to_cluster_id: Dict[int, int] = {}
-    for sequence_order, cluster_photos in enumerate(ordered_cluster_photo_groups):
-        if not cluster_photos:
-            continue
-
-        # Determine room type from majority vote
-        room_type = _majority_room_label(cluster_photos)
-        base_room_name = _room_instance_base_label(room_type)
-        room_instance_label = _room_instance_label_for_cluster(
-            base_room_name=base_room_name,
-            cluster_photos=cluster_photos,
-            tracker=room_instance_tracker,
-        )
-
-        cluster = RoomCluster(
-            job_id=job.id,
-            room_type=room_instance_label,
-            image_count=len(cluster_photos),
-            sequence_order=sequence_order,
-        )
-        db.add(cluster)
-        db.flush()
-
-        for photo_order, photo in enumerate(cluster_photos):
-            photo.room_cluster_id = cluster.id
-            photo.cluster_order = photo_order
-            photo_to_cluster_id[int(photo.id)] = int(cluster.id)
-
-        _compute_cluster_metrics(cluster, cluster_photos)
-        clusters.append(cluster)
-
-        logger.info(
-            f"Created cluster {cluster.id}: {room_instance_label} "
-            f"with {len(cluster_photos)} photos"
-        )
-
-    _persist_transition_sequences(
+    _replace_scene_state(
         db=db,
-        job_id=job.id,
-        sequences=transition_sequences,
-        photo_to_cluster_id=photo_to_cluster_id,
+        job_id=int(job.id),
+        geometries=geometries,
+        relations=relations,
+        components=components,
         photo_map=photo_map,
     )
-
+    clusters = _materialize_room_clusters(
+        db=db,
+        job=job,
+        components=components,
+        relations=relations,
+        photo_map=photo_map,
+    )
     db.commit()
-    logger.info(f"Created {len(clusters)} room clusters")
+    logger.info("Created %s room clusters from %s VGGT scene components", len(clusters), len(components))
     return clusters
 
 
-def _should_exclude_utility_room(photo: JobPhoto) -> bool:
-    label = _normalize_room_label(photo.room_override or photo.room_label)
-    return label in UTILITY_ROOM_LABELS
-
-
-def _persist_transition_sequences(
+def _replace_scene_state(
     db: Session,
     job_id: int,
-    sequences: List[Dict[str, Any]],
-    photo_to_cluster_id: Dict[int, int],
-    photo_map: Dict[int, JobPhoto],
+    geometries: list[PhotoGeometryResult],
+    relations: list[PhotoRelationResult],
+    components: list[SceneComponentResult],
+    photo_map: dict[int, JobPhoto],
 ) -> None:
-    db.query(TransitionSequence).filter(TransitionSequence.job_id == job_id).delete(synchronize_session=False)
-    if not sequences:
-        return
+    db.query(SceneComponentMembership).filter(SceneComponentMembership.job_id == job_id).delete(synchronize_session=False)
+    db.query(PhotoSceneGeometry).filter(PhotoSceneGeometry.job_id == job_id).delete(synchronize_session=False)
+    db.query(PhotoRelation).filter(PhotoRelation.job_id == job_id).delete(synchronize_session=False)
+    db.query(SceneComponent).filter(SceneComponent.job_id == job_id).delete(synchronize_session=False)
+    db.query(RoomCluster).filter(RoomCluster.job_id == job_id).delete(synchronize_session=False)
+    db.flush()
 
-    for rank, sequence in enumerate(sequences):
-        photo_ids = [int(photo_id) for photo_id in sequence.get("photo_ids", [])]
-        if len(photo_ids) < 3:
-            continue
-        cluster_ids = sorted(
-            {
-                photo_to_cluster_id.get(photo_id)
-                for photo_id in photo_ids
-                if photo_to_cluster_id.get(photo_id) is not None
-            }
-        )
-        room_type_hint = None
-        for photo_id in photo_ids:
-            photo = photo_map.get(photo_id)
-            if photo is None:
-                continue
-            room_type_hint = photo.room_override or photo.room_label
-            if room_type_hint:
-                break
-        record = TransitionSequence(
+    component_id_by_key: dict[str, int] = {}
+    role_by_photo: dict[int, str] = {}
+    relations_by_pair = {
+        (min(int(relation.photo_a_id), int(relation.photo_b_id)), max(int(relation.photo_a_id), int(relation.photo_b_id))): relation
+        for relation in relations
+    }
+    for component in components:
+        row = SceneComponent(
             job_id=job_id,
-            sequence_rank=rank,
-            sequence_score=float(sequence.get("sequence_score", 0.0) or 0.0),
-            certification_status=str(sequence.get("certification_status") or "usable"),
-            room_type_hint=room_type_hint,
-            source_cluster_ids=cluster_ids,
-            motion_hint=str(sequence.get("motion_hint") or "smooth_transition"),
+            scene_type=component.scene_type,
+            component_key=component.component_key,
+            photo_count=len(component.photo_ids),
+            geometry_confidence=component.geometry_confidence,
+            connectivity_confidence=component.connectivity_confidence,
+            track_coverage=component.track_coverage,
+            avg_reprojection_error=component.avg_reprojection_error,
+            hero_photo_id=component.hero_photo_id,
+            depth_range=component.depth_range,
+            motion_affordance=component.motion_affordance,
+            debug_metrics=component.debug_metrics,
         )
-        db.add(record)
+        db.add(row)
         db.flush()
-        edge_lookup = {
-            (
-                min(int(edge["photo_a_id"]), int(edge["photo_b_id"])),
-                max(int(edge["photo_a_id"]), int(edge["photo_b_id"])),
-            ): edge
-            for edge in sequence.get("edges", [])
-            if isinstance(edge, dict)
-        }
-        for step_index, photo_id in enumerate(photo_ids):
-            similarity_id = None
-            if step_index > 0:
-                left = min(photo_ids[step_index - 1], photo_id)
-                right = max(photo_ids[step_index - 1], photo_id)
-                edge = edge_lookup.get((left, right))
-                similarity_id = int(edge["id"]) if edge and edge.get("id") is not None else None
+        component_id_by_key[component.component_key] = int(row.id)
+        for index, photo_id in enumerate(component.ordered_photo_ids):
+            role = "support"
+            if photo_id == component.hero_photo_id:
+                role = "hero"
+            elif index == 0 or index == len(component.ordered_photo_ids) - 1:
+                role = "endpoint"
+            for other_id in component.photo_ids:
+                if other_id == photo_id:
+                    continue
+                relation = relations_by_pair.get((min(int(photo_id), int(other_id)), max(int(photo_id), int(other_id))))
+                if relation is not None and relation.is_bridge_edge:
+                    role = "bridge"
+                    break
+            role_by_photo[int(photo_id)] = role
             db.add(
-                TransitionSequenceStep(
-                    transition_sequence_id=record.id,
-                    step_index=step_index,
-                    photo_id=photo_id,
-                    photo_similarity_id=similarity_id,
+                SceneComponentMembership(
+                    job_id=job_id,
+                    photo_id=int(photo_id),
+                    scene_component_id=int(row.id),
+                    order_index=index,
+                    photo_role=role,
+                    is_primary=True,
                 )
             )
 
+    for geometry in geometries:
+        component_id = next(
+            (
+                component_id_by_key[component.component_key]
+                for component in components
+                if geometry.photo_id in component.photo_ids
+            ),
+            None,
+        )
+        db.add(
+            PhotoSceneGeometry(
+                job_id=job_id,
+                photo_id=int(geometry.photo_id),
+                scene_component_id=component_id,
+                pose_confidence=geometry.pose_confidence,
+                depth_confidence=geometry.depth_confidence,
+                point_confidence=geometry.point_confidence,
+                visibility_score=geometry.visibility_score,
+                reprojection_error=geometry.reprojection_error,
+                camera_extrinsic=geometry.camera_extrinsic,
+                camera_intrinsic=geometry.camera_intrinsic,
+                camera_center=geometry.camera_center,
+                view_direction=geometry.view_direction,
+                depth_artifact_uri=geometry.depth_artifact_uri,
+                point_map_artifact_uri=geometry.point_map_artifact_uri,
+                local_metrics={**geometry.local_metrics, "photo_role": role_by_photo.get(int(geometry.photo_id), "support")},
+            )
+        )
 
-def _cluster_with_orb(
+    for relation in relations:
+        component_id = None
+        for component in components:
+            if relation.photo_a_id in component.photo_ids and relation.photo_b_id in component.photo_ids:
+                component_id = component_id_by_key[component.component_key]
+                break
+        db.add(
+            PhotoRelation(
+                job_id=job_id,
+                photo_a_id=int(relation.photo_a_id),
+                photo_b_id=int(relation.photo_b_id),
+                scene_component_id=component_id,
+                overlap_score=relation.overlap_score,
+                track_support=relation.track_support,
+                reprojection_score=relation.reprojection_score,
+                relation_confidence=relation.relation_confidence,
+                baseline_distance=relation.baseline_distance,
+                relative_transform=relation.relative_transform,
+                direction_dx=relation.direction_dx,
+                direction_dy=relation.direction_dy,
+                continuity_type=relation.continuity_type,
+                is_bridge_edge=relation.is_bridge_edge,
+                is_connected=relation.is_connected,
+                debug_metrics=relation.debug_metrics,
+            )
+        )
+
+    db.flush()
+
+
+def _materialize_room_clusters(
     db: Session,
     job: Job,
-    photos: List[JobPhoto],
-    s3_client,
-    use_overlap_detection: bool,
-) -> List[RoomCluster]:
-    """Fallback clustering using ORB features."""
-    logger.info("Using ORB-based clustering (fallback)")
-
-    # Group photos by room label first
-    room_groups = defaultdict(list)
-    for photo in photos:
-        room_label = photo.room_override or photo.room_label or "unknown"
-        room_groups[room_label].append(photo)
-
-    clusters = []
-
-    raw_cluster_photo_groups = []
-    for room_label, room_photos in room_groups.items():
-        if len(room_photos) == 0:
-            continue
-
-        # Stage 2: Sub-cluster by embedding similarity (semantic)
-        if len(room_photos) > 1 and all(p.embedding for p in room_photos):
-            semantic_clusters = _sub_cluster_by_embedding(room_photos)
-        else:
-            semantic_clusters = [room_photos]
-
-        # Stage 3: Further split by visual overlap
-        for semantic_group in semantic_clusters:
-            if use_overlap_detection and s3_client and len(semantic_group) > 1:
-                overlap_clusters = _sub_cluster_by_overlap(semantic_group, s3_client)
-            else:
-                overlap_clusters = [semantic_group]
-
-            for overlap_group in overlap_clusters:
-                if overlap_group:
-                    raw_cluster_photo_groups.append(overlap_group)
-
-    ordered_cluster_photo_groups = _order_clusters_for_story(raw_cluster_photo_groups)
-    ordered_cluster_photo_groups = _apply_post_cluster_shot_caps(ordered_cluster_photo_groups)
-    room_instance_tracker: Dict[str, Dict[str, Any]] = {}
-    for sequence_order, overlap_group in enumerate(ordered_cluster_photo_groups):
-        room_type = _majority_room_label(overlap_group)
-        base_room_name = _room_instance_base_label(room_type)
-        room_instance_label = _room_instance_label_for_cluster(
-            base_room_name=base_room_name,
-            cluster_photos=overlap_group,
-            tracker=room_instance_tracker,
-        )
-
-        cluster = RoomCluster(
-            job_id=job.id,
-            room_type=room_instance_label,
-            image_count=len(overlap_group),
-            sequence_order=sequence_order,
-        )
-        db.add(cluster)
-        db.flush()
-
-        for photo_order, photo in enumerate(overlap_group):
-            photo.room_cluster_id = cluster.id
-            photo.cluster_order = photo_order
-
-        _compute_cluster_metrics(cluster, overlap_group)
-        clusters.append(cluster)
-
-        logger.info(
-            f"Created cluster {cluster.id}: {room_instance_label} "
-            f"with {len(overlap_group)} photos"
-        )
-
-    db.commit()
-    logger.info(f"Created {len(clusters)} room clusters")
+    components: list[SceneComponentResult],
+    relations: list[PhotoRelationResult],
+    photo_map: dict[int, JobPhoto],
+) -> list[RoomCluster]:
+    scene_rows = db.query(SceneComponent).filter(SceneComponent.job_id == int(job.id)).all()
+    scene_row_by_key = {row.component_key: row for row in scene_rows}
+    relation_by_pair = {
+        (min(int(relation.photo_a_id), int(relation.photo_b_id)), max(int(relation.photo_a_id), int(relation.photo_b_id))): relation
+        for relation in relations
+    }
+    clusters: list[RoomCluster] = []
+    sequence_order = 0
+    for component in components:
+        scene_row = scene_row_by_key[component.component_key]
+        ordered_photos = [photo_map[int(photo_id)] for photo_id in component.ordered_photo_ids if int(photo_id) in photo_map]
+        for cluster_photos in _derive_render_groups(ordered_photos, component.scene_type):
+            if not cluster_photos:
+                continue
+            room_type = _majority_room_label(cluster_photos)
+            geometry_confidence = component.geometry_confidence
+            confidence_tier = _confidence_tier(geometry_confidence, component.motion_affordance, len(cluster_photos))
+            overlap_score = _cluster_overlap_score(cluster_photos, relation_by_pair)
+            depth_variance = _cluster_depth_variance(cluster_photos)
+            cluster = RoomCluster(
+                job_id=int(job.id),
+                scene_component_id=int(scene_row.id),
+                room_type=room_type,
+                confidence_tier=confidence_tier,
+                sfm_eligible=component.motion_affordance in {"parallax", "multi_view"} and len(cluster_photos) >= 2,
+                image_count=len(cluster_photos),
+                overlap_score=overlap_score,
+                depth_variance=depth_variance,
+                geometry_confidence=geometry_confidence,
+                sequence_order=sequence_order,
+                recommended_motion=component.motion_affordance,
+            )
+            db.add(cluster)
+            db.flush()
+            for photo_order, photo in enumerate(cluster_photos):
+                photo.room_cluster_id = int(cluster.id)
+                photo.cluster_order = photo_order
+            clusters.append(cluster)
+            sequence_order += 1
     return clusters
 
 
-def _create_single_cluster(
-    db: Session,
-    job: Job,
-    photos: List[JobPhoto],
-) -> List[RoomCluster]:
-    """Create a single cluster for all photos (fallback)."""
-    if not photos:
-        return []
-
-    room_type = photos[0].room_override or photos[0].room_label or "unknown"
-    room_instance_label = _room_instance_base_label(room_type)
-
-    cluster = RoomCluster(
-        job_id=job.id,
-        room_type=room_instance_label,
-        image_count=len(photos),
-        sequence_order=0,
-    )
-    db.add(cluster)
-    db.flush()
-
-    for photo_order, photo in enumerate(photos):
-        photo.room_cluster_id = cluster.id
-        photo.cluster_order = photo_order
-
-    _compute_cluster_metrics(cluster, photos)
-    db.commit()
-
-    return [cluster]
+def _derive_render_groups(ordered_photos: list[JobPhoto], scene_type: str) -> list[list[JobPhoto]]:
+    if len(ordered_photos) <= 2:
+        return [ordered_photos]
+    if scene_type in {"exterior", "drone"}:
+        return [ordered_photos]
+    groups: list[list[JobPhoto]] = []
+    current_group: list[JobPhoto] = []
+    current_label: str | None = None
+    for photo in ordered_photos:
+        label = (photo.room_override or photo.room_label or "").strip().lower()
+        if current_group and current_label and label and label != current_label and len(current_group) >= 2:
+            groups.append(current_group)
+            current_group = []
+        current_group.append(photo)
+        current_label = label or current_label
+    if current_group:
+        groups.append(current_group)
+    return groups
 
 
-def _sub_cluster_by_embedding(photos: List[JobPhoto], eps: float = 0.3) -> List[List[JobPhoto]]:
-    """Sub-cluster photos within same room type by embedding similarity.
-
-    Args:
-        photos: Photos with same room label
-        eps: DBSCAN epsilon (distance threshold)
-
-    Returns:
-        List of photo groups (sub-clusters)
-    """
-    if len(photos) <= 1:
-        return [photos]
-
-    # Stack embeddings
-    embeddings = np.array([p.embedding for p in photos])
-
-    # Normalize embeddings
-    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-    # Use DBSCAN for clustering (handles variable cluster count)
-    clustering = DBSCAN(eps=eps, min_samples=1, metric="cosine")
-    labels = clustering.fit_predict(embeddings)
-
-    # Group photos by cluster label
-    groups = defaultdict(list)
-    for photo, label in zip(photos, labels):
-        groups[label].append(photo)
-
-    return list(groups.values())
-
-
-def _sub_cluster_by_overlap(photos: List[JobPhoto], s3_client) -> List[List[JobPhoto]]:
-    """Sub-cluster photos by visual overlap (shared pixels/keypoints).
-
-    Uses ORB feature matching to detect which photos share visual content.
-    Photos that don't overlap are split into separate clusters.
-
-    Args:
-        photos: Photos to cluster
-        s3_client: S3 client for downloading images
-
-    Returns:
-        List of photo groups where each group has visual overlap
-    """
-    if len(photos) <= 1:
-        return [photos]
-
-    try:
-        # Compute pairwise overlap matrix
-        overlap_matrix, _ = compute_overlap_for_photos(photos, s3_client)
-
-        # Cluster by overlap connectivity
-        overlap_clusters = cluster_by_overlap(photos, overlap_matrix)
-
-        # Order photos within each cluster for optimal interpolation
-        ordered_clusters = []
-        for cluster_photos in overlap_clusters:
-            if len(cluster_photos) > 2:
-                # Get subset of overlap matrix for this cluster
-                indices = [photos.index(p) for p in cluster_photos]
-                sub_matrix = overlap_matrix[np.ix_(indices, indices)]
-                ordered = order_photos_by_overlap(cluster_photos, sub_matrix)
-                ordered_clusters.append(ordered)
-            else:
-                ordered_clusters.append(cluster_photos)
-
-        return ordered_clusters
-
-    except Exception as e:
-        logger.warning(f"Overlap detection failed, using single cluster: {e}")
-        return [photos]
-
-
-def _compute_cluster_metrics(cluster: RoomCluster, photos: List[JobPhoto]) -> None:
-    """Compute aggregate metrics for a room cluster.
-
-    Args:
-        cluster: RoomCluster to update
-        photos: Photos in the cluster
-    """
-    # Compute average depth variance
-    depth_variances = [p.depth_variance for p in photos if p.depth_variance is not None]
-    if depth_variances:
-        cluster.depth_variance = float(np.mean(depth_variances))
-
-    # Determine confidence tier based on depth
-    # Thresholds tuned for real estate photos:
-    # - Indoor rooms typically have 0.03-0.06 variance
-    # - Outdoor/aerial typically have 0.06-0.12 variance
-    if cluster.depth_variance is not None:
-        if cluster.depth_variance > 0.06:
-            cluster.confidence_tier = "high"
-        elif cluster.depth_variance > 0.035:
-            cluster.confidence_tier = "medium"
-        else:
-            cluster.confidence_tier = "low"
-    else:
-        cluster.confidence_tier = "low"
-
-    # Check SFM eligibility
-    # Requirements:
-    # - 3+ photos (need multiple views for any 3D effect)
-    # - At least medium confidence (some depth variation)
-    # Even with medium tier, we can do partial reveals and parallax effects
-    cluster.sfm_eligible = len(photos) >= 3 and cluster.confidence_tier in ("high", "medium")
-
-
-def _reset_photo_clustering_state(photos: List[JobPhoto]) -> None:
-    """Reset cluster/duplicate state before recomputing clustering."""
-    for photo in photos:
-        photo.room_cluster_id = None
-        photo.cluster_order = None
-        photo.is_duplicate = False
-        photo.duplicate_of_photo_id = None
-
-
-def _normalize_room_label(room_type: str | None) -> str:
-    return (room_type or "unknown").strip().lower().replace("_", " ")
-
-
-def _room_bucket(room_type: str | None) -> str:
-    room = _normalize_room_label(room_type)
-
-    if "drone" in room:
-        return "drone"
-    if "aerial" in room:
-        return "aerial"
-    if "front yard" in room or "exterior front" in room:
-        return "exterior_front"
-    if any(token in room for token in ("entrance", "foyer")):
-        return "entrance"
-    if "living" in room:
-        return "living_room"
-    if "kitchen" in room:
-        return "kitchen"
-    if "dining" in room:
-        return "dining_room"
-    if "laundry" in room:
-        return "laundry"
-    if "bedroom" in room:
-        return "bedroom"
-    if "bathroom" in room:
-        return "bathroom"
-    if "office" in room:
-        return "office"
-    if "hallway" in room:
-        return "hallway"
-    if "garage" in room:
-        return "garage"
-    if "basement" in room:
-        return "basement"
-    if "attic" in room:
-        return "attic"
-    if any(token in room for token in ("pool", "spa")):
-        return "pool"
-    if "patio" in room or "deck" in room:
-        return "patio"
-    if "backyard" in room or "garden" in room or "yard" in room:
-        return "backyard"
-    if "exterior back" in room:
-        return "exterior_back"
-    if "exterior" in room and "front" in room:
-        return "exterior_front"
-    if "exterior" in room:
-        return "exterior_other"
-    return "unknown"
-
-
-def _story_stage(bucket: str, is_duplicate_cluster: bool) -> int:
-    """Lower stage index is earlier in the final video."""
-    if is_duplicate_cluster:
-        return 90
-    if bucket == "drone":
-        return 0
-    if bucket in {"exterior_front", "entrance", "aerial"}:
-        return 1
-    if bucket in {"living_room", "kitchen", "dining_room"}:
-        return 2
-    if bucket in {"bedroom", "bathroom", "office", "laundry"}:
-        return 3
-    if bucket in {"hallway", "garage", "basement", "attic", "unknown"}:
-        return 4
-    if bucket in {"patio", "backyard", "pool", "exterior_back", "exterior_other"}:
-        return 5
-    return 6
-
-
-def _bucket_priority(bucket: str) -> int:
-    """Ordering inside each story stage."""
-    priorities = {
-        "drone": 0,
-        "exterior_front": 10,
-        "entrance": 20,
-        "aerial": 30,
-        "living_room": 40,
-        "kitchen": 50,
-        "dining_room": 60,
-        "bedroom": 70,
-        "service_room": 80,
-        "bathroom": 80,
-        "office": 90,
-        "laundry": 100,
-        "hallway": 110,
-        "garage": 120,
-        "basement": 130,
-        "attic": 140,
-        "patio": 150,
-        "backyard": 160,
-        "pool": 170,
-        "exterior_back": 180,
-        "exterior_other": 190,
-        "unknown": 200,
-    }
-    return priorities.get(bucket, 999)
-
-
-def _as_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return False
-
-
-def _majority_room_label(photos: List[JobPhoto]) -> str:
-    labels = [p.room_override or p.room_label or "unknown" for p in photos]
+def _majority_room_label(photos: list[JobPhoto]) -> str:
+    labels = [
+        (photo.room_override or photo.room_label or "scene").strip()
+        for photo in photos
+        if (photo.room_override or photo.room_label or "").strip()
+    ]
     if not labels:
-        return "unknown"
-
-    counts: Dict[str, int] = defaultdict(int)
-    first_index: Dict[str, int] = {}
-    for idx, label in enumerate(labels):
-        counts[label] += 1
-        if label not in first_index:
-            first_index[label] = idx
-
-    # Deterministic tie-break: highest count, then first appearance in cluster order.
-    return max(counts.keys(), key=lambda label: (counts[label], -first_index[label]))
+        return "scene"
+    return Counter(labels).most_common(1)[0][0]
 
 
-def _room_instance_base_label(room_type: str | None) -> str:
-    """Normalize room label for per-job room-instance naming."""
-    bucket = _room_bucket(room_type)
-    bucket_to_name = {
-        "drone": "drone",
-        "aerial": "aerial",
-        "exterior_front": "front yard",
-        "entrance": "entrance",
-        "living_room": "living room",
-        "kitchen": "kitchen",
-        "dining_room": "dining room",
-        "bedroom": "bedroom",
-        "bathroom": "bathroom",
-        "office": "office",
-        "laundry": "laundry room",
-        "hallway": "hallway",
-        "garage": "garage",
-        "basement": "basement",
-        "attic": "attic",
-        "patio": "patio",
-        "backyard": "backyard",
-        "pool": "pool",
-        "exterior_back": "exterior back",
-        "exterior_other": "exterior",
-        "unknown": "unknown",
-    }
-    return bucket_to_name.get(bucket, _normalize_room_label(room_type) or "unknown")
+def _confidence_tier(geometry_confidence: float, motion_affordance: str, photo_count: int) -> str:
+    if motion_affordance == "multi_view" and geometry_confidence >= 0.72 and photo_count >= 3:
+        return "high"
+    if motion_affordance in {"parallax", "reveal"} and geometry_confidence >= 0.56:
+        return "medium"
+    return "low"
 
 
-def _cluster_position_center(photos: List[JobPhoto]) -> float:
-    positions = [int(p.position or 0) for p in photos]
-    if not positions:
-        return 0.0
-    return float(np.median(positions))
+def _cluster_overlap_score(photos: list[JobPhoto], relations_by_pair: dict[tuple[int, int], PhotoRelationResult]) -> float:
+    scores: list[float] = []
+    for index in range(len(photos) - 1):
+        pair = (min(int(photos[index].id), int(photos[index + 1].id)), max(int(photos[index].id), int(photos[index + 1].id)))
+        relation = relations_by_pair.get(pair)
+        if relation is not None:
+            scores.append(float(relation.overlap_score))
+    return float(sum(scores) / len(scores)) if scores else 0.0
 
 
-def _cluster_floor_tag(photos: List[JobPhoto]) -> str | None:
-    floor_keys = (
-        "floor",
-        "floor_label",
-        "floor_name",
-        "level",
-        "story",
-        "storey",
-    )
-    for photo in photos:
-        metadata = photo.manual_metadata if isinstance(photo.manual_metadata, dict) else {}
-        for key in floor_keys:
-            value = metadata.get(key)
-            if value is None:
-                continue
-            tag = str(value).strip().lower()
-            if tag:
-                return tag
-    return None
-
-
-def _room_instance_label_for_cluster(
-    base_room_name: str,
-    cluster_photos: List[JobPhoto],
-    tracker: Dict[str, Dict[str, Any]],
-) -> str:
-    state = tracker.get(base_room_name)
-    pos_center = _cluster_position_center(cluster_photos)
-    floor_tag = _cluster_floor_tag(cluster_photos)
-
-    if state is None:
-        state = {"index": 1, "last_pos_center": pos_center, "last_floor_tag": floor_tag}
-        tracker[base_room_name] = state
-    else:
-        last_pos_center = float(state.get("last_pos_center", pos_center))
-        last_floor_tag = state.get("last_floor_tag")
-
-        is_new_instance = False
-        if floor_tag and last_floor_tag and floor_tag != last_floor_tag:
-            is_new_instance = True
-        elif abs(pos_center - last_pos_center) > float(ROOM_INSTANCE_POSITION_GAP):
-            is_new_instance = True
-
-        if is_new_instance:
-            state["index"] = int(state.get("index", 1)) + 1
-
-        state["last_pos_center"] = pos_center
-        if floor_tag:
-            state["last_floor_tag"] = floor_tag
-
-    instance_index = int(state.get("index", 1))
-    if instance_index <= 1:
-        return base_room_name
-    return f"{base_room_name} {instance_index}"
-
-
-def _bathroom_cluster_is_strong(photos: List[JobPhoto]) -> bool:
-    scores = [float(p.final_score) for p in photos if p.final_score is not None]
-    if not scores:
-        return False
-    return float(np.mean(scores)) >= float(BATHROOM_STRONG_SCORE_THRESHOLD)
-
-
-def _room_shot_cap(room_type: str | None, photos: List[JobPhoto]) -> int:
-    bucket = _room_bucket(room_type)
-    if bucket in {"living_room", "kitchen", "dining_room"}:
-        return int(MAIN_ROOM_SHOT_CAP)
-    if bucket == "bedroom":
-        return int(BEDROOM_SHOT_CAP)
-    if bucket == "bathroom":
-        return int(BATHROOM_SHOT_CAP_STRONG if _bathroom_cluster_is_strong(photos) else BATHROOM_SHOT_CAP_WEAK)
-    return len(photos)
-
-
-def _apply_post_cluster_shot_caps(
-    cluster_photo_groups: List[List[JobPhoto]],
-) -> List[List[JobPhoto]]:
-    """Apply final shot-count caps after clustering is already decided.
-
-    This does not re-cluster; it trims oversized groups for render sequencing.
-    """
-    capped_groups: List[List[JobPhoto]] = []
-    trimmed_total = 0
-    for photos in cluster_photo_groups:
-        if not photos:
-            continue
-        room_labels = [p.room_override or p.room_label or "unknown" for p in photos]
-        room_type = max(set(room_labels), key=room_labels.count)
-        cap = _room_shot_cap(room_type, photos)
-        if cap <= 0:
-            continue
-        if len(photos) <= cap:
-            capped_groups.append(photos)
-            continue
-
-        trimmed = photos[:cap]
-        capped_groups.append(trimmed)
-        trimmed_total += (len(photos) - cap)
-        logger.info(
-            "Post-filter shot cap: room=%s size=%s -> %s",
-            room_type,
-            len(photos),
-            len(trimmed),
-        )
-
-    if trimmed_total > 0:
-        logger.info("Post-filter shot caps removed %s photos across clusters", trimmed_total)
-    return capped_groups
-
-
-def _master_priority(photo: JobPhoto) -> int:
-    """Extract user-driven master-shot priority from manual metadata."""
-    metadata = photo.manual_metadata if isinstance(photo.manual_metadata, dict) else {}
-    if not metadata:
-        return 0
-
-    priority = 0
-    for key in ("master_priority", "shot_priority", "priority", "video_priority"):
-        value = _as_int(metadata.get(key))
-        if value is not None:
-            priority = max(priority, value)
-
-    is_master = False
-    for key in ("is_master", "master_shot", "master", "is_hero", "hero_shot"):
-        if _as_bool(metadata.get(key)):
-            is_master = True
-            break
-
-    tags = metadata.get("tags")
-    if isinstance(tags, list):
-        if any(str(tag).strip().lower() in {"master", "hero"} for tag in tags):
-            is_master = True
-
-    return max(priority, 1 if is_master else 0)
-
-
-def _order_clusters_for_story(
-    cluster_photo_groups: List[List[JobPhoto]],
-    duplicate_of_map: Dict[int, int] | None = None,
-) -> List[List[JobPhoto]]:
-    """Order clusters primarily by upload order, grouped into local same-room runs.
-
-    Policy:
-    - upload order is dominant
-    - if nearby clusters belong to the same base room, keep them together
-    - inside a same-room run, multi-photo clusters come before singleton clusters
-    - preserve local upload order within those buckets
-    """
-    duplicate_of_map = duplicate_of_map or {}
-    ROOM_RUN_GAP = 6
-
-    descriptors = []
-    for photos in cluster_photo_groups:
-        if not photos:
-            continue
-
-        room_labels = [p.room_override or p.room_label or "unknown" for p in photos]
-        room_type = max(set(room_labels), key=room_labels.count)
-        positions = [p.position or 0 for p in photos]
-        min_pos = min(positions) if positions else 0
-        max_pos = max(positions) if positions else 0
-        pos_center = float(np.median(positions)) if positions else 0.0
-        quality = float(np.mean([p.final_score or 0.0 for p in photos]))
-        base_room_name = _room_instance_base_label(room_type)
-        multi_photo = len(photos) > 1
-
-        descriptors.append(
-            {
-                "photos": photos,
-                "room_type": room_type,
-                "base_room_name": base_room_name,
-                "min_pos": min_pos,
-                "max_pos": max_pos,
-                "pos_center": pos_center,
-                "quality": quality,
-                "multi_photo": multi_photo,
-            }
-        )
-
-    descriptors.sort(key=lambda d: (d["min_pos"], d["pos_center"], -d["quality"]))
-
-    room_runs: List[List[Dict[str, Any]]] = []
-    for desc in descriptors:
-        if not room_runs:
-            room_runs.append([desc])
-            continue
-        previous_run = room_runs[-1]
-        previous_desc = previous_run[-1]
-        same_room = desc["base_room_name"] == previous_desc["base_room_name"]
-        close_in_order = int(desc["min_pos"]) - int(previous_desc["max_pos"]) <= ROOM_RUN_GAP
-        if same_room and close_in_order:
-            previous_run.append(desc)
-        else:
-            room_runs.append([desc])
-
-    ordered: List[Dict[str, Any]] = []
-    for run in room_runs:
-        multi_clusters = [desc for desc in run if desc["multi_photo"]]
-        single_clusters = [desc for desc in run if not desc["multi_photo"]]
-        multi_clusters.sort(key=lambda d: (d["min_pos"], d["pos_center"], -d["quality"]))
-        single_clusters.sort(key=lambda d: (d["min_pos"], d["pos_center"], -d["quality"]))
-        ordered.extend(multi_clusters)
-        ordered.extend(single_clusters)
-
-    return [desc["photos"] for desc in ordered]
+def _cluster_depth_variance(photos: list[JobPhoto]) -> float:
+    values = [float(photo.depth_variance) for photo in photos if photo.depth_variance is not None]
+    return float(sum(values) / len(values)) if values else 0.0

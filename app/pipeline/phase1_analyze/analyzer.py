@@ -8,7 +8,7 @@ from typing import Dict, List
 from sqlalchemy.orm import Session
 from PIL import Image
 
-from app.db.models import Job, JobPhoto, RoomCluster, PhotoSimilarity
+from app.db.models import Job, JobPhoto, RoomCluster, PhotoRelation
 from app.models.openclip import openclip_model
 from app.models.midas import midas_model
 from app.services.storage.s3_client import s3_client
@@ -521,13 +521,13 @@ class Phase1Analyzer:
         # Rule 2: living->dining corrections with strong verified adjacent dining links.
         if job_id is not None and self.db is not None:
             strong_links = (
-                self.db.query(PhotoSimilarity)
-                .filter(PhotoSimilarity.job_id == job_id)
-                .filter(PhotoSimilarity.is_connected == 1)
-                .filter(PhotoSimilarity.reciprocal_match_count.isnot(None))
-                .filter(PhotoSimilarity.reciprocal_match_count >= 20)
-                .filter(PhotoSimilarity.pair_rank.isnot(None))
-                .filter(PhotoSimilarity.pair_rank >= 0.30)
+                self.db.query(PhotoRelation)
+                .filter(PhotoRelation.job_id == job_id)
+                .filter(PhotoRelation.is_connected.is_(True))
+                .filter(PhotoRelation.track_support.isnot(None))
+                .filter(PhotoRelation.track_support >= 0.45)
+                .filter(PhotoRelation.relation_confidence.isnot(None))
+                .filter(PhotoRelation.relation_confidence >= 0.52)
                 .all()
             )
 
@@ -564,11 +564,11 @@ class Phase1Analyzer:
                     candidate.room_label = "dining room"
                     changed += 1
                     logger.info(
-                        "Photo %s room relabel: living room -> dining room (strong certified dining link to %s, inliers=%s, rank=%.3f)",
+                        "Photo %s room relabel: living room -> dining room (strong dining relation to %s, track_support=%.3f, confidence=%.3f)",
                         candidate.id,
                         other.id,
-                        int(sim.reciprocal_match_count or 0),
-                        float(sim.pair_rank or 0.0),
+                        float(sim.track_support or 0.0),
+                        float(sim.relation_confidence or 0.0),
                     )
 
         if changed:

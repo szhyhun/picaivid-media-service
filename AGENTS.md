@@ -12,10 +12,9 @@ It does **not** own product/business logic, auth, billing, or user-facing API co
 
 ## Current Production Direction
 
-- Primary matcher path is `loftr_kornia_indoor_native`.
-- Reverse-direction LoFTR retry (`_maybe_retry_reverse_native`) is intentional and required; treat it as non-regression and do not remove/disable it unless explicitly requested by the user.
+- Primary phase-1 path is `vggt_scene_graph`.
 - Cluster membership is geometry-first and strict-gated.
-- Pair debug is matcher-limited (Kornia native path).
+- Scene and relation debug must stay aligned with the VGGT-derived tables.
 - Rails remains the orchestration and user-facing system of record.
 
 If you change these assumptions, update:
@@ -45,7 +44,7 @@ If you change these assumptions, update:
 ## Validation Before Commit
 
 - Python compile check:
-  - `./venv/bin/python -m py_compile app/main.py app/pipeline/phase1_analyze/learned_matching.py`
+  - `./venv/bin/python -m py_compile app/main.py app/pipeline/phase1_analyze/vggt_pipeline.py app/models/vggt.py`
 - Run targeted tests/scripts for changed area.
 - If clustering behavior changed, compare against baseline:
   - see `scripts/baselines/README.md`

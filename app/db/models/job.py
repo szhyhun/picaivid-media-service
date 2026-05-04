@@ -29,6 +29,7 @@ class Job(Base):
 
     # Relationships
     job_photos = relationship("JobPhoto", back_populates="job", cascade="all, delete-orphan")
+    scene_components = relationship("SceneComponent", back_populates="job", cascade="all, delete-orphan")
     room_clusters = relationship("RoomCluster", back_populates="job", cascade="all, delete-orphan")
     clips = relationship("Clip", back_populates="job", cascade="all, delete-orphan")
     timelines = relationship("Timeline", back_populates="job", cascade="all, delete-orphan")

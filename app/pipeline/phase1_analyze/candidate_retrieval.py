@@ -1,4 +1,4 @@
-"""Room-label compatibility helpers used by the MASt3R graph scorer."""
+"""Room-label compatibility helpers used by the VGGT scene graph builder."""
 from __future__ import annotations
 
 from typing import Optional

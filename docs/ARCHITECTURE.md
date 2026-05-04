@@ -1,42 +1,34 @@
-# Media Service Architecture
+# Architecture
 
-## What This Service Owns
+## Pipeline shape
 
-- Photo-level analysis and geometry matching
-- Cluster construction and ordering metadata
-- Clip generation and rendering phases
-- Background worker execution for media jobs
+1. Rails creates a media job and writes project photos.
+2. Media-service phase 1 runs VGGT over the project photo set.
+3. VGGT outputs are converted into:
+   - `scene_components`
+   - `scene_component_memberships`
+   - `photo_scene_geometry`
+   - `photo_relations`
+4. Render clusters and motion decisions are derived from scene geometry.
+5. Phase 2 generates clips from ordered cluster inputs.
 
-## What It Does Not Own
+## Storage model
 
-- Product/business workflows
-- User auth and authorization
-- Billing and subscription rules
-- Frontend state/UI contracts
+- Postgres stores metadata and planning state.
+- S3 stores dense geometry artifacts:
+  - depth maps
+  - point maps
+  - optional sparse scene exports
+  - optional track bundles
 
-Those are owned by `picaivid-rails` and `picaivid-react`.
+## Scene-first rules
 
-## Runtime Components
+- geometry decides connectivity
+- room labels are hints, not truth
+- indoor and outdoor components use different thresholds
+- cross-room parallax is only allowed when actual geometry continuity exists
 
-- FastAPI app (`app/main.py`)
-- SQS worker (`app/worker.py`)
-- Pipeline orchestrator (`app/pipeline/orchestrator.py`)
-- Postgres models (`app/db/models/*`)
-- S3/MinIO client (`app/services/storage/s3_client.py`)
+## Debug surface
 
-## Pipeline Shape
-
-1. Phase 1 analyze
-   - MASt3R retrieval graph + geometry matching
-   - Room clusters + pair diagnostics
-2. Phase 2 render
-   - Clip generation and media outputs
-3. Persist outputs and metrics for Rails/UI consumption
-
-## Geometry/Clustering Notes
-
-- Production matcher default: `mast3r_graph`
-- Edge acceptance is strict-gated by geometry quality and model constraints
-- Pair debug is intended for diagnosing pair-level failures, not changing business flow
-
-For details see `docs/CLUSTERING.md`.
+- `scenes/debug` explains component-level decisions
+- `relations/debug` explains two-photo continuity using derived VGGT relations

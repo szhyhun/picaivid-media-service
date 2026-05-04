@@ -1,4 +1,4 @@
-"""add mast3r fields and pose alignments
+"""historical geometry fields and pose alignments
 
 Revision ID: 2d3e4f5a6b7c
 Revises: 1c2d3e4f5a6b

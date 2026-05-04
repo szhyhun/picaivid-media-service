@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Phases each worker type handles
 CPU_PHASES = [3, 4]   # Timeline, Assembly
-GPU_PHASES = [1, 2]   # MASt3R analyze, Render clips
+GPU_PHASES = [1, 2]   # VGGT analyze, Render clips
 
 
 def process_message(message: dict) -> None:
@@ -31,7 +31,7 @@ def process_message(message: dict) -> None:
     # Parse message
     job_message = JobMessage(**message)
 
-    # MASt3R phase 1 now belongs to GPU workers in all environments.
+    # Geometry reconstruction phase 1 belongs to GPU workers in all environments.
     if settings.ENVIRONMENT == "development":
         allowed_phases = GPU_PHASES if settings.WORKER_TYPE == "gpu" else CPU_PHASES
     elif settings.WORKER_TYPE == "gpu":
@@ -59,7 +59,7 @@ def main():
     logger.info(f"SQS Queue: {settings.SQS_QUEUE_URL}")
     warmup_core_models(
         context=f"worker:{settings.WORKER_TYPE}",
-        include_mast3r=settings.WORKER_TYPE == "gpu",
+        include_vggt=settings.WORKER_TYPE == "gpu",
         include_legacy=False,
     )
 

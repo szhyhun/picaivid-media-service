@@ -35,7 +35,7 @@ class AnalysisResult(Base):
     cfg_scale = Column(Float, default=4.0)  # CFG scale 3-6
     inference_steps = Column(Integer, default=40)  # 30-50 steps
 
-    # Debug metrics (includes depth_variance, image_count, sfm_eligible)
+    # Debug metrics (scene geometry, component confidence, motion decisions)
     debug_metrics = Column(JSONB, default={})
 
     # Relationships
