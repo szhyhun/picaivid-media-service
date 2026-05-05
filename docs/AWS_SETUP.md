@@ -12,6 +12,24 @@ This repo now deploys a **VGGT-first** media worker. Finish the code migration f
 - app domain: `picaivid.com`
 - GPU worker: one `g6.2xlarge` Spot by default
 
+## Current state
+
+Already done:
+
+- app host booted and reachable
+- Rails service running on `3000`
+- React service running on `3001`
+- nginx installed and configured
+- DNS points to the Elastic IP
+- HTTPS is active for `picaivid.com` and `www.picaivid.com`
+
+Still pending:
+
+- GPU worker launch
+- VGGT commercial checkpoint approval and hydration
+- first CUDA-backed worker validation
+- GitHub Actions deploy automation
+
 ## Auth
 
 Local:
@@ -87,6 +105,13 @@ Recommended instance paths:
 /srv/picaivid/third_party/vggt/checkpoints/VGGT-1B-Commercial.safetensors
 ```
 
+Checkpoint source:
+
+- request access at [facebook/VGGT-1B-Commercial](https://huggingface.co/facebook/VGGT-1B-Commercial)
+- after approval, download with a Hugging Face read token
+- upload the approved checkpoint into `s3://picaivid-prod-media/artifacts/vggt/checkpoints/`
+- hydrate it onto the GPU host before starting `picaivid-media-worker`
+
 ## App-first order
 
 1. app EC2 up
@@ -96,3 +121,5 @@ Recommended instance paths:
 5. GPU worker launched
 6. VGGT checkpoint hydrated
 7. one small end-to-end job passes
+
+At the time of writing, steps 1 through 4 are complete.

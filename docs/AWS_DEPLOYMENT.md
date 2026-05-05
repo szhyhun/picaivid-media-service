@@ -11,9 +11,36 @@ Operational order for the workspace:
 7. run one small reconstruction job
 8. add GitHub Actions OIDC + SSM deploy automation
 
+## Current status
+
+Completed:
+
+- VGGT migration is merged
+- local Alembic upgrade succeeded through `3f4e5d6c7b8a`
+- `picaivid.com` and `www.picaivid.com` point to the app EC2 Elastic IP
+- Rails and React are running on `picaivid-app`
+- nginx is installed and proxies:
+  - `/` -> React on `127.0.0.1:3001`
+  - `/api` -> Rails on `127.0.0.1:3000`
+- Let's Encrypt TLS is live for:
+  - `https://picaivid.com`
+  - `https://www.picaivid.com`
+
+Pending:
+
+- launch the GPU worker
+- hydrate the VGGT commercial checkpoint after Hugging Face approval
+- run the first real CUDA-backed end-to-end job
+- add GitHub Actions OIDC + SSM deploy automation
+
 ## App host
 
 The app host serves Rails + React and can optionally run the media API for scene/relation debug. Media-to-Rails traffic should stay inside the VPC once the GPU worker exists.
+
+Current public entrypoints:
+
+- `https://picaivid.com`
+- `https://www.picaivid.com`
 
 ## GPU worker
 
@@ -28,6 +55,7 @@ The worker needs:
 - the VGGT commercial checkpoint on disk
 - repo bootstrap complete
 - `/etc/picaivid/media-worker.env`
+- Hugging Face access approval for `facebook/VGGT-1B-Commercial`
 
 ## Bootstrap checklist
 
