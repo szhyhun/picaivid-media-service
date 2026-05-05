@@ -1,8 +1,8 @@
-name: Deploy Media Service via SSM
+name: Deploy Media Service via S3 + SSM
 
 on:
   push:
-    branches: ["main"]
+    branches: ["master"]
   workflow_dispatch:
 
 permissions:
@@ -16,23 +16,39 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       EC2_INSTANCE_ID: ${{ vars.EC2_MEDIA_INSTANCE_ID }}
       DEPLOY_PATH: ${{ vars.MEDIA_DEPLOY_PATH }}
-      DEPLOY_REF: ${{ github.ref_name }}
-      SERVICE_API: picaivid-media-api
-      SERVICE_WORKER: picaivid-media-worker
+      DEPLOY_ARTIFACT_BUCKET: ${{ vars.DEPLOY_ARTIFACT_BUCKET }}
+      DEPLOY_ARTIFACT_PREFIX: ${{ vars.DEPLOY_ARTIFACT_PREFIX }}
       RESTART_API: ${{ vars.MEDIA_RESTART_API }}
+      INSTALL_CUDA_TORCH: ${{ vars.MEDIA_INSTALL_CUDA_TORCH }}
       CUDA_WHL_INDEX: https://download.pytorch.org/whl/cu124
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Validate required variables
         run: |
           test -n "${AWS_REGION}" || (echo "Missing repo variable AWS_REGION" && exit 1)
           test -n "${EC2_INSTANCE_ID}" || (echo "Missing repo variable EC2_MEDIA_INSTANCE_ID" && exit 1)
           test -n "${DEPLOY_PATH}" || (echo "Missing repo variable MEDIA_DEPLOY_PATH" && exit 1)
+          test -n "${DEPLOY_ARTIFACT_BUCKET}" || (echo "Missing repo variable DEPLOY_ARTIFACT_BUCKET" && exit 1)
+          test -n "${DEPLOY_ARTIFACT_PREFIX}" || (echo "Missing repo variable DEPLOY_ARTIFACT_PREFIX" && exit 1)
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package source artifact
+        run: |
+          git archive --format=tar.gz --output media-artifact.tar.gz HEAD
+
+      - name: Upload artifact to S3
+        env:
+          ARTIFACT_KEY: ${{ vars.DEPLOY_ARTIFACT_PREFIX }}/picaivid-media-service/${{ github.sha }}.tar.gz
+        run: |
+          aws s3 cp media-artifact.tar.gz "s3://${DEPLOY_ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
+          echo "ARTIFACT_KEY=${ARTIFACT_KEY}" >> "$GITHUB_ENV"
 
       - name: Trigger SSM deploy command
         id: ssm
@@ -44,20 +60,14 @@ jobs:
             --comment "Deploy media-service ${GITHUB_SHA}" \
             --parameters commands="[
               \"set -euo pipefail\",
-              \"cd ${DEPLOY_PATH}\",
-              \"git fetch --all --prune\",
-              \"git checkout ${DEPLOY_REF}\",
-              \"git pull --ff-only\",
-              \"python3 -m venv venv || true\",
-              \"source venv/bin/activate\",
-              \"pip install -U pip\",
-              \"pip install -r requirements.lock.txt\",
-              \"pip uninstall -y torch torchvision torchaudio || true\",
-              \"pip install --index-url ${CUDA_WHL_INDEX} torch torchvision torchaudio\",
-              \"python -c 'import torch; print(\\\"cuda_available=\\\", torch.cuda.is_available())'\",
-              \"sudo systemctl restart ${SERVICE_WORKER}\",
-              \"if [ \\\"${RESTART_API}\\\" = \\\"1\\\" ]; then sudo systemctl restart ${SERVICE_API}; fi\",
-              \"sudo systemctl --no-pager --full status ${SERVICE_WORKER} | head -n 40\"
+              \"ARTIFACT=/tmp/picaivid-media-service-${GITHUB_SHA}.tar.gz\",
+              \"RELEASE_DIR=/tmp/picaivid-media-service-${GITHUB_SHA}\",
+              \"rm -rf \${RELEASE_DIR}\",
+              \"mkdir -p \${RELEASE_DIR}\",
+              \"aws s3 cp s3://${DEPLOY_ARTIFACT_BUCKET}/${ARTIFACT_KEY} \${ARTIFACT}\",
+              \"tar -xzf \${ARTIFACT} -C \${RELEASE_DIR}\",
+              \"chmod +x \${RELEASE_DIR}/scripts/aws/deploy-from-artifact.sh\",
+              \"sudo -u ubuntu -H bash -lc 'RESTART_API=${RESTART_API} INSTALL_CUDA_TORCH=${INSTALL_CUDA_TORCH} CUDA_WHL_INDEX=${CUDA_WHL_INDEX} \${RELEASE_DIR}/scripts/aws/deploy-from-artifact.sh --source-dir \${RELEASE_DIR} --deploy-dir ${DEPLOY_PATH} --env-file /etc/picaivid/media-worker.env --worker-service picaivid-media-worker --api-service picaivid-media-api'\"
             ]" \
             --query "Command.CommandId" \
             --output text)

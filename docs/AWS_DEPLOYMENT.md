@@ -94,18 +94,59 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 After the manual deploy is stable, CD should do:
 
 1. assume AWS role via OIDC
-2. deploy app host via SSM:
-   - pull code
-   - install deps
-   - `bundle install`
-   - `bundle exec rails db:migrate`
-   - `npm ci`
-   - `npm run build`
-   - restart Rails/React services
-3. deploy media worker via SSM:
-   - pull code
-   - install Python deps
-   - validate VGGT assets
-   - restart worker
+2. package a repo artifact in GitHub Actions
+3. upload it to S3
+4. deploy on-host via SSM:
+   - download artifact from S3
+   - unpack into a fresh release dir
+   - install/build on the host
+   - swap the working directory
+   - restart only the affected service
 
-Keep the first automated workflow simple. It should restart only services whose repo changed.
+This is intentionally minimal:
+
+- no host-side GitHub credentials
+- no Rails specs in Actions for now
+- no Docker-in-Actions
+- one OIDC role
+- one S3 artifact bucket
+- one SSM deploy path per repo
+
+### Required GitHub configuration
+
+Secret in each repo:
+
+- `AWS_DEPLOY_ROLE_ARN`
+
+Repository variables:
+
+- `AWS_REGION`
+- `DEPLOY_ARTIFACT_BUCKET`
+- `DEPLOY_ARTIFACT_PREFIX`
+
+React repo variables:
+
+- `EC2_APP_INSTANCE_ID`
+- `REACT_DEPLOY_PATH`
+
+Rails repo variables:
+
+- `EC2_APP_INSTANCE_ID`
+- `RAILS_DEPLOY_PATH`
+
+Media-service repo variables:
+
+- `EC2_MEDIA_INSTANCE_ID`
+- `MEDIA_DEPLOY_PATH`
+- `MEDIA_RESTART_API` (`0` or `1`)
+- `MEDIA_INSTALL_CUDA_TORCH` (`0` or `1`)
+
+Recommended values today:
+
+- `DEPLOY_ARTIFACT_BUCKET=picaivid-prod-media`
+- `DEPLOY_ARTIFACT_PREFIX=deploy-artifacts`
+- `REACT_DEPLOY_PATH=/srv/picaivid/picaivid-react`
+- `RAILS_DEPLOY_PATH=/srv/picaivid/picaivid-rails`
+- `MEDIA_DEPLOY_PATH=/srv/picaivid/picaivid-media-service`
+
+Keep the first automated workflow simple. It should deploy only the repo that changed.
