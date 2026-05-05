@@ -27,6 +27,16 @@ Each component stores:
 - depth range
 - recommended motion affordance
 
+## Indoor / outdoor safeguards
+
+- indoor and outdoor photos do not share one component by default
+- cross-domain joins are penalized in relation scoring
+- interior-to-exterior joins require strong bridge evidence
+- mixed components are split again if cross-domain support is weak
+- weakly attached photos are ejected as outliers instead of poisoning a larger scene
+
+This is intentional. The renderer should prefer separate high-confidence room or exterior clips over one bad global scene.
+
 ## Relation debug
 
 Two-photo inspection now answers:

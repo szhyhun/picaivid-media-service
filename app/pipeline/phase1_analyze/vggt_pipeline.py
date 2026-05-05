@@ -18,6 +18,23 @@ from app.services.storage.s3_client import S3Client
 
 logger = logging.getLogger(__name__)
 
+BRIDGE_LABEL_TOKENS = (
+    "hall",
+    "hallway",
+    "entry",
+    "entryway",
+    "foyer",
+    "landing",
+    "stair",
+    "door",
+    "patio",
+    "deck",
+    "balcony",
+    "porch",
+    "terrace",
+    "walkway",
+)
+
 
 @dataclass
 class PhotoGeometryResult:
@@ -122,6 +139,24 @@ def _scene_type_for_label(label: str | None) -> str:
     return "interior"
 
 
+def _is_bridge_label(label: str | None) -> bool:
+    text = str(label or "").strip().lower().replace("_", " ")
+    return any(token in text for token in BRIDGE_LABEL_TOKENS)
+
+
+def _domain_penalty(left_domain: str, right_domain: str) -> float:
+    domain_pair = {left_domain, right_domain}
+    if len(domain_pair) <= 1:
+        return 0.0
+    if domain_pair == {"interior", "exterior"}:
+        return float(settings.VGGT_INTERIOR_EXTERIOR_PENALTY)
+    if domain_pair == {"interior", "drone"}:
+        return float(settings.VGGT_INTERIOR_DRONE_PENALTY)
+    if domain_pair == {"exterior", "drone"}:
+        return float(settings.VGGT_EXTERIOR_DRONE_PENALTY)
+    return 0.0
+
+
 def _synthetic_vggt_outputs(
     photo_ids: list[int],
     room_labels: list[str],
@@ -192,19 +227,52 @@ def _compute_pair_relations(
             room_match = 1.0 if room_labels.get(left.photo_id) == room_labels.get(right.photo_id) else 0.0
             position_gap = abs(int(positions.get(left.photo_id, 0)) - int(positions.get(right.photo_id, 0)))
             position_bonus = float(math.exp(-position_gap / 4.0))
-            overlap_score = float(np.clip(0.48 * view_alignment + 0.28 * baseline_score + 0.14 * position_bonus + 0.10 * room_match, 0.0, 1.0))
-            track_support = float(np.clip(0.55 * overlap_score + 0.45 * min(left.point_confidence, right.point_confidence), 0.0, 1.0))
+            left_domain = _scene_type_for_label(room_labels.get(left.photo_id))
+            right_domain = _scene_type_for_label(room_labels.get(right.photo_id))
+            domain_penalty = _domain_penalty(left_domain, right_domain)
+            bridge_candidate = (
+                (_is_bridge_label(room_labels.get(left.photo_id)) or _is_bridge_label(room_labels.get(right.photo_id)))
+                and position_gap <= int(settings.VGGT_BRIDGE_POSITION_GAP_MAX)
+            )
+            overlap_score = float(np.clip(
+                0.48 * view_alignment + 0.28 * baseline_score + 0.14 * position_bonus + 0.10 * room_match - domain_penalty,
+                0.0,
+                1.0,
+            ))
+            track_support = float(np.clip(
+                0.55 * overlap_score + 0.45 * min(left.point_confidence, right.point_confidence) - 0.5 * domain_penalty,
+                0.0,
+                1.0,
+            ))
             reprojection_score = float(np.clip(1.0 - 0.5 * (left.reprojection_error + right.reprojection_error), 0.0, 1.0))
-            relation_confidence = float(np.clip(0.40 * overlap_score + 0.30 * track_support + 0.20 * reprojection_score + 0.10 * room_match, 0.0, 1.0))
+            relation_confidence = float(np.clip(
+                0.40 * overlap_score
+                + 0.30 * track_support
+                + 0.20 * reprojection_score
+                + 0.10 * room_match
+                + (float(settings.VGGT_CROSS_DOMAIN_CONFIDENCE_BONUS) if bridge_candidate else 0.0),
+                0.0,
+                1.0,
+            ))
             continuity_type = "weak"
             if room_labels.get(left.photo_id) == room_labels.get(right.photo_id):
                 continuity_type = "same_room"
-            elif position_gap <= 2 and room_labels.get(left.photo_id) and room_labels.get(right.photo_id):
-                continuity_type = "doorway"
-            elif all(_scene_type_for_label(room_labels.get(pid)) == "exterior" for pid in (left.photo_id, right.photo_id)):
+            elif left_domain == right_domain == "exterior":
                 continuity_type = "exterior"
-            is_bridge_edge = continuity_type in {"doorway", "exterior"} and relation_confidence >= float(settings.VGGT_BRIDGE_SCORE_THRESHOLD)
-            is_connected = relation_confidence >= float(settings.VGGT_RELATION_SCORE_THRESHOLD)
+            elif left_domain == right_domain == "drone":
+                continuity_type = "drone"
+            elif bridge_candidate and room_labels.get(left.photo_id) and room_labels.get(right.photo_id):
+                continuity_type = "doorway"
+            elif left_domain != right_domain:
+                continuity_type = "cross_domain"
+            is_bridge_edge = continuity_type == "doorway" and relation_confidence >= float(settings.VGGT_BRIDGE_SCORE_THRESHOLD)
+            requires_bridge = "interior" in {left_domain, right_domain} and left_domain != right_domain
+            threshold = float(settings.VGGT_RELATION_SCORE_THRESHOLD)
+            if requires_bridge:
+                threshold = max(threshold, float(settings.VGGT_MIXED_COMPONENT_SPLIT_THRESHOLD))
+            elif left_domain != right_domain:
+                threshold = max(threshold, float(settings.VGGT_RELATION_SCORE_THRESHOLD) + 0.04)
+            is_connected = relation_confidence >= threshold and (bridge_candidate if requires_bridge else True)
             relations.append(
                 PhotoRelationResult(
                     photo_a_id=int(left.photo_id),
@@ -228,6 +296,10 @@ def _compute_pair_relations(
                         "baseline_score": baseline_score,
                         "position_gap": position_gap,
                         "room_match": room_match,
+                        "left_domain": left_domain,
+                        "right_domain": right_domain,
+                        "domain_penalty": domain_penalty,
+                        "bridge_candidate": bridge_candidate,
                     },
                 )
             )
@@ -257,6 +329,156 @@ def _connected_components(photo_ids: Iterable[int], relations: list[PhotoRelatio
             stack.extend(sorted(adjacency.get(current, set()) - seen))
         components.append(sorted(component))
     return components
+
+
+def _relation_lookup(relations: list[PhotoRelationResult]) -> dict[tuple[int, int], PhotoRelationResult]:
+    return {
+        (min(int(relation.photo_a_id), int(relation.photo_b_id)), max(int(relation.photo_a_id), int(relation.photo_b_id))): relation
+        for relation in relations
+    }
+
+
+def _component_internal_scores(
+    component_photo_ids: list[int],
+    relation_by_pair: dict[tuple[int, int], PhotoRelationResult],
+) -> dict[int, tuple[int, float]]:
+    scores: dict[int, list[float]] = {int(photo_id): [] for photo_id in component_photo_ids}
+    for idx, left_photo_id in enumerate(component_photo_ids):
+        for right_photo_id in component_photo_ids[idx + 1:]:
+            relation = relation_by_pair.get((min(int(left_photo_id), int(right_photo_id)), max(int(left_photo_id), int(right_photo_id))))
+            if relation is None or not relation.is_connected:
+                continue
+            scores[int(left_photo_id)].append(float(relation.relation_confidence))
+            scores[int(right_photo_id)].append(float(relation.relation_confidence))
+    return {
+        photo_id: (len(values), float(np.mean(values)) if values else 0.0)
+        for photo_id, values in scores.items()
+    }
+
+
+def _split_mixed_component(
+    component_photo_ids: list[int],
+    relation_by_pair: dict[tuple[int, int], PhotoRelationResult],
+    room_labels: dict[int, str],
+) -> list[list[int]]:
+    domains = {_scene_type_for_label(room_labels.get(photo_id)) for photo_id in component_photo_ids}
+    if len(component_photo_ids) <= 2 or len(domains) <= 1:
+        return [sorted(component_photo_ids)]
+
+    cross_domain_relations = []
+    for idx, left_photo_id in enumerate(component_photo_ids):
+        for right_photo_id in component_photo_ids[idx + 1:]:
+            relation = relation_by_pair.get((min(int(left_photo_id), int(right_photo_id)), max(int(left_photo_id), int(right_photo_id))))
+            if relation is None or not relation.is_connected:
+                continue
+            left_domain = _scene_type_for_label(room_labels.get(left_photo_id))
+            right_domain = _scene_type_for_label(room_labels.get(right_photo_id))
+            if left_domain != right_domain:
+                cross_domain_relations.append(relation)
+
+    if not cross_domain_relations:
+        return [sorted(component_photo_ids)]
+
+    avg_cross_domain_confidence = float(np.mean([relation.relation_confidence for relation in cross_domain_relations]))
+    strong_bridge_count = sum(1 for relation in cross_domain_relations if relation.is_bridge_edge)
+    bridge_photos = {
+        photo_id
+        for relation in cross_domain_relations
+        if relation.is_bridge_edge
+        for photo_id in (int(relation.photo_a_id), int(relation.photo_b_id))
+        if _is_bridge_label(room_labels.get(photo_id))
+    }
+    keep_cross_domain_edges = (
+        strong_bridge_count >= 2
+        and len(bridge_photos) >= 2
+        and avg_cross_domain_confidence >= float(settings.VGGT_MIXED_COMPONENT_SPLIT_THRESHOLD) + 0.04
+    )
+    if keep_cross_domain_edges:
+        return [sorted(component_photo_ids)]
+
+    adjacency: dict[int, set[int]] = {int(photo_id): set() for photo_id in component_photo_ids}
+    for idx, left_photo_id in enumerate(component_photo_ids):
+        for right_photo_id in component_photo_ids[idx + 1:]:
+            relation = relation_by_pair.get((min(int(left_photo_id), int(right_photo_id)), max(int(left_photo_id), int(right_photo_id))))
+            if relation is None or not relation.is_connected:
+                continue
+            left_domain = _scene_type_for_label(room_labels.get(left_photo_id))
+            right_domain = _scene_type_for_label(room_labels.get(right_photo_id))
+            if left_domain != right_domain and not keep_cross_domain_edges:
+                continue
+            if left_domain != right_domain and not relation.is_bridge_edge:
+                continue
+            adjacency[int(left_photo_id)].add(int(right_photo_id))
+            adjacency[int(right_photo_id)].add(int(left_photo_id))
+
+    subcomponents: list[list[int]] = []
+    seen: set[int] = set()
+    for photo_id in sorted(adjacency):
+        if photo_id in seen:
+            continue
+        stack = [photo_id]
+        current_component: list[int] = []
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            current_component.append(current)
+            stack.extend(sorted(adjacency.get(current, set()) - seen))
+        subcomponents.append(sorted(current_component))
+    return subcomponents
+
+
+def _prune_outliers(
+    component_photo_ids: list[int],
+    relation_by_pair: dict[tuple[int, int], PhotoRelationResult],
+    room_labels: dict[int, str],
+) -> list[list[int]]:
+    if len(component_photo_ids) <= 2:
+        return [sorted(component_photo_ids)]
+
+    kept = sorted(component_photo_ids)
+    peeled: list[int] = []
+    while len(kept) > 2:
+        internal_scores = _component_internal_scores(kept, relation_by_pair)
+        weak_photo_id = None
+        weak_score = None
+        dominant_domain = max(
+            {_scene_type_for_label(room_labels.get(photo_id)) for photo_id in kept},
+            key=lambda domain: sum(1 for photo_id in kept if _scene_type_for_label(room_labels.get(photo_id)) == domain),
+        )
+        for photo_id in kept:
+            degree, avg_confidence = internal_scores.get(int(photo_id), (0, 0.0))
+            domain = _scene_type_for_label(room_labels.get(photo_id))
+            bridge = _is_bridge_label(room_labels.get(photo_id))
+            should_remove = degree == 0 or avg_confidence < float(settings.VGGT_OUTLIER_CONFIDENCE_THRESHOLD)
+            if domain != dominant_domain and not bridge and avg_confidence < float(settings.VGGT_MIXED_COMPONENT_SPLIT_THRESHOLD):
+                should_remove = True
+            if should_remove and (weak_score is None or avg_confidence < weak_score):
+                weak_photo_id = int(photo_id)
+                weak_score = avg_confidence
+        if weak_photo_id is None:
+            break
+        kept = [photo_id for photo_id in kept if int(photo_id) != weak_photo_id]
+        peeled.append(weak_photo_id)
+
+    components = [sorted(kept)] if kept else []
+    components.extend([[int(photo_id)] for photo_id in peeled])
+    return components
+
+
+def _refine_components(
+    photo_ids: list[int],
+    relations: list[PhotoRelationResult],
+    room_labels: dict[int, str],
+) -> list[list[int]]:
+    relation_by_pair = _relation_lookup(relations)
+    initial_components = _connected_components(photo_ids, relations)
+    refined: list[list[int]] = []
+    for component_photo_ids in initial_components:
+        for split_component in _split_mixed_component(component_photo_ids, relation_by_pair, room_labels):
+            refined.extend(_prune_outliers(split_component, relation_by_pair, room_labels))
+    return [sorted(component) for component in refined if component]
 
 
 def _order_component(component_photo_ids: list[int], geometries_by_photo: dict[int, PhotoGeometryResult], positions: dict[int, int]) -> list[int]:
@@ -384,7 +606,7 @@ def run_vggt_scene_pipeline(
     position_map = {int(photo_id): int(positions[idx] if idx < len(positions) else idx) for idx, photo_id in enumerate(photo_ids)}
     geometries_by_photo = {geometry.photo_id: geometry for geometry in geometries}
     relations = _compute_pair_relations(geometries, room_label_map, position_map)
-    components = _connected_components(photo_ids, relations)
+    components = _refine_components(photo_ids, relations, room_label_map)
 
     component_results: list[SceneComponentResult] = []
     for index, component_photo_ids in enumerate(components):
@@ -404,6 +626,11 @@ def run_vggt_scene_pipeline(
         depth_range = float(max(depth_means) - min(depth_means)) if depth_means else 0.0
         motion_affordance, avg_relation, avg_track, baseline_spread = _motion_affordance(component_photo_ids, geometries_by_photo, relations)
         hero_photo = max(component_geometries, key=lambda geometry: (geometry.pose_confidence, geometry.depth_confidence)).photo_id
+        bridge_count = sum(1 for relation in component_relations if relation.is_bridge_edge)
+        domain_counts: dict[str, int] = {}
+        for photo_id in component_photo_ids:
+            domain = _scene_type_for_label(room_label_map.get(photo_id))
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
         component_results.append(
             SceneComponentResult(
                 component_key=f"component-{index + 1}",
@@ -421,6 +648,8 @@ def run_vggt_scene_pipeline(
                     "avg_relation_confidence": avg_relation,
                     "avg_track_support": avg_track,
                     "baseline_spread": baseline_spread,
+                    "bridge_edge_count": bridge_count,
+                    "domain_counts": domain_counts,
                     "photo_ids": [int(photo_id) for photo_id in component_photo_ids],
                 },
             )
