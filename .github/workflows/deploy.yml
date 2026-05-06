@@ -59,7 +59,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --comment "Deploy media-service ${GITHUB_SHA}" \
             --parameters commands="[
-              \"set -euo pipefail\",
+              \"set -eu\",
               \"ARTIFACT=/tmp/picaivid-media-service-${GITHUB_SHA}.tar.gz\",
               \"RELEASE_DIR=/tmp/picaivid-media-service-${GITHUB_SHA}\",
               \"rm -rf \${RELEASE_DIR}\",
