@@ -23,7 +23,7 @@ jobs:
       CUDA_WHL_INDEX: https://download.pytorch.org/whl/cu124
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Validate required variables
         run: |
@@ -34,7 +34,7 @@ jobs:
           test -n "${DEPLOY_ARTIFACT_PREFIX}" || (echo "Missing repo variable DEPLOY_ARTIFACT_PREFIX" && exit 1)
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
