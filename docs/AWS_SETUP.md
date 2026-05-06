@@ -102,7 +102,7 @@ Recommended instance paths:
 
 ```text
 /srv/picaivid/third_party/vggt
-/srv/picaivid/third_party/vggt/checkpoints/VGGT-1B-Commercial.safetensors
+/srv/picaivid/third_party/vggt/checkpoints/vggt_1B_commercial.pt
 ```
 
 Checkpoint source:

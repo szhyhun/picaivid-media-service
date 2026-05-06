@@ -6,9 +6,11 @@ import os
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors.torch import load_file as safetensors_load_file
 
 from app.core.config import settings
 from app.pipeline.phase1_analyze.matcher_loaders import _ensure_local_file, _ensure_local_repo
@@ -31,8 +33,23 @@ def _resolve_repo_dir() -> str:
 
 def _resolve_checkpoint_path() -> str:
     repo_dir = _resolve_repo_dir()
-    fallback = os.path.join(repo_dir, "checkpoints", "VGGT-1B-Commercial", "model.pt")
-    return _ensure_local_file(str(settings.VGGT_MODEL_CHECKPOINT or fallback), "VGGT_MODEL_CHECKPOINT_S3_URI")
+    if settings.VGGT_MODEL_CHECKPOINT:
+        return _ensure_local_file(str(settings.VGGT_MODEL_CHECKPOINT), "VGGT_MODEL_CHECKPOINT_S3_URI")
+
+    candidates = [
+        os.path.join(repo_dir, "checkpoints", "vggt_1B_commercial.pt"),
+        os.path.join(repo_dir, "checkpoints", "model.safetensors"),
+        os.path.join(repo_dir, "vggt_1B_commercial.pt"),
+        os.path.join(repo_dir, "model.safetensors"),
+        os.path.join(repo_dir, "checkpoints", "VGGT-1B-Commercial", "model.pt"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    preferred_target = os.path.join(repo_dir, "checkpoints", "vggt_1B_commercial.pt")
+    Path(preferred_target).parent.mkdir(parents=True, exist_ok=True)
+    return _ensure_local_file(preferred_target, "VGGT_MODEL_CHECKPOINT_S3_URI")
 
 
 def _device() -> str:
@@ -73,7 +90,12 @@ def _load_model() -> Any:
     imports = _load_imports()
     checkpoint_path = _resolve_checkpoint_path()
     model = imports.VGGT().to(_device())
-    state_dict = torch.load(checkpoint_path, map_location=_device())
+    if checkpoint_path.endswith(".safetensors"):
+        state_dict = safetensors_load_file(checkpoint_path, device=_device())
+    else:
+        state_dict = torch.load(checkpoint_path, map_location=_device())
+    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
     model.load_state_dict(state_dict)
     model.eval()
     logger.info("Loaded VGGT checkpoint from %s", checkpoint_path)

@@ -599,8 +599,11 @@ def run_vggt_scene_pipeline(
                 )
             )
     except Exception as err:
-        logger.warning("VGGT runtime unavailable, using synthetic scene fallback: %s", err)
-        geometries, _ = _synthetic_vggt_outputs(photo_ids, room_labels, positions)
+        if str(settings.ENVIRONMENT).lower() == "development":
+            logger.warning("VGGT runtime unavailable, using synthetic scene fallback: %s", err)
+            geometries, _ = _synthetic_vggt_outputs(photo_ids, room_labels, positions)
+        else:
+            raise RuntimeError(f"VGGT runtime unavailable in {settings.ENVIRONMENT}: {err}") from err
 
     room_label_map = {int(photo_id): str(room_labels[idx] if idx < len(room_labels) else "") for idx, photo_id in enumerate(photo_ids)}
     position_map = {int(photo_id): int(positions[idx] if idx < len(positions) else idx) for idx, photo_id in enumerate(photo_ids)}
