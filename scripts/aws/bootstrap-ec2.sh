@@ -40,7 +40,7 @@ log() { echo; echo "==> $*"; }
 
 log "Installing OS dependencies"
 ${SUDO} apt-get update
-${SUDO} apt-get install -y git curl ca-certificates python3 python3-venv python3-pip
+${SUDO} apt-get install -y git curl ca-certificates awscli python3 python3-venv python3-pip
 
 log "Installing Python dependencies"
 cd "${REPO_DIR}"

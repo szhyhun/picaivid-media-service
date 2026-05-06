@@ -60,6 +60,7 @@ jobs:
             --comment "Deploy media-service ${GITHUB_SHA}" \
             --parameters commands="[
               \"set -eu\",
+              \"command -v aws >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y awscli; }\",
               \"ARTIFACT=/tmp/picaivid-media-service-${GITHUB_SHA}.tar.gz\",
               \"RELEASE_DIR=/tmp/picaivid-media-service-${GITHUB_SHA}\",
               \"rm -rf \${RELEASE_DIR}\",
