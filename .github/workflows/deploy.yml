@@ -68,7 +68,7 @@ jobs:
               \"aws s3 cp s3://${DEPLOY_ARTIFACT_BUCKET}/${ARTIFACT_KEY} \${ARTIFACT}\",
               \"tar -xzf \${ARTIFACT} -C \${RELEASE_DIR}\",
               \"chmod +x \${RELEASE_DIR}/scripts/aws/deploy-from-artifact.sh\",
-              \"sudo -u ubuntu -H bash -lc 'RESTART_API=${RESTART_API} INSTALL_CUDA_TORCH=${INSTALL_CUDA_TORCH} CUDA_WHL_INDEX=${CUDA_WHL_INDEX} \${RELEASE_DIR}/scripts/aws/deploy-from-artifact.sh --source-dir \${RELEASE_DIR} --deploy-dir ${DEPLOY_PATH} --env-file /etc/picaivid/media-worker.env --worker-service picaivid-media-worker --api-service picaivid-media-api'\"
+              \"sudo -u ubuntu -H env RESTART_API=${RESTART_API} INSTALL_CUDA_TORCH=${INSTALL_CUDA_TORCH} CUDA_WHL_INDEX=${CUDA_WHL_INDEX} \${RELEASE_DIR}/scripts/aws/deploy-from-artifact.sh --source-dir \${RELEASE_DIR} --deploy-dir ${DEPLOY_PATH} --env-file /etc/picaivid/media-worker.env --worker-service picaivid-media-worker --api-service picaivid-media-api\"
             ]" \
             --query "Command.CommandId" \
             --output text)
