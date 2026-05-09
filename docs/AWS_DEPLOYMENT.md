@@ -29,7 +29,6 @@ Completed:
 Pending:
 
 - launch the GPU worker
-- hydrate the VGGT commercial checkpoint after Hugging Face approval
 - run the first real CUDA-backed end-to-end job
 - add GitHub Actions OIDC + SSM deploy automation
 
@@ -46,8 +45,9 @@ Current public entrypoints:
 
 Use:
 
-- `g6.2xlarge` Spot first
-- `g5.xlarge` Spot fallback
+- `g6.xlarge` Spot first for quota-compatible validation
+- `g6.2xlarge` only after quota allows it or if validation proves `g6.xlarge` too small
+- avoid `g4dn.xlarge` unless forced; the T4 is a weaker fit for VGGT than the L4
 
 The worker needs:
 
@@ -55,7 +55,14 @@ The worker needs:
 - the VGGT commercial checkpoint on disk
 - repo bootstrap complete
 - `/etc/picaivid/media-worker.env`
-- Hugging Face access approval for `facebook/VGGT-1B-Commercial`
+
+The checkpoint and repo archive are already staged in S3. The remaining work is instance launch, hydration onto disk, and first real validation.
+
+Use the existing lifecycle helpers after the instance exists:
+
+- [gpu-start.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-start.sh)
+- [gpu-stop.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-stop.sh)
+- [gpu-status.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-status.sh)
 
 ## Bootstrap checklist
 

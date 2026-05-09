@@ -6,6 +6,8 @@ FastAPI + worker service for geometry-first photo analysis and clip generation.
 
 Phase 1 is now **VGGT-first**.
 
+VGGT is the core intelligence layer for this product. The primary product remains cinematic video generation from listing photos. Any future `tour_3d` or splat-based interactive experience is a secondary track that should build on the VGGT-centered pipeline rather than replace it.
+
 The service reconstructs project geometry from the full photo set, derives scene components, orders photos within each component, and feeds geometry-backed render clusters into phase 2. Pairwise relations still exist, but only as derived support data.
 
 Primary outputs:
@@ -61,3 +63,9 @@ pip install -r requirements.lock.txt
 - [docs/DEVELOPMENT.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/DEVELOPMENT.md)
 - [docs/AWS_SETUP.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/AWS_SETUP.md)
 - [docs/AWS_DEPLOYMENT.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/AWS_DEPLOYMENT.md)
+
+## Reference
+
+- PlayCanvas SuperSplat and related splat tooling are reference material for a possible later `tour_3d` side project, not the main product direction:
+  - [playcanvas/supersplat](https://github.com/playcanvas/supersplat)
+  - [playcanvas/model-viewer](https://github.com/playcanvas/model-viewer)

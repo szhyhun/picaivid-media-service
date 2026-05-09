@@ -2,6 +2,8 @@
 
 This repo now deploys a **VGGT-first** media worker. Finish the code migration first, then resume AWS work from this shape.
 
+VGGT is the core direction. A possible future `tour_3d` or splat-delivery product is secondary and should not change the current priority: get the VGGT-powered cinematic pipeline working first.
+
 ## Current target
 
 - region: `us-west-2`
@@ -10,7 +12,7 @@ This repo now deploys a **VGGT-first** media worker. Finish the code migration f
 - queue: `picaivid-jobs`
 - media bucket: `picaivid-prod-media`
 - app domain: `picaivid.com`
-- GPU worker: one `g6.2xlarge` Spot by default
+- GPU worker: one `g6.xlarge` Spot for first validation, then scale up if needed
 
 ## Current state
 
@@ -26,7 +28,7 @@ Already done:
 Still pending:
 
 - GPU worker launch
-- VGGT commercial checkpoint approval and hydration
+- first real VGGT CUDA validation
 - first CUDA-backed worker validation
 - GitHub Actions deploy automation
 
@@ -70,6 +72,32 @@ aws ssm send-command \
   --region "$AWS_REGION"
 ```
 
+## GPU lifecycle control
+
+The worker is intended to be started and stopped on demand. Existing helper scripts:
+
+- [scripts/aws/gpu-start.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-start.sh)
+- [scripts/aws/gpu-stop.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-stop.sh)
+- [scripts/aws/gpu-status.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-status.sh)
+
+They assume:
+
+- the instance already exists
+- `GPU_INSTANCE_ID` is set
+- `AWS_PROFILE` and `AWS_REGION` are set if needed
+
+Example:
+
+```bash
+export AWS_PROFILE=picaivid-admin
+export AWS_REGION=us-west-2
+export GPU_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx
+
+./scripts/aws/gpu-start.sh
+./scripts/aws/gpu-status.sh
+./scripts/aws/gpu-stop.sh
+```
+
 ## Required media env values
 
 - `DATABASE_URL`
@@ -108,9 +136,14 @@ Recommended instance paths:
 Checkpoint source:
 
 - request access at [facebook/VGGT-1B-Commercial](https://huggingface.co/facebook/VGGT-1B-Commercial)
-- after approval, download with a Hugging Face read token
+- after approval, download with a Hugging Face read token or approved local login
 - upload the approved checkpoint into `s3://picaivid-prod-media/artifacts/vggt/checkpoints/`
 - hydrate it onto the GPU host before starting `picaivid-media-worker`
+
+Reference only for a later splat-side project:
+
+- [playcanvas/supersplat](https://github.com/playcanvas/supersplat)
+- [playcanvas/model-viewer](https://github.com/playcanvas/model-viewer)
 
 ## App-first order
 
@@ -122,4 +155,4 @@ Checkpoint source:
 6. VGGT checkpoint hydrated
 7. one small end-to-end job passes
 
-At the time of writing, steps 1 through 4 are complete.
+At the time of writing, steps 1 through 4 and step 6 are complete.
