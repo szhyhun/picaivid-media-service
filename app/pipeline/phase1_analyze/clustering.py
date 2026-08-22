@@ -173,6 +173,10 @@ def _replace_scene_state(
             )
 
     for geometry in geometries:
+        photo = photo_map.get(int(geometry.photo_id))
+        if photo is not None:
+            photo.depth_variance = float(geometry.local_metrics.get("depth_variance", 0.0))
+            photo.depth_layers = int(geometry.local_metrics.get("depth_layers", 1))
         component_id = next(
             (
                 component_id_by_key[component.component_key]

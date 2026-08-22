@@ -10,7 +10,7 @@ Phase 1 no longer chooses clips from pair-matcher scores. It reconstructs geomet
 2. run VGGT on the project set or overlapping windows
 3. persist per-photo geometry
 4. measure bidirectional depth overlap, depth consistency, normalized reprojection, and relative pose for candidate pairs
-5. verify the strongest candidates with RoMa/RANSAC and run VGGT tracks only inside candidate components
+5. classify continuity directly from the jointly reconstructed VGGT geometry and run focused VGGT tracks inside candidate components
 6. split scene components only on `interpolation_safe` edges
 7. order photos with deterministic beam search over verified edges
 8. derive one-to-four-photo render groups and a renderer-neutral ShotPlan
@@ -51,7 +51,7 @@ Two-photo inspection now answers:
 Relation classes are intentionally strict:
 
 - `duplicate`: very high overlap and near-zero baseline
-- `interpolation_safe`: geometric overlap, RoMa/RANSAC inliers, reprojection, and rotation all pass
+- `interpolation_safe`: VGGT overlap, depth agreement, reprojection, and rotation all pass
 - `doorway_bridge`: editorial continuity only; never used as an interpolation request
 - `cut_only` / `unrelated`: safe editorial cut or no use
 

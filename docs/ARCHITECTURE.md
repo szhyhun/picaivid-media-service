@@ -18,7 +18,7 @@
    - `scene_component_memberships`
    - `photo_scene_geometry`
    - `photo_relations`
-4. Measured overlaps, RoMa verification, scoped tracks, and deterministic ordering form a renderer-neutral `ShotPlan`.
+4. Measured VGGT overlaps, depth agreement, scoped tracks, and deterministic ordering form a renderer-neutral `ShotPlan`.
 5. Render clusters and motion decisions are derived from the verified plan.
 6. Phase 2 generates clips from ordered shot-plan inputs.
 

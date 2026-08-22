@@ -20,15 +20,9 @@ opencv-python-headless==4.11.0.86
 # Phase 1: Analysis Models
 open-clip-torch>=2.24.0
 timm>=0.9.12
-transformers>=4.36.0
 huggingface_hub>=0.24.0
 einops>=0.8.0
 safetensors>=0.5.0
-
-# Learned Feature Matching (replaces ORB)
-kornia>=0.7.0
-kornia-rs>=0.1.0
-romatch==0.1.2
 
 # Phase 2: Video Generation (GPU only, but imported everywhere)
 diffusers>=0.32.0

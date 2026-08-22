@@ -97,6 +97,24 @@ def _confidence_unit(values: np.ndarray) -> np.ndarray:
     return np.clip(1.0 - np.exp(-(values - 1.0)), 0.0, 1.0)
 
 
+def _depth_metrics(depth: np.ndarray) -> dict[str, float | int]:
+    """Return scale-invariant cinematic depth metrics from VGGT depth."""
+    values = np.asarray(depth, dtype=np.float64)
+    finite = values[np.isfinite(values) & (values > 0.0)]
+    if finite.size < 16:
+        return {"depth_variance": 0.0, "depth_layers": 1}
+    low, high = np.quantile(finite, [0.02, 0.98])
+    if high - low <= 1e-8:
+        return {"depth_variance": 0.0, "depth_layers": 1}
+    normalized = np.clip((finite - low) / (high - low), 0.0, 1.0)
+    histogram, _ = np.histogram(normalized, bins=8, range=(0.0, 1.0))
+    significant = int(np.count_nonzero(histogram >= max(1, int(0.05 * normalized.size))))
+    return {
+        "depth_variance": float(np.var(normalized)),
+        "depth_layers": max(1, significant),
+    }
+
+
 def _camera_center(extrinsic: np.ndarray) -> np.ndarray:
     rotation = extrinsic[:3, :3]
     translation = extrinsic[:3, 3]
@@ -321,15 +339,26 @@ def _predict_with_retries(filelist: list[str]) -> tuple[dict[str, Any], dict[str
 
 def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, float]:
     source_points = source.world_points.reshape(-1, 3)
-    source_conf = _confidence_unit(source.point_conf).reshape(-1)
-    valid = np.isfinite(source_points).all(axis=1) & (source_conf >= np.quantile(source_conf, 0.65))
+    source_depth = source.depth.reshape(-1)
+    source_conf = np.asarray(source.depth_conf, dtype=np.float64).reshape(-1)
+    finite_conf = source_conf[np.isfinite(source_conf)]
+    confidence_threshold = float(np.quantile(finite_conf, 0.65)) if finite_conf.size else math.inf
+    valid = (
+        np.isfinite(source_points).all(axis=1)
+        & np.isfinite(source_depth)
+        & (source_depth > 1e-8)
+        & np.isfinite(source_conf)
+        & (source_conf >= confidence_threshold)
+    )
     indices = np.flatnonzero(valid)
     maximum = int(settings.VGGT_MAX_GEOMETRY_POINTS_PER_PAIR)
     if len(indices) > maximum:
         indices = indices[np.linspace(0, len(indices) - 1, maximum, dtype=int)]
     if len(indices) == 0:
-        return {"visible_fraction": 0.0, "depth_consistency": 0.0, "reprojection_error": 1.0}
+        return {"visible_fraction": 0.0, "frustum_fraction": 0.0, "depth_consistency": 0.0, "reprojection_error": 1.0}
     points = source_points[indices]
+    source_height, source_width = source.depth.shape[:2]
+    source_pixels = np.column_stack((indices % source_width, indices // source_width)).astype(np.float64)
     camera = points @ target.extrinsic[:3, :3].T + target.extrinsic[:3, 3]
     depth = camera[:, 2]
     projected = camera @ target.intrinsic.T
@@ -339,21 +368,45 @@ def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, fl
     y = np.rint(pixels[:, 1]).astype(int)
     visible = (depth > 1e-6) & (x >= 0) & (x < width) & (y >= 0) & (y < height)
     if not np.any(visible):
-        return {"visible_fraction": 0.0, "depth_consistency": 0.0, "reprojection_error": 1.0}
+        return {"visible_fraction": 0.0, "frustum_fraction": 0.0, "depth_consistency": 0.0, "reprojection_error": 1.0}
     x_visible, y_visible, z_visible = x[visible], y[visible], depth[visible]
     target_depth = np.asarray(target.depth[y_visible, x_visible]).reshape(-1)
-    relative_depth_error = np.abs(z_visible - target_depth) / np.maximum(np.abs(target_depth), 1e-6)
-    consistent = relative_depth_error <= 0.05
-    target_points = target.world_points[y_visible, x_visible]
-    target_camera = target_points @ target.extrinsic[:3, :3].T + target.extrinsic[:3, 3]
-    target_pixels = target_camera @ target.intrinsic.T
-    target_pixels = target_pixels[:, :2] / np.maximum(target_pixels[:, 2:3], 1e-8)
-    diagonal = math.hypot(width, height)
-    reprojection = np.linalg.norm(pixels[visible] - target_pixels, axis=1) / max(diagonal, 1.0)
+    target_conf = np.asarray(target.depth_conf[y_visible, x_visible]).reshape(-1)
+    finite_target_conf = np.asarray(target.depth_conf, dtype=np.float64)
+    finite_target_conf = finite_target_conf[np.isfinite(finite_target_conf)]
+    target_conf_threshold = float(np.quantile(finite_target_conf, 0.35)) if finite_target_conf.size else math.inf
+    target_valid = (
+        np.isfinite(target_depth)
+        & (target_depth > 1e-8)
+        & np.isfinite(target_conf)
+        & (target_conf >= target_conf_threshold)
+    )
+    relative_depth_error = np.full_like(z_visible, np.inf, dtype=np.float64)
+    relative_depth_error[target_valid] = (
+        np.abs(z_visible[target_valid] - target_depth[target_valid])
+        / np.maximum(np.maximum(np.abs(z_visible[target_valid]), np.abs(target_depth[target_valid])), 1e-6)
+    )
+    consistent = target_valid & (relative_depth_error <= 0.15)
+
+    reprojection_error = 1.0
+    if np.any(consistent):
+        target_points = target.world_points[y_visible[consistent], x_visible[consistent]]
+        source_camera = target_points @ source.extrinsic[:3, :3].T + source.extrinsic[:3, 3]
+        source_projected = source_camera @ source.intrinsic.T
+        source_projected = source_projected[:, :2] / np.maximum(source_projected[:, 2:3], 1e-8)
+        source_reference = source_pixels[visible][consistent]
+        diagonal = math.hypot(source_width, source_height)
+        cycle_error = np.linalg.norm(source_projected - source_reference, axis=1) / max(diagonal, 1.0)
+        reprojection_error = float(np.median(cycle_error)) if len(cycle_error) else 1.0
+
+    frustum_fraction = float(np.mean(visible))
+    visible_fraction = float(np.count_nonzero(consistent) / len(indices))
+    depth_consistency = float(np.mean(consistent[target_valid])) if np.any(target_valid) else 0.0
     return {
-        "visible_fraction": float(np.mean(visible)),
-        "depth_consistency": float(np.mean(consistent)),
-        "reprojection_error": float(np.median(reprojection)) if len(reprojection) else 1.0,
+        "visible_fraction": visible_fraction,
+        "frustum_fraction": frustum_fraction,
+        "depth_consistency": depth_consistency,
+        "reprojection_error": reprojection_error,
     }
 
 
@@ -664,6 +717,7 @@ def run_vggt_scene_pipeline(
             arrays[int(photo_id)] = data
             depth_confidence = float(np.mean(_confidence_unit(data.depth_conf)))
             point_confidence = float(np.mean(_confidence_unit(data.point_conf)))
+            cinematic_depth = _depth_metrics(data.depth)
             depth_uri = _artifact_uri(s3_client, f"jobs/{job_id}/geometry/photo_{photo_id}_depth.npz", data.depth)
             point_uri = _artifact_uri(s3_client, f"jobs/{job_id}/geometry/photo_{photo_id}_pointmap.npz", data.world_points)
             geometries.append(PhotoGeometryResult(
@@ -679,7 +733,12 @@ def run_vggt_scene_pipeline(
                 view_direction=_view_direction(data.extrinsic).tolist(),
                 depth_artifact_uri=depth_uri,
                 point_map_artifact_uri=point_uri,
-                local_metrics={"depth_mean": float(np.mean(data.depth)), "depth_std": float(np.std(data.depth)), "runtime": predictions["runtime"]},
+                local_metrics={
+                    "depth_mean": float(np.mean(data.depth)),
+                    "depth_std": float(np.std(data.depth)),
+                    **cinematic_depth,
+                    "runtime": predictions["runtime"],
+                },
             ))
         labels = {int(photo_id): str(room_labels[index] if index < len(room_labels) else "") for index, photo_id in enumerate(photo_ids)}
         position_map = {int(photo_id): int(positions[index] if index < len(positions) else index) for index, photo_id in enumerate(photo_ids)}

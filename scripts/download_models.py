@@ -29,31 +29,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def download_huggingface_models(cache_dir: Path) -> None:
-    """Download HuggingFace models (MiDaS/DPT)."""
-    from transformers import DPTForDepthEstimation, DPTImageProcessor
-
-    hf_cache = cache_dir / "huggingface"
-    hf_cache.mkdir(parents=True, exist_ok=True)
-
-    # Set environment variables
-    os.environ["HF_HOME"] = str(hf_cache)
-    os.environ["TRANSFORMERS_CACHE"] = str(hf_cache)
-
-    model_id = "Intel/dpt-large"
-    logger.info(f"Downloading {model_id}...")
-
-    # Download processor
-    DPTImageProcessor.from_pretrained(model_id, cache_dir=str(hf_cache))
-    logger.info(f"  - Processor downloaded")
-
-    # Download model
-    DPTForDepthEstimation.from_pretrained(model_id, cache_dir=str(hf_cache))
-    logger.info(f"  - Model downloaded")
-
-    logger.info(f"HuggingFace models cached in {hf_cache}")
-
-
 def download_openclip_models(cache_dir: Path) -> None:
     """Download OpenCLIP models for embeddings."""
     import open_clip
@@ -73,6 +48,7 @@ def download_openclip_models(cache_dir: Path) -> None:
     model, _, preprocess = open_clip.create_model_and_transforms(
         model_name,
         pretrained=pretrained,
+        cache_dir=str(openclip_cache),
     )
 
     logger.info(f"OpenCLIP model downloaded")
@@ -102,27 +78,15 @@ def download_ltx2_models(cache_dir: Path) -> None:
 
 def verify_models(cache_dir: Path) -> bool:
     """Verify all models are properly cached."""
-    hf_cache = cache_dir / "huggingface"
-
-    # Check HuggingFace cache
-    if not hf_cache.exists():
-        logger.error("HuggingFace cache directory not found")
+    openclip_cache = cache_dir / "openclip"
+    if not openclip_cache.exists():
+        logger.error("OpenCLIP cache directory not found")
         return False
-
-    # List cached files
-    cached_files = list(hf_cache.rglob("*"))
-    model_files = [f for f in cached_files if f.is_file() and f.suffix in [".bin", ".safetensors", ".json"]]
-
-    logger.info(f"Found {len(model_files)} model files in cache")
-
-    # Check for key model files
-    has_model = any("model" in f.name.lower() for f in model_files)
-    has_config = any("config" in f.name.lower() for f in model_files)
-
-    if not has_model or not has_config:
-        logger.error("Missing required model files")
+    model_files = [path for path in openclip_cache.rglob("*") if path.is_file()]
+    if not model_files:
+        logger.error("OpenCLIP model cache is empty")
         return False
-
+    logger.info("Found %s OpenCLIP cache files", len(model_files))
     logger.info("Model verification passed")
     return True
 
@@ -165,12 +129,6 @@ def main():
     logger.info("=" * 50)
     logger.info("Downloading all ML models...")
     logger.info("=" * 50)
-
-    try:
-        download_huggingface_models(cache_dir)
-    except Exception as e:
-        logger.error(f"Failed to download HuggingFace models: {e}")
-        sys.exit(1)
 
     if not args.skip_openclip:
         try:

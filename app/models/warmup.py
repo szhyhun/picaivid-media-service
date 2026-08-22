@@ -29,14 +29,6 @@ def warmup_core_models(
         except Exception:
             logger.exception("Model warmup failed: openclip context=%s", context)
 
-        try:
-            from app.models.midas import midas_model
-
-            midas_model._ensure_loaded()  # internal singleton warmup
-            logger.info("Model warmup loaded: midas context=%s", context)
-        except Exception:
-            logger.exception("Model warmup failed: midas context=%s", context)
-
     if include_vggt:
         try:
             from app.models.vggt import vggt_model

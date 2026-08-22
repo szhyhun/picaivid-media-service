@@ -10,7 +10,6 @@ from PIL import Image
 
 from app.db.models import Job, JobPhoto, RoomCluster, PhotoRelation
 from app.models.openclip import openclip_model
-from app.models.midas import midas_model
 from app.services.storage.s3_client import s3_client
 from app.services.rails.photo_reader import rails_photo_reader, RailsPhoto
 from app.pipeline.phase1_analyze.clustering import cluster_photos_by_room
@@ -29,8 +28,8 @@ class Phase1Analyzer:
     2. Creates JobPhoto records in Python DB
     3. Computes embeddings with OpenCLIP
     4. Classifies room types
-    5. Analyzes depth with MiDaS
-    6. Computes quality scores
+    5. Computes quality scores
+    6. Reconstructs cameras, depth, and scene geometry with VGGT
     7. Clusters photos by room
     8. Plans motion strategy per cluster
     """
@@ -95,16 +94,11 @@ class Phase1Analyzer:
             self._classify_rooms(job_photos, image_cache)
             self.db.commit()
 
-            # Step 5: Analyze depth
-            self._analyze_depth(job_photos, image_cache)
-            self.db.commit()
-
-            # Step 5b: Correct common exterior label confusions using
-            # sequence context + depth hints (front/back/aerial).
+            # Step 5: Correct common exterior label confusions using sequence context.
             self._postprocess_exterior_room_labels(job_photos)
             self.db.commit()
 
-            # Step 5c: Correct common interior label confusions using
+            # Step 5b: Correct common interior label confusions using
             # local sequence context (kitchen/living/dining).
             self._postprocess_interior_room_labels(job_photos, image_cache=image_cache)
             self.db.commit()
@@ -112,10 +106,6 @@ class Phase1Analyzer:
             # Step 6: Compute quality scores
             compute_photo_scores(job_photos, image_cache=image_cache)
             self.db.commit()
-
-            # Depth is complete. Free DPT before VGGT and RoMa allocate their
-            # substantially larger reconstruction and matching tensors.
-            midas_model.release()
 
             # Step 7: Cluster photos by room (with visual overlap detection)
             clusters = cluster_photos_by_room(
@@ -185,7 +175,6 @@ class Phase1Analyzer:
                 except Exception:
                     pass
             image_cache.clear()
-            midas_model.release()
             openclip_model.release()
 
     def _create_job_photos(self, job: Job, rails_photos: List[RailsPhoto]) -> List[JobPhoto]:
@@ -319,25 +308,6 @@ class Phase1Analyzer:
                 logger.error(f"FAILED to classify room for photo {photo.id}: {e}", exc_info=True)
                 photo.room_label = "unknown"
 
-    def _analyze_depth(self, photos: List[JobPhoto], image_cache: Dict[int, Image.Image]) -> None:
-        """Analyze depth for each photo."""
-        logger.info("Analyzing depth...")
-
-        for i, photo in enumerate(photos):
-            if photo.depth_variance is not None:
-                continue
-
-            try:
-                image = self._get_cached_image(photo, image_cache)
-                depth_metrics = midas_model.analyze_depth(image)
-                photo.depth_variance = depth_metrics["variance"]
-                photo.depth_layers = depth_metrics["depth_layers"]
-                logger.info(f"Depth analyzed for photo {i+1}/{len(photos)}: var={photo.depth_variance:.3f}, layers={photo.depth_layers}")
-            except Exception as e:
-                logger.error(f"FAILED to analyze depth for photo {photo.id}: {e}", exc_info=True)
-                photo.depth_variance = 0.0
-                photo.depth_layers = 1
-
     def _postprocess_exterior_room_labels(self, photos: List[JobPhoto]) -> None:
         """Correct common exterior room label confusions.
 
@@ -373,19 +343,17 @@ class Phase1Analyzer:
             next_has_aerial = any(_is_aerial_label(_normalize_room_label(p.room_label)) for p in next_close)
             near_back_context = any(_is_back_context_label(_normalize_room_label(p.room_label)) for p in window if p.id != photo.id)
 
-            dv = float(photo.depth_variance or 0.0)
             rp = rel_pos(idx)
 
             # 1) Early front-yard frame bracketed by aerial context -> aerial.
-            if rp <= 0.20 and dv >= 0.06 and prev_has_aerial and next_has_aerial:
+            if rp <= 0.20 and prev_has_aerial and next_has_aerial:
                 photo.room_label = "aerial view"
                 changed += 1
                 logger.info(
-                    "Photo %s room relabel: %s -> aerial view (early bracketed aerial context, pos=%.2f, depth_var=%.3f)",
+                    "Photo %s room relabel: %s -> aerial view (early bracketed aerial context, pos=%.2f)",
                     photo.id,
                     current,
                     rp,
-                    dv,
                 )
                 continue
 

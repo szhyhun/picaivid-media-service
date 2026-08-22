@@ -48,8 +48,6 @@ importlib_metadata==8.7.1
 jmespath==1.1.0
 joblib==1.5.3
 kiwisolver==1.4.9
-kornia==0.8.2
-kornia_rs==0.1.10
 loguru==0.7.3
 markdown-it-py==4.0.0
 matplotlib==3.10.8
@@ -78,7 +76,6 @@ python-slugify==8.0.4
 regex==2026.1.15
 requests==2.32.5
 rich==14.3.2
-romatch==0.1.2
 s3transfer==0.16.0
 safetensors==0.7.0
 scikit-learn==1.8.0

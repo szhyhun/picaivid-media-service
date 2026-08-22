@@ -15,6 +15,7 @@ from app.pipeline.phase1_analyze.vggt_pipeline import (
     _PhotoArrays,
     _estimate_similarity,
     _compute_pair_relations,
+    _depth_metrics,
     _order_component,
     _project_metrics,
 )
@@ -68,6 +69,13 @@ class VGGTPhase1Tests(unittest.TestCase):
         self.assertGreater(metrics["visible_fraction"], 0.9)
         self.assertGreater(metrics["depth_consistency"], 0.9)
         self.assertLess(metrics["reprojection_error"], 1e-6)
+
+    def test_depth_metrics_are_scale_invariant(self) -> None:
+        depth = np.linspace(1.0, 8.0, 64, dtype=np.float64).reshape(8, 8)
+        first = _depth_metrics(depth)
+        second = _depth_metrics(depth * 25.0)
+        self.assertAlmostEqual(first["depth_variance"], second["depth_variance"])
+        self.assertEqual(first["depth_layers"], second["depth_layers"])
 
     def test_beam_search_is_deterministic_and_uses_verified_edges(self) -> None:
         relations = [_relation(1, 2), _relation(2, 3), _relation(3, 4)]

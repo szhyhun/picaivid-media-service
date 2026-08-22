@@ -31,7 +31,7 @@ RUN pip3 install --no-cache-dir \
 # Copy download script
 COPY scripts/download_models.py scripts/
 
-# Download Phase 1 models (MiDaS, OpenCLIP)
+# Download the Phase 1 semantic model (VGGT is supplied separately)
 RUN python3 scripts/download_models.py --cache-dir /models
 
 # Download LTX-2 model (~15GB)

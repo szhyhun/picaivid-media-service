@@ -92,33 +92,6 @@ def test_openclip(image):
         return False
 
 
-def test_midas(image):
-    """Test MiDaS depth model."""
-    print("\n=== Testing MiDaS Model ===")
-    from app.models.midas import midas_model
-
-    try:
-        print("Analyzing depth...")
-        depth_metrics = midas_model.analyze_depth(image)
-
-        print(f"Depth variance: {depth_metrics['variance']:.4f}")
-        print(f"Depth std: {depth_metrics['std']:.4f}")
-        print(f"Depth layers: {depth_metrics['depth_layers']}")
-        print(f"Depth range: {depth_metrics['depth_range']:.2f}")
-        print(f"Min depth: {depth_metrics['min_depth']:.2f}")
-        print(f"Max depth: {depth_metrics['max_depth']:.2f}")
-
-        tier = midas_model.get_confidence_tier(depth_metrics)
-        print(f"Confidence tier: {tier}")
-
-        return True
-    except Exception as e:
-        print(f"Error with MiDaS: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
 def test_rails_photo_reader():
     """Test reading photos from Rails DB."""
     print("\n=== Testing Rails Photo Reader ===")
@@ -163,7 +136,6 @@ def main():
         if image:
             # Test models
             test_openclip(image)
-            test_midas(image)
 
     # Test Rails photo reader
     test_rails_photo_reader()
