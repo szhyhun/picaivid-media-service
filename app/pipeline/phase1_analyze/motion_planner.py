@@ -174,6 +174,12 @@ def plan_motion_for_cluster(
     if inferred_motion:
         recommended = inferred_motion
 
+    requested_motion, requested_motion_reason = _requested_motion(ordered_photos, cluster, allowed_motions)
+    if requested_motion is not None:
+        recommended = requested_motion
+    if requested_motion_reason:
+        motion_guidance = "\n\n".join(part for part in (motion_guidance, requested_motion_reason) if part)
+
     # Duration policy:
     # - Single-photo clusters: 1-2s
     # - Multi-photo clusters: up to 4s
@@ -218,6 +224,8 @@ def plan_motion_for_cluster(
             "matching_inferred_motion": inferred_motion,
             "matching_motion_guidance": motion_guidance,
             "matching_summary": matching_summary,
+            "requested_motion": _configured_motion(ordered_photos),
+            "motion_fallback_reason": requested_motion_reason,
         },
     )
 
@@ -413,6 +421,48 @@ def _ordered_cluster_photos(
     return sorted(source, key=lambda p: (p.cluster_order if p.cluster_order is not None else 10**9, p.id))
 
 
+def _configured_motion(photos: List["JobPhoto"]) -> str | None:
+    requested = [str((photo.manual_metadata or {}).get("camera_motion", "auto")) for photo in photos]
+    requested = [motion for motion in requested if motion and motion != "auto"]
+    if not requested or len(set(requested)) != 1:
+        return None
+    return requested[0]
+
+
+def _requested_motion(
+    photos: List["JobPhoto"],
+    cluster: RoomCluster,
+    allowed_motions: List[str],
+) -> Tuple[str | None, str | None]:
+    """Honor one clear user override only when verified geometry permits it."""
+    requested = _configured_motion(photos)
+    if requested is None:
+        return None, None
+    mapping = {
+        "push_in": "push_in",
+        "push_out": "push_out",
+        "orbit_right": "orbit",
+        "orbit_left": "orbit",
+        "orbit": "orbit",
+        "multi_view": "multi_view",
+    }
+    requested = mapping.get(requested, requested)
+    requires_multi_view = requested in {"orbit", "multi_view"}
+    verified_multi_view = bool(cluster.sfm_eligible and int(cluster.image_count or 0) >= 2)
+    if requires_multi_view and not verified_multi_view:
+        fallback = next((motion for motion in ("micro_push_in", "subtle_pan", "static") if motion in allowed_motions), allowed_motions[0])
+        return fallback, (
+            "Requested multi-view motion was not used because this group lacks verified "
+            "interpolation-safe geometry; render a single-image move instead."
+        )
+    if requested in allowed_motions:
+        return requested, "User-selected camera motion is supported by verified scene evidence."
+    fallback = next((motion for motion in ("micro_push_in", "push_in", "subtle_pan", "static") if motion in allowed_motions), allowed_motions[0])
+    return fallback, (
+        f"Requested {requested} is unsafe for this confidence tier; using {fallback} to preserve geometry."
+    )
+
+
 def _motion_from_direction(
     dx: float,
     dy: float,
@@ -454,7 +504,7 @@ def _infer_motion_from_matching(
         "avg_verified_inliers": 0.0,
         "avg_dx": 0.0,
         "avg_dy": 0.0,
-        "dominant_camera_direction": "unknown",
+        "dominant_image_motion": "unknown",
     }
 
     if len(ordered_photos) < 2:
@@ -480,6 +530,8 @@ def _infer_motion_from_matching(
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a
                   AND photo_b_id = :photo_b
+                  AND continuity_type = 'interpolation_safe'
+                  AND is_connected = true
                 LIMIT 1
                 """
             ),
@@ -534,7 +586,7 @@ def _infer_motion_from_matching(
         camera_dir = "left" if avg_dx > 0 else "right"
     else:
         camera_dir = "up" if avg_dy > 0 else "down"
-    summary["dominant_camera_direction"] = camera_dir
+    summary["dominant_image_motion"] = camera_dir
 
     if inferred is None:
         guidance = (
@@ -543,12 +595,12 @@ def _infer_motion_from_matching(
         )
         return None, guidance, summary
 
-        guidance = (
-            "Match-guided camera direction: move camera "
-            f"{camera_dir} following verified geometric transitions "
-            f"({summary['verified_transitions']}/{summary['total_transitions']} verified, "
-            f"avg support {summary['avg_verified_inliers']:.1f}); keep motion smooth and consistent."
-        )
+    guidance = (
+        "Match-guided image-space motion: follow the verified subject movement "
+        f"{camera_dir} across transitions "
+        f"({summary['verified_transitions']}/{summary['total_transitions']} verified, "
+        f"avg support {summary['avg_verified_inliers']:.1f}); keep movement smooth and consistent."
+    )
     return inferred, guidance, summary
 
 
@@ -575,7 +627,9 @@ def _select_hero_photo(cluster: RoomCluster, photos: Optional[List["JobPhoto"]] 
         metadata = photo.manual_metadata or {}
         priority = 0
 
-        if metadata.get("hero_room"):
+        if metadata.get("editorial_role") == "hero":
+            priority = 1_000
+        elif metadata.get("hero_room"):
             priority = 100
         elif metadata.get("preferred_opening"):
             priority = 50

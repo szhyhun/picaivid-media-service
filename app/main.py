@@ -36,6 +36,7 @@ from app.schemas.clip import (
     PhotoRelationDebugResponse,
     SceneComponentSummary,
     SceneDebugResponse,
+    ShotPlanResponse,
     SourcePhotoInfo,
 )
 from app.schemas.job import JobMessage, JobStatusResponse
@@ -55,7 +56,9 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup_warm_models() -> None:
-    warmup_core_models(context="api", include_vggt=True, include_legacy=False)
+    # Inference belongs to the worker. Keeping the API lightweight avoids loading
+    # a second multi-gigabyte model beside the local MPS worker.
+    warmup_core_models(context="api", include_vggt=False, include_legacy=False)
 
 
 app.add_middleware(
@@ -159,6 +162,30 @@ def _serialize_relation_debug(
         relative_transform=relation.relative_transform,
         debug_metrics=relation.debug_metrics or {},
     )
+
+
+def _shot_plan_response(project_id: str, job: Job | None, db: Session) -> ShotPlanResponse:
+    if job is None:
+        return ShotPlanResponse(project_id=project_id, job_id=None)
+    analyses = (
+        db.query(AnalysisResult)
+        .filter(AnalysisResult.job_id == job.id)
+        .order_by(AnalysisResult.room_cluster_id.asc().nulls_last())
+        .all()
+    )
+    for analysis in analyses:
+        plan = (analysis.debug_metrics or {}).get("shot_plan") if isinstance(analysis.debug_metrics, dict) else None
+        if isinstance(plan, dict):
+            return ShotPlanResponse(
+                project_id=project_id,
+                job_id=int(job.id),
+                planner_version=str(plan.get("planner_version", "v2.0")),
+                runtime_provenance=plan.get("runtime_provenance") or {},
+                target_length_seconds=_safe_float(plan.get("target_length_seconds")),
+                target_group_budget=plan.get("target_group_budget"),
+                ordered_shots=plan.get("ordered_shots") or [],
+            )
+    return ShotPlanResponse(project_id=project_id, job_id=int(job.id))
 
 
 def _camera_direction_recommendation(dx: float | None, dy: float | None, confidence: float | None) -> str:
@@ -393,7 +420,7 @@ async def get_project_clips(project_id: str, db: Session = Depends(get_db)):
 async def get_project_scenes_debug(project_id: str, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.project_id == project_id).order_by(Job.created_at.desc()).first()
     if not job:
-        return SceneDebugResponse(project_id=project_id, job_id=None, components=[], photo_geometries=[], motion_decisions=[])
+        return SceneDebugResponse(project_id=project_id, job_id=None, components=[], photo_geometries=[], motion_decisions=[], shot_plan=None)
 
     photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).all()
     photo_map = {int(photo.id): photo for photo in photos}
@@ -474,7 +501,16 @@ async def get_project_scenes_debug(project_id: str, db: Session = Depends(get_db
         components=component_summaries,
         photo_geometries=photo_geometries,
         motion_decisions=motion_decisions,
+        shot_plan=_shot_plan_response(project_id, job, db),
     )
+
+
+@app.get("/api/projects/{project_id}/shot_plan", response_model=ShotPlanResponse)
+async def get_project_shot_plan(project_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.project_id == project_id).order_by(Job.created_at.desc()).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="No job found for project")
+    return _shot_plan_response(project_id, job, db)
 
 
 @app.post("/api/projects/{project_id}/relations/debug", response_model=PhotoRelationDebugResponse)

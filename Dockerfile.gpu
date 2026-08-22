@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y \
 
 # Install dependencies for model download
 RUN pip3 install --no-cache-dir \
-    torch>=2.1.0 \
+    torch==2.13.0 \
+    torchvision==0.28.0 \
     transformers>=4.36.0 \
     diffusers>=0.32.0 \
     accelerate>=0.30.0 \

@@ -1,4 +1,5 @@
 """OpenCLIP model for image embeddings and lightweight region classification."""
+import gc
 import logging
 from typing import Dict, List, Optional, Sequence
 
@@ -239,6 +240,21 @@ class OpenCLIPModel:
             label: float(similarities[idx].item())
             for idx, label in enumerate(unique_labels)
         }
+
+    def release(self) -> None:
+        """Release accelerator-resident weights after the CLIP pipeline stage."""
+        self._model = None
+        self._preprocess = None
+        self._tokenizer = None
+        self._device = None
+        self._text_features = None
+        self._prompt_feature_cache.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
 
 # Singleton instance

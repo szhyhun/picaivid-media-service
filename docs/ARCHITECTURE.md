@@ -18,8 +18,9 @@
    - `scene_component_memberships`
    - `photo_scene_geometry`
    - `photo_relations`
-4. Render clusters and motion decisions are derived from scene geometry.
-5. Phase 2 generates clips from ordered cluster inputs.
+4. Measured overlaps, RoMa verification, scoped tracks, and deterministic ordering form a renderer-neutral `ShotPlan`.
+5. Render clusters and motion decisions are derived from the verified plan.
+6. Phase 2 generates clips from ordered shot-plan inputs.
 
 For any future dense-capture or splat-backed workflow, VGGT should still be treated as the story and scene-logic layer, with 3D reconstruction acting as an execution enhancement rather than a replacement for the core planner.
 
@@ -43,3 +44,4 @@ For any future dense-capture or splat-backed workflow, VGGT should still be trea
 
 - `scenes/debug` explains component-level decisions
 - `relations/debug` explains two-photo continuity using derived VGGT relations
+- `shot_plan` exposes the ordered cinematic plan, runtime provenance, and per-shot evidence

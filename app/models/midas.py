@@ -8,6 +8,7 @@ For production:
 - Set HF_HUB_OFFLINE=1 to use only cached models
 - See scripts/download_models.py for pre-download during build
 """
+import gc
 import logging
 import os
 import time
@@ -244,6 +245,19 @@ class MiDaSModel:
 
         # Low confidence: flat scene
         return "low"
+
+    def release(self) -> None:
+        """Release depth-model weights after depth metrics have been persisted."""
+        MiDaSModel._model = None
+        MiDaSModel._processor = None
+        MiDaSModel._device = None
+        MiDaSModel._loaded = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
 
 # Singleton instance

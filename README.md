@@ -43,16 +43,17 @@ pip install -r requirements.lock.txt
 
 ## Runtime Notes
 
-- GPU phase 1 requires CUDA.
+- Phase 1 selects CUDA, then Apple Silicon MPS, then CPU. CUDA is used for the on-demand worker; MPS is supported for local review.
 - Dense geometry artifacts belong in S3, not Postgres.
-- Local development may use the synthetic VGGT fallback when the repo/checkpoint are not present.
-- Production and AWS should use the hydrated VGGT commercial checkpoint only.
+- Synthetic geometry is disabled. Every analysis requires the pinned VGGT-1B-Commercial repository and checkpoint.
+- Production and AWS use the hydrated commercial checkpoint only.
 
 ## Main Endpoints
 
 - `GET /health`
 - `GET /api/projects/{project_id}/clips`
 - `GET /api/projects/{project_id}/scenes/debug`
+- `GET /api/projects/{project_id}/shot_plan`
 - `POST /api/projects/{project_id}/relations/debug`
 - `POST /internal/jobs`
 
@@ -61,6 +62,7 @@ pip install -r requirements.lock.txt
 - [docs/ARCHITECTURE.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/ARCHITECTURE.md)
 - [docs/CLUSTERING.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/CLUSTERING.md)
 - [docs/DEVELOPMENT.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/DEVELOPMENT.md)
+- [docs/GOLDEN_REVIEW.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/GOLDEN_REVIEW.md)
 - [docs/AWS_SETUP.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/AWS_SETUP.md)
 - [docs/AWS_DEPLOYMENT.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/AWS_DEPLOYMENT.md)
 

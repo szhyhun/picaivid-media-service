@@ -9,11 +9,12 @@ Phase 1 no longer chooses clips from pair-matcher scores. It reconstructs geomet
 1. load project photos
 2. run VGGT on the project set or overlapping windows
 3. persist per-photo geometry
-4. derive photo relations from pose, depth, overlap, and track support
-5. split the project graph into scene components
-6. order photos inside each component
-7. derive render clusters
-8. choose motion from geometry confidence
+4. measure bidirectional depth overlap, depth consistency, normalized reprojection, and relative pose for candidate pairs
+5. verify the strongest candidates with RoMa/RANSAC and run VGGT tracks only inside candidate components
+6. split scene components only on `interpolation_safe` edges
+7. order photos with deterministic beam search over verified edges
+8. derive one-to-four-photo render groups and a renderer-neutral ShotPlan
+9. choose motion from geometry confidence
 
 ## Scene components
 
@@ -46,6 +47,21 @@ Two-photo inspection now answers:
 - how strong is track support?
 - is this a bridge edge?
 - what is the relative transform?
+
+Relation classes are intentionally strict:
+
+- `duplicate`: very high overlap and near-zero baseline
+- `interpolation_safe`: geometric overlap, RoMa/RANSAC inliers, reprojection, and rotation all pass
+- `doorway_bridge`: editorial continuity only; never used as an interpolation request
+- `cut_only` / `unrelated`: safe editorial cut or no use
+
+## Shot plan
+
+`GET /api/projects/:id/shot_plan` returns the ordered renderer-neutral plan. It records the
+VGGT checkpoint hash, repository commit, device, precision, inference strategy, story role,
+keyframe IDs, transition choice, motion intent, confidence, and any reason a multi-view move
+was rejected. `opening`, `hero`, `closing`, and `exclude` are persisted with the source photo
+metadata before analysis; explicit roles override automatic ranking.
 
 ## Motion guidance
 

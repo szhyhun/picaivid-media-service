@@ -12,9 +12,11 @@ from alembic import context
 # Alembic uses Base.metadata to detect table definitions
 from app.db.base import Base
 from app.db.models import Job, JobPhoto, RoomCluster, AnalysisResult, Clip, Timeline, TimelineClip
+from app.core.config import settings
 
 # Alembic Config object - reads from alembic.ini
 config = context.config
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 # Setup Python logging from the config file
 if config.config_file_name is not None:

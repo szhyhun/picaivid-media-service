@@ -16,6 +16,7 @@ from app.services.rails.photo_reader import rails_photo_reader, RailsPhoto
 from app.pipeline.phase1_analyze.clustering import cluster_photos_by_room
 from app.pipeline.phase1_analyze.scoring import compute_photo_scores
 from app.pipeline.phase1_analyze.motion_planner import plan_motion_for_cluster
+from app.pipeline.phase1_analyze.shot_planner import build_and_persist_shot_plan
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class Phase1Analyzer:
         self._image_cache_hits = 0
         self._image_cache_misses = 0
         self._image_download_seconds = 0.0
+        image_cache: Dict[int, Image.Image] = {}
 
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
@@ -80,8 +82,6 @@ class Phase1Analyzer:
             # Step 2: Create JobPhoto records in Python DB
             job_photos = self._create_job_photos(job, rails_photos)
             self.db.commit()
-            image_cache: Dict[int, Image.Image] = {}
-
             # Prefetch all images in parallel before the sequential pipeline steps.
             # This turns every subsequent _get_cached_image() call into a cache hit,
             # cutting total S3 download time by ~5-10x compared to sequential fetches.
@@ -113,6 +113,10 @@ class Phase1Analyzer:
             compute_photo_scores(job_photos, image_cache=image_cache)
             self.db.commit()
 
+            # Depth is complete. Free DPT before VGGT and RoMa allocate their
+            # substantially larger reconstruction and matching tensors.
+            midas_model.release()
+
             # Step 7: Cluster photos by room (with visual overlap detection)
             clusters = cluster_photos_by_room(
                 self.db,
@@ -126,6 +130,7 @@ class Phase1Analyzer:
             # (e.g., living vs dining confusion in adjacent shots).
             self._postprocess_interior_room_labels(job_photos, job_id=job.id, image_cache=image_cache)
             self.db.commit()
+            openclip_model.release()
 
             # Step 8: Plan motion for each cluster
             photos_by_cluster: Dict[int, List[JobPhoto]] = {}
@@ -139,6 +144,10 @@ class Phase1Analyzer:
                     cluster,
                     preloaded_photos=photos_by_cluster.get(int(cluster.id), []),
                 )
+
+            # Store an editorial plan independently of the later video renderer.
+            build_and_persist_shot_plan(self.db, job, clusters)
+            self.db.commit()
 
             # Update job status
             job.status = "analysis_complete"
@@ -167,6 +176,17 @@ class Phase1Analyzer:
                 failed_job.error_message = str(e)[:1000]
                 self.db.commit()
             raise
+        finally:
+            # PIL keeps decoded pixel buffers outside Python's small-object heap.
+            # Close them explicitly so repeated jobs do not retain a listing.
+            for image in image_cache.values():
+                try:
+                    image.close()
+                except Exception:
+                    pass
+            image_cache.clear()
+            midas_model.release()
+            openclip_model.release()
 
     def _create_job_photos(self, job: Job, rails_photos: List[RailsPhoto]) -> List[JobPhoto]:
         """Create JobPhoto records from Rails photos.

@@ -6,7 +6,8 @@ WORKDIR /app
 # Install dependencies for model download
 RUN pip install --no-cache-dir \
     transformers>=4.36.0 \
-    torch>=2.1.0 \
+    torch==2.13.0 \
+    torchvision==0.28.0 \
     open-clip-torch>=2.24.0 \
     huggingface_hub
 

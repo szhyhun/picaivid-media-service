@@ -20,6 +20,18 @@ CPU_PHASES = [3, 4]   # Timeline, Assembly
 GPU_PHASES = [1, 2]   # VGGT analyze, Render clips
 
 
+def _configured_phases(default_phases: list[int]) -> list[int]:
+    if not settings.WORKER_PHASES:
+        return default_phases
+    try:
+        phases = [int(value.strip()) for value in settings.WORKER_PHASES.split(",") if value.strip()]
+    except ValueError as error:
+        raise RuntimeError("WORKER_PHASES must be a comma-separated list of phase numbers") from error
+    if not phases or any(phase not in {1, 2, 3, 4} for phase in phases):
+        raise RuntimeError("WORKER_PHASES must contain phase numbers from 1 through 4")
+    return phases
+
+
 def process_message(message: dict) -> None:
     """Process a single SQS message."""
     action = message.get("action", "run")
@@ -33,11 +45,11 @@ def process_message(message: dict) -> None:
 
     # Geometry reconstruction phase 1 belongs to GPU workers in all environments.
     if settings.ENVIRONMENT == "development":
-        allowed_phases = GPU_PHASES if settings.WORKER_TYPE == "gpu" else CPU_PHASES
+        allowed_phases = _configured_phases(GPU_PHASES if settings.WORKER_TYPE == "gpu" else CPU_PHASES)
     elif settings.WORKER_TYPE == "gpu":
-        allowed_phases = GPU_PHASES
+        allowed_phases = _configured_phases(GPU_PHASES)
     else:
-        allowed_phases = CPU_PHASES
+        allowed_phases = _configured_phases(CPU_PHASES)
 
     with get_db_context() as db:
         orchestrator = PipelineOrchestrator(db)

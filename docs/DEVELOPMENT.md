@@ -18,6 +18,29 @@ source venv/bin/activate
 python -m app.worker
 ```
 
+## Apple Silicon VGGT validation
+
+VGGT-1B-Commercial is the only reconstruction model. Keep its checkpoint at
+`vggt-commercial/vggt_1B_commercial.pt`; it is ignored and must never be committed. The official
+repository is pinned at `../third_party/vggt` (currently
+`a288dd0f14786c93483e45524328726ab7b1b4ce`).
+
+```bash
+./venv/bin/python - <<'PY'
+import torch
+assert torch.backends.mps.is_available(), 'Install an Apple Silicon PyTorch build first'
+x = torch.ones((2, 2), device='mps')
+assert x.device.type == 'mps' and x.sum().cpu().item() == 4
+print('MPS tensor smoke test passed')
+PY
+./venv/bin/python -m unittest discover -s tests
+```
+
+Run real 4, 12, and approximately 50 photo listings only with owned images. Capture the
+scene-debug and shot-plan JSON for golden review; synthetic geometry is disabled outside unit tests.
+Use [`GOLDEN_REVIEW.md`](GOLDEN_REVIEW.md) and `scripts/run_vggt_phase1_smoke.py` for the exact
+local commands and release gates.
+
 ## Useful checks
 
 ```bash
@@ -31,4 +54,4 @@ git diff --check
 - ordered photo traversal is sensible
 - bridge/outlier roles are reasonable
 - motion decisions match geometry confidence
-- `/api/projects/:id/scenes/debug` and `/api/projects/:id/relations/debug` stay in sync with the React UI
+- `/api/projects/:id/scenes/debug`, `/api/projects/:id/relations/debug`, and `/api/projects/:id/shot_plan` stay in sync with the React UI

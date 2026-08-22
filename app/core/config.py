@@ -31,20 +31,30 @@ class Settings(BaseSettings):
 
     # Worker Type
     WORKER_TYPE: str = "cpu"
+    WORKER_PHASES: str | None = None
 
     # ML Models
     MODEL_CACHE_DIR: str = "./ml_models"
     ANALYSIS_MATCH_ENGINE: str = "vggt_scene_graph"
     VGGT_REPO_DIR: str | None = None
+    VGGT_REPO_COMMIT: str | None = None
     VGGT_REPO_ARCHIVE_S3_URI: str | None = None
     VGGT_MODEL_CHECKPOINT: str | None = None
     VGGT_MODEL_CHECKPOINT_S3_URI: str | None = None
+    VGGT_DEVICE: str = "auto"
+    VGGT_PRECISION: str = "auto"
     VGGT_IMAGE_SIZE: int = 518
-    VGGT_WINDOW_SIZE: int = 30
-    VGGT_WINDOW_OVERLAP: int = 6
+    VGGT_RETRY_WINDOW_SIZE: int = 16
+    VGGT_RETRY_WINDOW_OVERLAP: int = 6
+    VGGT_FINAL_WINDOW_SIZE: int = 10
+    VGGT_FINAL_WINDOW_OVERLAP: int = 4
+    VGGT_TRACK_POINTS_PER_IMAGE: int = 64
+    VGGT_TRACK_GROUP_MAX: int = 8
+    VGGT_MAX_GEOMETRY_POINTS_PER_PAIR: int = 4096
+    VGGT_ROMA_NEIGHBORS_PER_PHOTO: int = 6
+    ALLOW_SYNTHETIC_GEOMETRY: bool = False
     VGGT_RELATION_SCORE_THRESHOLD: float = 0.50
     VGGT_BRIDGE_SCORE_THRESHOLD: float = 0.42
-    VGGT_TRACK_POINTS_PER_IMAGE: int = 256
     VGGT_USE_BUNDLE_ADJUSTMENT_EXPORT: bool = False
     VGGT_INTERIOR_EXTERIOR_PENALTY: float = 0.18
     VGGT_INTERIOR_DRONE_PENALTY: float = 0.24

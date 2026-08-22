@@ -36,7 +36,16 @@ def cluster_photos_by_room(
     preloaded_images: Optional[Dict[int, Image.Image]] = None,
 ) -> List[RoomCluster]:
     del use_overlap_detection  # geometry-first pipeline ignores the old flag
-    active_photos = sorted([photo for photo in photos if not photo.exclude], key=lambda photo: photo.position or 0)
+    active_photos = sorted(
+        [
+            photo
+            for photo in photos
+            if not photo.exclude
+            and not photo.is_duplicate
+            and (photo.manual_metadata or {}).get("editorial_role") != "exclude"
+        ],
+        key=lambda photo: photo.position or 0,
+    )
     logger.info("Clustering %s photos for job %s with VGGT scene graph", len(active_photos), job.id)
     if not active_photos:
         return []
@@ -46,6 +55,8 @@ def cluster_photos_by_room(
     room_labels: list[str] = []
     positions: list[int] = []
     photo_map: dict[int, JobPhoto] = {}
+    quality_scores: dict[int, float] = {}
+    editorial_roles: dict[int, str] = {}
     for photo in active_photos:
         image = preloaded_images.get(photo.id) if preloaded_images is not None else None
         if image is None:
@@ -61,6 +72,8 @@ def cluster_photos_by_room(
         room_labels.append(photo.room_override or photo.room_label or "")
         positions.append(int(photo.position or 0))
         photo_map[int(photo.id)] = photo
+        quality_scores[int(photo.id)] = float(photo.final_score or 0.0)
+        editorial_roles[int(photo.id)] = str((photo.manual_metadata or {}).get("editorial_role", "auto"))
         photo.room_cluster_id = None
         photo.cluster_order = None
 
@@ -71,6 +84,8 @@ def cluster_photos_by_room(
         positions=positions,
         job_id=int(job.id),
         s3_client=s3_client,
+        quality_scores=quality_scores,
+        editorial_roles=editorial_roles,
     )
 
     _replace_scene_state(
@@ -266,16 +281,38 @@ def _materialize_room_clusters(
 
 
 def _derive_render_groups(ordered_photos: list[JobPhoto], scene_type: str) -> list[list[JobPhoto]]:
-    if len(ordered_photos) <= 2:
+    if not ordered_photos:
+        return []
+    if len(ordered_photos) == 1:
         return [ordered_photos]
-    if scene_type in {"exterior", "drone"}:
-        return [ordered_photos]
+
+    primary_label = _majority_room_label(ordered_photos).strip().lower()
+    if scene_type == "drone":
+        max_group_size = 1
+    elif any(token in primary_label for token in ("bath", "powder")):
+        max_group_size = 1
+    elif any(token in primary_label for token in ("bed", "primary suite", "guest")):
+        max_group_size = 2
+    else:
+        # Social rooms, exterior and outdoor scenes can earn up to four verified views.
+        max_group_size = 4
     groups: list[list[JobPhoto]] = []
     current_group: list[JobPhoto] = []
     current_label: str | None = None
     for photo in ordered_photos:
+        editorial_role = str((photo.manual_metadata or {}).get("editorial_role", "auto")).lower()
+        if editorial_role in {"opening", "closing"}:
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+            groups.append([photo])
+            current_label = None
+            continue
         label = (photo.room_override or photo.room_label or "").strip().lower()
-        if current_group and current_label and label and label != current_label and len(current_group) >= 2:
+        if current_group and (
+            (current_label and label and label != current_label)
+            or len(current_group) >= max_group_size
+        ):
             groups.append(current_group)
             current_group = []
         current_group.append(photo)

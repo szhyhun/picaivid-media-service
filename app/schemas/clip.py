@@ -170,12 +170,23 @@ class MotionDecisionDebug(BaseModel):
     decision_metrics: Dict[str, Any] = {}
 
 
+class ShotPlanResponse(BaseModel):
+    project_id: str
+    job_id: Optional[int] = None
+    planner_version: str = "v2.0"
+    runtime_provenance: Dict[str, Any] = {}
+    target_length_seconds: Optional[float] = None
+    target_group_budget: Optional[List[int]] = None
+    ordered_shots: List[Dict[str, Any]] = []
+
+
 class SceneDebugResponse(BaseModel):
     project_id: str
     job_id: Optional[int] = None
     components: List[SceneComponentSummary]
     photo_geometries: List[PhotoGeometryDebug]
     motion_decisions: List[MotionDecisionDebug]
+    shot_plan: Optional[ShotPlanResponse] = None
 
 
 class PhotoRelationDebugRequest(BaseModel):
