@@ -290,22 +290,13 @@ def _derive_render_groups(ordered_photos: list[JobPhoto], scene_type: str) -> li
     if len(ordered_photos) == 1:
         return [ordered_photos]
 
-    explicit_labels = [str(photo.room_override).strip().lower() for photo in ordered_photos if photo.room_override]
-    primary_label = Counter(explicit_labels).most_common(1)[0][0] if explicit_labels else ""
-    if scene_type == "drone":
-        max_group_size = 1
-    elif any(token in primary_label for token in ("bath", "powder")):
-        max_group_size = 1
-    elif any(token in primary_label for token in ("bed", "primary suite", "guest")):
-        max_group_size = 2
-    else:
-        # Social rooms, exterior and outdoor scenes can earn up to four verified views.
-        max_group_size = 4
+    del scene_type
+    max_group_size = 2
     groups: list[list[JobPhoto]] = []
     current_group: list[JobPhoto] = []
     for photo in ordered_photos:
         editorial_role = str((photo.manual_metadata or {}).get("editorial_role", "auto")).lower()
-        if editorial_role in {"opening", "closing"}:
+        if editorial_role in {"opening", "hero", "closing"}:
             if current_group:
                 groups.append(current_group)
                 current_group = []

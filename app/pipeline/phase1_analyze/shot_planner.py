@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models import AnalysisResult, Job, JobPhoto, PhotoRelation, RoomCluster
 
 
-PLANNER_VERSION = "v2.1-omega-geometry"
+PLANNER_VERSION = "v2.2-paired-scene-map"
 
 
 def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluster]) -> dict[str, Any]:
@@ -47,7 +47,7 @@ def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluste
         shot = _build_shot(cluster, cluster_photos, analysis, relations)
         candidates.append((_sort_key(cluster, cluster_photos, shot), cluster, shot))
 
-    candidates.sort(key=lambda candidate: candidate[0])
+    candidates = _order_component_blocks(candidates)
     previous: dict[str, Any] | None = None
     for index, (_, cluster, shot) in enumerate(candidates):
         cluster.sequence_order = index
@@ -55,7 +55,13 @@ def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluste
         shot["transition_type"] = _transition_type(previous, shot, relations)
         if previous is not None:
             shot["transition_from_photo_id"] = previous["ordered_photo_ids"][-1]
+            shot["previous_cluster_id"] = previous["cluster_id"]
         previous = shot
+    ordered_shots = [shot for _, _, shot in candidates]
+    for index, shot in enumerate(ordered_shots):
+        shot["next_cluster_id"] = ordered_shots[index + 1]["cluster_id"] if index + 1 < len(ordered_shots) else None
+        shot.setdefault("previous_cluster_id", None)
+    _mark_redundant_neighbors(ordered_shots, relations)
 
     runtime = _runtime_from_clusters(clusters)
     plan = {
@@ -65,7 +71,8 @@ def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluste
         "runtime_provenance": runtime,
         "target_length_seconds": _target_length(job),
         "target_group_budget": _group_budget(_target_length(job)),
-        "ordered_shots": [shot for _, _, shot in candidates],
+        "sequence_edges": _sequence_edges(ordered_shots, relations),
+        "ordered_shots": ordered_shots,
     }
 
     for _, cluster, shot in candidates:
@@ -114,12 +121,16 @@ def _build_shot(
         "duration_seconds": float(duration or 3.0),
         "transition_type": "opening",
         "confidence": round(confidence, 4),
+        "skip_recommended": False,
+        "skip_reason": None,
+        "duplicate_of_cluster_id": None,
         "evidence": {
             "photo_count": len(photos),
             "geometry_confidence": confidence,
             "cluster_overlap": float(cluster.overlap_score or 0.0),
             "motion_affordance": cluster.recommended_motion,
             "hard_editorial_role": _editorial_role(hero),
+            "hero_quality": float(hero.final_score or 0.0),
             "requested_motion": ((analysis.debug_metrics or {}).get("requested_motion") if analysis is not None and isinstance(analysis.debug_metrics, dict) else None),
             "geometry_connections": connection_evidence,
             "sequence_mode": (
@@ -132,6 +143,99 @@ def _build_shot(
         },
         "rejection_reasons": _rejection_reasons(multi_view, analysis),
     }
+
+
+def _order_component_blocks(
+    candidates: list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]],
+) -> list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]]:
+    blocks: dict[tuple[str, int], list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]]] = defaultdict(list)
+    for candidate in candidates:
+        cluster = candidate[1]
+        component_id = int(cluster.scene_component_id) if cluster.scene_component_id is not None else int(cluster.id)
+        kind = "component" if cluster.scene_component_id is not None else "cluster"
+        blocks[(kind, component_id)].append(candidate)
+    ordered_blocks = sorted(blocks.values(), key=lambda block: min(candidate[0] for candidate in block))
+    return [
+        candidate
+        for block in ordered_blocks
+        for candidate in sorted(block, key=lambda item: (int(item[1].sequence_order or 0), int(item[1].id)))
+    ]
+
+
+def _relation_between_shots(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    relations: dict[tuple[int, int], PhotoRelation],
+) -> PhotoRelation | None:
+    candidates: list[PhotoRelation] = []
+    for left_id in left["ordered_photo_ids"]:
+        for right_id in right["ordered_photo_ids"]:
+            relation = relations.get((min(int(left_id), int(right_id)), max(int(left_id), int(right_id))))
+            if relation is not None:
+                candidates.append(relation)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda relation: (float(relation.overlap_score or 0.0), float(relation.relation_confidence or 0.0)))
+
+
+def _similar_angle_duplicate(relation: PhotoRelation | None) -> bool:
+    if relation is None:
+        return False
+    if relation.continuity_type == "duplicate":
+        return True
+    transform = relation.relative_transform or {}
+    rotation = float(transform.get("rotation_degrees", 180.0))
+    baseline = float(transform.get("normalized_baseline", 1.0))
+    return (
+        float(relation.overlap_score or 0.0) >= 0.72
+        and float(relation.relation_confidence or 0.0) >= 0.65
+        and rotation <= 15.0
+        and baseline <= 0.12
+    )
+
+
+def _mark_redundant_neighbors(
+    shots: list[dict[str, Any]],
+    relations: dict[tuple[int, int], PhotoRelation],
+) -> None:
+    for left, right in zip(shots, shots[1:]):
+        relation = _relation_between_shots(left, right, relations)
+        if not _similar_angle_duplicate(relation):
+            continue
+        protected = {"opening", "hero", "closing"}
+        choices = [shot for shot in (left, right) if shot["evidence"].get("hard_editorial_role") not in protected]
+        if not choices:
+            continue
+        skip = min(
+            choices,
+            key=lambda shot: (float(shot["evidence"].get("hero_quality") or 0.0), -int(shot["order_index"])),
+        )
+        keep = right if skip is left else left
+        if keep.get("skip_recommended"):
+            continue
+        skip["skip_recommended"] = True
+        skip["duplicate_of_cluster_id"] = int(keep["cluster_id"])
+        skip["skip_reason"] = (
+            "Adjacent shot covers the same reconstructed surfaces from a similar camera angle; "
+            "keep it visible for review but omit it from the final render by default."
+        )
+
+
+def _sequence_edges(
+    shots: list[dict[str, Any]],
+    relations: dict[tuple[int, int], PhotoRelation],
+) -> list[dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    for left, right in zip(shots, shots[1:]):
+        relation = _relation_between_shots(left, right, relations)
+        edges.append({
+            "from_cluster_id": int(left["cluster_id"]),
+            "to_cluster_id": int(right["cluster_id"]),
+            "transition_type": str(right["transition_type"]),
+            "continuity_type": str(relation.continuity_type) if relation is not None else None,
+            "relation_confidence": round(float(relation.relation_confidence or 0.0), 4) if relation is not None else None,
+        })
+    return edges
 
 
 def _connection_evidence(

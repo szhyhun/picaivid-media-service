@@ -177,6 +177,7 @@ class ShotPlanResponse(BaseModel):
     runtime_provenance: Dict[str, Any] = {}
     target_length_seconds: Optional[float] = None
     target_group_budget: Optional[List[int]] = None
+    sequence_edges: List[Dict[str, Any]] = []
     ordered_shots: List[Dict[str, Any]] = []
 
 

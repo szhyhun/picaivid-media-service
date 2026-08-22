@@ -13,7 +13,7 @@ Phase 1 no longer chooses clips from pair-matcher scores. It reconstructs geomet
 5. build an adaptive mutual-neighbor graph directly from jointly reconstructed Omega geometry
 6. build scene components from `same_scene` and `interpolation_safe` edges
 7. order photos with deterministic beam search over verified edges
-8. derive one-to-four-photo render groups and a renderer-neutral ShotPlan
+8. partition each ordered component into verified two-photo groups, with a single hero for odd or explicitly featured views
 9. choose motion from geometry confidence
 
 ## Scene components
@@ -72,3 +72,7 @@ metadata before analysis; explicit roles override automatic ranking.
 
 Auto room labels name and story-order a geometry group. They never split a verified Omega scene
 component; only explicit editorial overrides may force a separate group.
+
+The planner keeps each component's groups adjacent and emits explicit cluster-to-cluster links.
+When neighboring groups cover the same surfaces from nearly the same pose, the lower-quality group
+is marked `skip_recommended` but remains in the API and review UI.

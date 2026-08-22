@@ -159,6 +159,23 @@ class VGGTPhase1Tests(unittest.TestCase):
         groups = _derive_render_groups(photos, "interior")
         self.assertEqual(groups, [photos])
 
+    def test_geometry_component_is_partitioned_into_pairs(self) -> None:
+        photos = [
+            SimpleNamespace(room_override=None, room_label="living room", manual_metadata={})
+            for _ in range(5)
+        ]
+        groups = _derive_render_groups(photos, "interior")
+        self.assertEqual([len(group) for group in groups], [2, 2, 1])
+
+    def test_explicit_hero_remains_a_single_photo_group(self) -> None:
+        photos = [
+            SimpleNamespace(room_override=None, room_label="living room", manual_metadata={}),
+            SimpleNamespace(room_override=None, room_label="living room", manual_metadata={"editorial_role": "hero"}),
+            SimpleNamespace(room_override=None, room_label="living room", manual_metadata={}),
+        ]
+        groups = _derive_render_groups(photos, "interior")
+        self.assertEqual([len(group) for group in groups], [1, 1, 1])
+
     def test_explicit_hero_and_single_image_fallback(self) -> None:
         auto = SimpleNamespace(id=1, final_score=0.99, position=0, manual_metadata={})
         hero = SimpleNamespace(id=2, final_score=0.10, position=1, manual_metadata={"editorial_role": "hero"})
@@ -179,6 +196,28 @@ class VGGTPhase1Tests(unittest.TestCase):
         shot = shot_planner._build_shot(cluster, [first, second], None)
         self.assertEqual(shot["shot_type"], "verified_multi_view")
         self.assertEqual(shot["ordered_photo_ids"], [1, 2])
+
+    def test_similar_neighbor_is_marked_skip_but_retained(self) -> None:
+        first = {
+            "cluster_id": 1, "order_index": 0, "ordered_photo_ids": [10],
+            "skip_recommended": False,
+            "evidence": {"hard_editorial_role": "auto", "hero_quality": 0.9},
+        }
+        second = {
+            "cluster_id": 2, "order_index": 1, "ordered_photo_ids": [20],
+            "skip_recommended": False,
+            "evidence": {"hard_editorial_role": "auto", "hero_quality": 0.7},
+        }
+        duplicate = SimpleNamespace(
+            continuity_type="same_scene", overlap_score=0.90, relation_confidence=0.90,
+            relative_transform={"rotation_degrees": 5.0, "normalized_baseline": 0.03},
+        )
+        shots = [first, second]
+        shot_planner._mark_redundant_neighbors(shots, {(10, 20): duplicate})
+        self.assertEqual(len(shots), 2)
+        self.assertFalse(first["skip_recommended"])
+        self.assertTrue(second["skip_recommended"])
+        self.assertEqual(second["duplicate_of_cluster_id"], 1)
 
     def test_transition_only_interpolates_verified_relation(self) -> None:
         previous = {"ordered_photo_ids": [1]}

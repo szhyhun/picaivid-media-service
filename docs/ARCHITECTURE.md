@@ -22,6 +22,10 @@
 5. Render clusters and motion decisions are derived from the verified plan.
 6. Phase 2 generates clips from ordered shot-plan inputs.
 
+Interior and exterior photos stay in the same global Omega inference. This preserves reconstructed
+entry, doorway, and approach continuity. Scene components are separated only after reconstruction;
+an optional component-level refinement pass may be added later without discarding the global frame.
+
 For any future dense-capture or splat-backed workflow, VGGT should still be treated as the story and scene-logic layer, with 3D reconstruction acting as an execution enhancement rather than a replacement for the core planner.
 
 ## Storage model
@@ -46,3 +50,5 @@ For any future dense-capture or splat-backed workflow, VGGT should still be trea
 - `scenes/debug` explains component-level decisions
 - `relations/debug` explains two-photo continuity using derived VGGT relations
 - `shot_plan` exposes the ordered cinematic plan, runtime provenance, and per-shot evidence
+- each storyboard shot contains one hero photo or one verified two-photo pair
+- shots expose previous/next cluster links; redundant adjacent views remain visible with an advisory skip marker

@@ -183,6 +183,7 @@ def _shot_plan_response(project_id: str, job: Job | None, db: Session) -> ShotPl
                 runtime_provenance=plan.get("runtime_provenance") or {},
                 target_length_seconds=_safe_float(plan.get("target_length_seconds")),
                 target_group_budget=plan.get("target_group_budget"),
+                sequence_edges=plan.get("sequence_edges") or [],
                 ordered_shots=plan.get("ordered_shots") or [],
             )
     return ShotPlanResponse(project_id=project_id, job_id=int(job.id))
