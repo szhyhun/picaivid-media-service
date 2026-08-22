@@ -512,8 +512,6 @@ class Phase1Analyzer:
                 self.db.query(PhotoRelation)
                 .filter(PhotoRelation.job_id == job_id)
                 .filter(PhotoRelation.is_connected.is_(True))
-                .filter(PhotoRelation.track_support.isnot(None))
-                .filter(PhotoRelation.track_support >= 0.45)
                 .filter(PhotoRelation.relation_confidence.isnot(None))
                 .filter(PhotoRelation.relation_confidence >= 0.52)
                 .all()

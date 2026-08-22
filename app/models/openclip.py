@@ -165,6 +165,8 @@ class OpenCLIPModel:
 
             # Compute similarity with room types
             similarity = (image_features @ self._text_features.T).squeeze(0)
+            logit_scale = self._model.logit_scale.exp() if hasattr(self._model, "logit_scale") else 1.0
+            similarity = similarity * logit_scale
             probs = similarity.softmax(dim=-1)
 
             # Get top prediction

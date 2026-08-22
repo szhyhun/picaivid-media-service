@@ -97,6 +97,28 @@ def _confidence_unit(values: np.ndarray) -> np.ndarray:
     return np.clip(1.0 - np.exp(-(values - 1.0)), 0.0, 1.0)
 
 
+def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    total = float(np.sum(weights))
+    return float(np.sum(values * weights) / total) if total > 1e-12 else 0.0
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if values.size == 0:
+        return 0.0
+    order = np.argsort(values)
+    ordered_values = values[order]
+    ordered_weights = weights[order]
+    midpoint = 0.5 * float(np.sum(ordered_weights))
+    if midpoint <= 0.0:
+        return float(np.median(ordered_values))
+    index = int(np.searchsorted(np.cumsum(ordered_weights), midpoint, side="left"))
+    return float(ordered_values[min(index, len(ordered_values) - 1)])
+
+
 def _depth_metrics(depth: np.ndarray) -> dict[str, float | int]:
     """Return scale-invariant cinematic depth metrics from VGGT depth."""
     values = np.asarray(depth, dtype=np.float64)
@@ -340,23 +362,29 @@ def _predict_with_retries(filelist: list[str]) -> tuple[dict[str, Any], dict[str
 def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, float]:
     source_points = source.world_points.reshape(-1, 3)
     source_depth = source.depth.reshape(-1)
-    source_conf = np.asarray(source.depth_conf, dtype=np.float64).reshape(-1)
-    finite_conf = source_conf[np.isfinite(source_conf)]
-    confidence_threshold = float(np.quantile(finite_conf, 0.65)) if finite_conf.size else math.inf
+    source_conf = _confidence_unit(np.asarray(source.depth_conf, dtype=np.float64)).reshape(-1)
     valid = (
         np.isfinite(source_points).all(axis=1)
         & np.isfinite(source_depth)
         & (source_depth > 1e-8)
-        & np.isfinite(source_conf)
-        & (source_conf >= confidence_threshold)
     )
     indices = np.flatnonzero(valid)
     maximum = int(settings.VGGT_MAX_GEOMETRY_POINTS_PER_PAIR)
     if len(indices) > maximum:
         indices = indices[np.linspace(0, len(indices) - 1, maximum, dtype=int)]
     if len(indices) == 0:
-        return {"visible_fraction": 0.0, "frustum_fraction": 0.0, "depth_consistency": 0.0, "reprojection_error": 1.0}
+        return {
+            "visible_fraction": 0.0,
+            "frustum_fraction": 0.0,
+            "depth_consistency": 0.0,
+            "reprojection_error": 1.0,
+            "median_image_dx": 0.0,
+            "median_image_dy": 0.0,
+        }
     points = source_points[indices]
+    # Confidence is a soft reliability weight. The reconstructed world points,
+    # not an arbitrary confidence percentile, determine surface overlap.
+    source_weights = 0.10 + 0.90 * np.nan_to_num(source_conf[indices], nan=0.0, posinf=1.0, neginf=0.0)
     source_height, source_width = source.depth.shape[:2]
     source_pixels = np.column_stack((indices % source_width, indices // source_width)).astype(np.float64)
     camera = points @ target.extrinsic[:3, :3].T + target.extrinsic[:3, 3]
@@ -368,18 +396,25 @@ def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, fl
     y = np.rint(pixels[:, 1]).astype(int)
     visible = (depth > 1e-6) & (x >= 0) & (x < width) & (y >= 0) & (y < height)
     if not np.any(visible):
-        return {"visible_fraction": 0.0, "frustum_fraction": 0.0, "depth_consistency": 0.0, "reprojection_error": 1.0}
+        return {
+            "visible_fraction": 0.0,
+            "frustum_fraction": 0.0,
+            "depth_consistency": 0.0,
+            "reprojection_error": 1.0,
+            "median_image_dx": 0.0,
+            "median_image_dy": 0.0,
+        }
     x_visible, y_visible, z_visible = x[visible], y[visible], depth[visible]
     target_depth = np.asarray(target.depth[y_visible, x_visible]).reshape(-1)
-    target_conf = np.asarray(target.depth_conf[y_visible, x_visible]).reshape(-1)
-    finite_target_conf = np.asarray(target.depth_conf, dtype=np.float64)
-    finite_target_conf = finite_target_conf[np.isfinite(finite_target_conf)]
-    target_conf_threshold = float(np.quantile(finite_target_conf, 0.35)) if finite_target_conf.size else math.inf
+    target_conf = _confidence_unit(np.asarray(target.depth_conf[y_visible, x_visible], dtype=np.float64)).reshape(-1)
     target_valid = (
         np.isfinite(target_depth)
         & (target_depth > 1e-8)
-        & np.isfinite(target_conf)
-        & (target_conf >= target_conf_threshold)
+    )
+    visible_source_weights = source_weights[visible]
+    pair_weights = np.minimum(
+        visible_source_weights,
+        0.10 + 0.90 * np.nan_to_num(target_conf, nan=0.0, posinf=1.0, neginf=0.0),
     )
     relative_depth_error = np.full_like(z_visible, np.inf, dtype=np.float64)
     relative_depth_error[target_valid] = (
@@ -389,6 +424,8 @@ def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, fl
     consistent = target_valid & (relative_depth_error <= 0.15)
 
     reprojection_error = 1.0
+    median_image_dx = 0.0
+    median_image_dy = 0.0
     if np.any(consistent):
         target_points = target.world_points[y_visible[consistent], x_visible[consistent]]
         source_camera = target_points @ source.extrinsic[:3, :3].T + source.extrinsic[:3, 3]
@@ -397,16 +434,21 @@ def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, fl
         source_reference = source_pixels[visible][consistent]
         diagonal = math.hypot(source_width, source_height)
         cycle_error = np.linalg.norm(source_projected - source_reference, axis=1) / max(diagonal, 1.0)
-        reprojection_error = float(np.median(cycle_error)) if len(cycle_error) else 1.0
+        reprojection_error = _weighted_median(cycle_error, pair_weights[consistent]) if len(cycle_error) else 1.0
+        image_flow = pixels[visible][consistent] - source_reference
+        median_image_dx = _weighted_median(image_flow[:, 0], pair_weights[consistent])
+        median_image_dy = _weighted_median(image_flow[:, 1], pair_weights[consistent])
 
-    frustum_fraction = float(np.mean(visible))
-    visible_fraction = float(np.count_nonzero(consistent) / len(indices))
-    depth_consistency = float(np.mean(consistent[target_valid])) if np.any(target_valid) else 0.0
+    frustum_fraction = float(np.sum(visible_source_weights) / max(float(np.sum(source_weights)), 1e-12))
+    visible_fraction = float(np.sum(pair_weights[consistent]) / max(float(np.sum(source_weights)), 1e-12))
+    depth_consistency = _weighted_mean(consistent[target_valid], pair_weights[target_valid]) if np.any(target_valid) else 0.0
     return {
         "visible_fraction": visible_fraction,
         "frustum_fraction": frustum_fraction,
         "depth_consistency": depth_consistency,
         "reprojection_error": reprojection_error,
+        "median_image_dx": median_image_dx,
+        "median_image_dy": median_image_dy,
     }
 
 
@@ -432,6 +474,7 @@ def _compute_pair_relations(
             baseline = float(np.linalg.norm(centers[right_id] - centers[left_id]))
             base_metrics[(left_id, right_id)] = {
                 "overlap": 0.5 * (forward["visible_fraction"] + backward["visible_fraction"]),
+                "mutual_overlap": min(forward["visible_fraction"], backward["visible_fraction"]),
                 "depth_consistency": 0.5 * (forward["depth_consistency"] + backward["depth_consistency"]),
                 "reprojection_error": 0.5 * (forward["reprojection_error"] + backward["reprojection_error"]),
                 "baseline": baseline,
@@ -440,47 +483,63 @@ def _compute_pair_relations(
                 "forward": forward,
                 "backward": backward,
             }
+            metrics = base_metrics[(left_id, right_id)]
+            reprojection_quality = math.exp(-metrics["reprojection_error"] / 0.03)
+            metrics["same_scene_score"] = float(np.clip(
+                0.35 * metrics["overlap"]
+                + 0.25 * metrics["mutual_overlap"]
+                + 0.25 * metrics["depth_consistency"]
+                + 0.15 * reprojection_quality,
+                0.0,
+                1.0,
+            ))
     logger.info(
         "VGGT_RELATION_GEOMETRY_COMPLETE photos=%s all_pairs=%s",
         len(photo_ids),
         len(base_metrics),
     )
+    ranked_neighbors: dict[int, list[int]] = {photo_id: [] for photo_id in photo_ids}
+    for photo_id in photo_ids:
+        candidates = []
+        for pair, metrics in base_metrics.items():
+            if photo_id not in pair:
+                continue
+            other_id = pair[1] if pair[0] == photo_id else pair[0]
+            candidates.append((float(metrics["same_scene_score"]), other_id))
+        ranked_neighbors[photo_id] = [other_id for score, other_id in sorted(candidates, reverse=True)[:4] if score >= 0.45]
+
     relations: list[PhotoRelationResult] = []
     for pair, metrics in base_metrics.items():
         left_id, right_id = pair
         left_domain = _scene_type_for_label(room_labels.get(left_id))
         right_domain = _scene_type_for_label(room_labels.get(right_id))
         duplicate = metrics["overlap"] >= 0.85 and metrics["normalized_baseline"] <= 0.03
+        mutual_neighbor = right_id in ranked_neighbors[left_id] and left_id in ranked_neighbors[right_id]
+        same_scene = mutual_neighbor and metrics["same_scene_score"] >= 0.45
         interpolation_safe = (
-            metrics["overlap"] >= 0.35
-            and metrics["depth_consistency"] >= 0.45
-            and metrics["reprojection_error"] <= 0.015
-            and metrics["rotation_degrees"] <= 50.0
+            same_scene
+            and metrics["overlap"] >= 0.28
+            and metrics["reprojection_error"] <= 0.025
+            and metrics["rotation_degrees"] <= 60.0
         )
         doorway_bridge = (
-            metrics["overlap"] >= 0.15
-            and metrics["depth_consistency"] >= 0.25
-            and metrics["reprojection_error"] <= 0.03
+            not same_scene
+            and metrics["same_scene_score"] >= 0.38
+            and metrics["overlap"] >= 0.08
         )
         if duplicate:
             continuity_type = "duplicate"
         elif interpolation_safe:
             continuity_type = "interpolation_safe"
+        elif same_scene:
+            continuity_type = "same_scene"
         elif doorway_bridge:
             continuity_type = "doorway_bridge"
-        elif metrics["overlap"] >= 0.08 or metrics["depth_consistency"] >= 0.15:
+        elif metrics["same_scene_score"] >= 0.25:
             continuity_type = "cut_only"
         else:
             continuity_type = "unrelated"
-        rotation_score = max(0.0, 1.0 - metrics["rotation_degrees"] / 90.0)
-        relation_confidence = float(np.clip(
-            0.40 * metrics["overlap"]
-            + 0.30 * metrics["depth_consistency"]
-            + 0.20 * (1.0 - min(metrics["reprojection_error"] / 0.05, 1.0))
-            + 0.10 * rotation_score,
-            0.0,
-            1.0,
-        ))
+        relation_confidence = float(metrics["same_scene_score"])
         delta = centers[right_id] - centers[left_id]
         relations.append(PhotoRelationResult(
             photo_a_id=left_id,
@@ -491,14 +550,17 @@ def _compute_pair_relations(
             relation_confidence=relation_confidence,
             baseline_distance=float(metrics["baseline"]),
             relative_transform={"translation": [float(value) for value in delta], "normalized_baseline": float(metrics["normalized_baseline"]), "rotation_degrees": float(metrics["rotation_degrees"])},
-            direction_dx=0.0,
-            direction_dy=0.0,
+            direction_dx=float(metrics["forward"]["median_image_dx"]),
+            direction_dy=float(metrics["forward"]["median_image_dy"]),
             continuity_type=continuity_type,
             is_bridge_edge=continuity_type == "doorway_bridge",
-            is_connected=continuity_type == "interpolation_safe",
+            is_connected=continuity_type in {"interpolation_safe", "same_scene"},
             debug_metrics={
                 **metrics,
                 "verification_source": "vggt_joint_geometry",
+                "mutual_neighbor": mutual_neighbor,
+                "left_neighbor_rank": ranked_neighbors[left_id].index(right_id) + 1 if right_id in ranked_neighbors[left_id] else None,
+                "right_neighbor_rank": ranked_neighbors[right_id].index(left_id) + 1 if left_id in ranked_neighbors[right_id] else None,
                 "left_domain": left_domain,
                 "right_domain": right_domain,
             },
@@ -552,6 +614,11 @@ def _query_points_from_confidence(confidence: np.ndarray, count: int) -> torch.T
 
 def _enrich_tracks(components: list[list[int]], relations: list[PhotoRelationResult], file_by_photo: dict[int, str], arrays: dict[int, _PhotoArrays]) -> None:
     relation_by_pair = _relation_lookup(relations)
+    if not getattr(vggt_model, "supports_tracks", False):
+        for relation in relations:
+            relation.debug_metrics["track_status"] = "unavailable_for_vggt_omega"
+        logger.info("VGGT track verification skipped: VGGT-Omega has no public track head")
+        return
     for component in components:
         # A pathological global component must never turn into an all-listing track request.
         group_size = max(2, int(settings.VGGT_TRACK_GROUP_MAX))
@@ -614,7 +681,7 @@ def _edge_score(left_id: int, right_id: int, relations: dict[tuple[int, int], Ph
     upload_proximity = math.exp(-abs(positions.get(left_id, 0) - positions.get(right_id, 0)) / 8.0)
     camera_motion = math.hypot(relation.direction_dx, relation.direction_dy)
     smoothness = math.exp(-max(camera_motion - 160.0, 0.0) / 160.0)
-    return 0.30 * relation.relation_confidence + 0.20 * relation.overlap_score + 0.15 * relation.track_support + 0.15 * reprojection + 0.10 * smoothness + 0.10 * upload_proximity
+    return 0.35 * relation.relation_confidence + 0.25 * relation.overlap_score + 0.20 * reprojection + 0.10 * smoothness + 0.10 * upload_proximity
 
 
 def _order_component(component: list[int], relations: list[PhotoRelationResult], positions: dict[int, int]) -> list[int]:
@@ -648,16 +715,22 @@ def _scene_type(component: list[int], room_labels: dict[int, str]) -> str:
 
 
 def _motion_affordance(component: list[int], relations: list[PhotoRelationResult]) -> str:
-    internal = [relation for relation in relations if relation.photo_a_id in component and relation.photo_b_id in component]
+    internal = [
+        relation
+        for relation in relations
+        if relation.photo_a_id in component
+        and relation.photo_b_id in component
+        and relation.is_connected
+    ]
     if len(component) == 1:
         return "micro_push_in"
     average_confidence = float(np.mean([relation.relation_confidence for relation in internal])) if internal else 0.0
-    average_tracks = float(np.mean([relation.track_support for relation in internal])) if internal else 0.0
-    if average_confidence >= 0.74 and average_tracks >= 0.62:
+    safe_interpolation_fraction = float(np.mean([relation.continuity_type == "interpolation_safe" for relation in internal])) if internal else 0.0
+    if average_confidence >= 0.68 and safe_interpolation_fraction >= 0.50:
         return "multi_view"
-    if average_confidence >= 0.62:
+    if average_confidence >= 0.45:
         return "parallax"
-    return "reveal" if average_confidence >= 0.50 else "micro_push_in"
+    return "reveal" if average_confidence >= 0.35 else "micro_push_in"
 
 
 def _hero_photo(component: list[int], arrays: dict[int, _PhotoArrays], quality_scores: dict[int, float], room_labels: dict[int, str], editorial_roles: dict[int, str]) -> int:
@@ -750,7 +823,13 @@ def run_vggt_scene_pipeline(
         results: list[SceneComponentResult] = []
         for index, component in enumerate(components):
             ordered = _order_component(component, relations, position_map)
-            internal = [relation for relation in relations if relation.photo_a_id in component and relation.photo_b_id in component]
+            internal = [
+                relation
+                for relation in relations
+                if relation.photo_a_id in component
+                and relation.photo_b_id in component
+                and relation.is_connected
+            ]
             component_geometries = [geometry for geometry in geometries if geometry.photo_id in component]
             results.append(SceneComponentResult(
                 component_key=f"component-{index + 1}",

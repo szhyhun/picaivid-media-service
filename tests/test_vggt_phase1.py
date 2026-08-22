@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from app.models import vggt as vggt_runtime
-from app.pipeline.phase1_analyze import shot_planner
+from app.pipeline.phase1_analyze import shot_planner, vggt_pipeline
+from app.pipeline.phase1_analyze.clustering import _derive_render_groups
 from app.pipeline.phase1_analyze.motion_planner import _requested_motion
 from app.pipeline.phase1_analyze.vggt_pipeline import (
     PhotoRelationResult,
@@ -16,6 +18,7 @@ from app.pipeline.phase1_analyze.vggt_pipeline import (
     _estimate_similarity,
     _compute_pair_relations,
     _depth_metrics,
+    _motion_affordance,
     _order_component,
     _project_metrics,
 )
@@ -77,11 +80,25 @@ class VGGTPhase1Tests(unittest.TestCase):
         self.assertAlmostEqual(first["depth_variance"], second["depth_variance"])
         self.assertEqual(first["depth_layers"], second["depth_layers"])
 
+    def test_omega_depth_unprojection_uses_world_to_camera_pose(self) -> None:
+        depth = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+        extrinsic = torch.tensor([[[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 2.0], [0.0, 0.0, 1.0, 3.0]]])
+        intrinsic = torch.eye(3, dtype=torch.float32).unsqueeze(0)
+        points = vggt_runtime._unproject_depth(depth, extrinsic, intrinsic)
+        np.testing.assert_allclose(points.numpy(), np.array([[[[-1.0, -2.0, -2.0]]]]))
+
     def test_beam_search_is_deterministic_and_uses_verified_edges(self) -> None:
         relations = [_relation(1, 2), _relation(2, 3), _relation(3, 4)]
         positions = {1: 0, 2: 1, 3: 2, 4: 3}
         self.assertEqual(_order_component([1, 2, 3, 4], relations, positions), [1, 2, 3, 4])
         self.assertEqual(_order_component([1, 2, 3, 4], relations, positions), [1, 2, 3, 4])
+
+    def test_motion_affordance_ignores_unconnected_internal_pairs(self) -> None:
+        connected = [_relation(1, 2, 0.60), _relation(2, 3, 0.60)]
+        unrelated = _relation(1, 3, 0.0)
+        unrelated.is_connected = False
+        unrelated.continuity_type = "unrelated"
+        self.assertEqual(_motion_affordance([1, 2, 3], connected + [unrelated]), "parallax")
 
     def test_relation_thresholds_use_joint_vggt_geometry_for_interpolation(self) -> None:
         height = width = 8
@@ -103,6 +120,45 @@ class VGGTPhase1Tests(unittest.TestCase):
         self.assertTrue(relation.is_connected)
         self.assertEqual(relation.debug_metrics["verification_source"], "vggt_joint_geometry")
 
+    def test_wide_angle_views_remain_one_same_scene(self) -> None:
+        angle = np.deg2rad(86.0)
+        rotation = np.array([
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ])
+        left = _PhotoArrays(
+            extrinsic=np.hstack((np.eye(3), np.zeros((3, 1)))), intrinsic=np.eye(3),
+            depth=np.ones((2, 2)), depth_conf=np.ones((2, 2)),
+            point_map=np.ones((2, 2, 3)), point_conf=np.ones((2, 2)), world_points=np.ones((2, 2, 3)),
+        )
+        right = _PhotoArrays(
+            extrinsic=np.hstack((rotation, np.array([[0.5], [0.0], [0.0]]))), intrinsic=np.eye(3),
+            depth=np.ones((2, 2)), depth_conf=np.ones((2, 2)),
+            point_map=np.ones((2, 2, 3)), point_conf=np.ones((2, 2)), world_points=np.ones((2, 2, 3)),
+        )
+        measured = {
+            "visible_fraction": 0.40,
+            "frustum_fraction": 0.84,
+            "depth_consistency": 0.76,
+            "reprojection_error": 0.011,
+            "median_image_dx": 142.0,
+            "median_image_dy": 4.0,
+        }
+        with patch.object(vggt_pipeline, "_project_metrics", side_effect=[measured, measured]):
+            relation = _compute_pair_relations({1: left, 2: right}, {1: "dining room", 2: "dining room"})[0]
+        self.assertEqual(relation.continuity_type, "same_scene")
+        self.assertTrue(relation.is_connected)
+        self.assertGreater(relation.relation_confidence, 0.45)
+
+    def test_auto_room_labels_do_not_split_geometry_group(self) -> None:
+        photos = [
+            SimpleNamespace(room_override=None, room_label="dining room", manual_metadata={}),
+            SimpleNamespace(room_override=None, room_label="garage", manual_metadata={}),
+        ]
+        groups = _derive_render_groups(photos, "interior")
+        self.assertEqual(groups, [photos])
+
     def test_explicit_hero_and_single_image_fallback(self) -> None:
         auto = SimpleNamespace(id=1, final_score=0.99, position=0, manual_metadata={})
         hero = SimpleNamespace(id=2, final_score=0.10, position=1, manual_metadata={"editorial_role": "hero"})
@@ -111,6 +167,18 @@ class VGGTPhase1Tests(unittest.TestCase):
         shot = shot_planner._build_shot(cluster, [hero], None)
         self.assertEqual(shot["shot_type"], "single_image_move")
         self.assertTrue(shot["rejection_reasons"])
+
+    def test_geometry_group_becomes_multi_view_storyboard_shot(self) -> None:
+        first = SimpleNamespace(id=1, final_score=0.9, position=0, manual_metadata={})
+        second = SimpleNamespace(id=2, final_score=0.8, position=1, manual_metadata={})
+        cluster = SimpleNamespace(
+            hero_photo_id=None, room_type="dining room", sfm_eligible=True,
+            geometry_confidence=0.9, overlap_score=0.4, recommended_motion="parallax",
+            recommended_duration=3.0, id=7, scene_component_id=4,
+        )
+        shot = shot_planner._build_shot(cluster, [first, second], None)
+        self.assertEqual(shot["shot_type"], "verified_multi_view")
+        self.assertEqual(shot["ordered_photo_ids"], [1, 2])
 
     def test_transition_only_interpolates_verified_relation(self) -> None:
         previous = {"ordered_photo_ids": [1]}

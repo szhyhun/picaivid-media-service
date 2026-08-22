@@ -546,20 +546,19 @@ def _infer_motion_from_matching(
         relation_confidence = row[3]
         if dx is None or dy is None:
             continue
-        if track_support is None or float(track_support) < 0.35:
-            continue
         if relation_confidence is None or float(relation_confidence) < 0.45:
             continue
 
         summary["verified_transitions"] += 1
-        verified_inliers += int(round(float(track_support) * 100.0))
+        evidence = float(track_support) if track_support is not None and float(track_support) > 0.0 else float(relation_confidence)
+        verified_inliers += int(round(evidence * 100.0))
         dx = float(dx)
         dy = float(dy)
         if left != photo_a:
             dx = -dx
             dy = -dy
 
-        weight = float(max(1.0, float(track_support) * 100.0))
+        weight = float(max(1.0, evidence * 100.0))
         weighted_dx += dx * weight
         weighted_dy += dy * weight
         total_weight += weight

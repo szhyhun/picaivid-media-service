@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models import AnalysisResult, Job, JobPhoto, PhotoRelation, RoomCluster
 
 
-PLANNER_VERSION = "v2.0"
+PLANNER_VERSION = "v2.1-omega-geometry"
 
 
 def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluster]) -> dict[str, Any]:
@@ -44,7 +44,7 @@ def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluste
         if not cluster_photos:
             continue
         analysis = analyses.get(int(cluster.id))
-        shot = _build_shot(cluster, cluster_photos, analysis)
+        shot = _build_shot(cluster, cluster_photos, analysis, relations)
         candidates.append((_sort_key(cluster, cluster_photos, shot), cluster, shot))
 
     candidates.sort(key=lambda candidate: candidate[0])
@@ -89,13 +89,19 @@ def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluste
     return plan
 
 
-def _build_shot(cluster: RoomCluster, photos: list[JobPhoto], analysis: AnalysisResult | None) -> dict[str, Any]:
+def _build_shot(
+    cluster: RoomCluster,
+    photos: list[JobPhoto],
+    analysis: AnalysisResult | None,
+    relations: dict[tuple[int, int], PhotoRelation] | None = None,
+) -> dict[str, Any]:
     hero = _hero_photo(cluster, photos)
     role = _story_role(cluster, photos, hero)
     motion = analysis.recommended_motion if analysis is not None else cluster.recommended_motion
     duration = analysis.recommended_duration if analysis is not None else cluster.recommended_duration
     confidence = float(cluster.geometry_confidence or 0.0)
     multi_view = bool(cluster.sfm_eligible and len(photos) > 1 and confidence >= 0.56)
+    connection_evidence = _connection_evidence(photos, relations or {})
     return {
         "cluster_id": int(cluster.id),
         "scene_component_id": int(cluster.scene_component_id) if cluster.scene_component_id is not None else None,
@@ -115,9 +121,39 @@ def _build_shot(cluster: RoomCluster, photos: list[JobPhoto], analysis: Analysis
             "motion_affordance": cluster.recommended_motion,
             "hard_editorial_role": _editorial_role(hero),
             "requested_motion": ((analysis.debug_metrics or {}).get("requested_motion") if analysis is not None and isinstance(analysis.debug_metrics, dict) else None),
+            "geometry_connections": connection_evidence,
+            "sequence_mode": (
+                "continuous_geometry"
+                if connection_evidence and all(edge["continuity_type"] == "interpolation_safe" for edge in connection_evidence)
+                else "matched_same_scene"
+                if connection_evidence
+                else "single_view"
+            ),
         },
         "rejection_reasons": _rejection_reasons(multi_view, analysis),
     }
+
+
+def _connection_evidence(
+    photos: list[JobPhoto],
+    relations: dict[tuple[int, int], PhotoRelation],
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for left, right in zip(photos, photos[1:]):
+        pair = (min(int(left.id), int(right.id)), max(int(left.id), int(right.id)))
+        relation = relations.get(pair)
+        if relation is None:
+            continue
+        evidence.append({
+            "from_photo_id": int(left.id),
+            "to_photo_id": int(right.id),
+            "continuity_type": str(relation.continuity_type),
+            "same_scene_confidence": round(float(relation.relation_confidence or 0.0), 4),
+            "surface_overlap": round(float(relation.overlap_score or 0.0), 4),
+            "reprojection_score": round(float(relation.reprojection_score or 0.0), 4),
+            "image_motion": [round(float(relation.direction_dx or 0.0), 2), round(float(relation.direction_dy or 0.0), 2)],
+        })
+    return evidence
 
 
 def _hero_photo(cluster: RoomCluster, photos: list[JobPhoto]) -> JobPhoto:

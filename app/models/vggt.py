@@ -1,4 +1,4 @@
-"""Device-aware loader for the VGGT-1B-Commercial reconstruction model."""
+"""Device-aware VGGT-Omega reconstruction runtime."""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +14,6 @@ from time import monotonic
 from typing import Any, ContextManager
 
 import torch
-from safetensors.torch import load_file as safetensors_load_file
 
 from app.core.config import settings
 from app.pipeline.phase1_analyze.matcher_loaders import _ensure_local_file, _ensure_local_repo
@@ -42,25 +41,25 @@ def _allocated_memory_mb(device: str) -> float | None:
 
 def _log_stage(stage: str, started_at: float, device: str, image_count: int) -> None:
     _synchronize_device(device)
+    allocated = _allocated_memory_mb(device)
     logger.info(
-        "VGGT_STAGE_COMPLETE stage=%s images=%s elapsed_seconds=%.3f allocated_mb=%s",
+        "VGGT_OMEGA_STAGE_COMPLETE stage=%s images=%s elapsed_seconds=%.3f allocated_mb=%s",
         stage,
         image_count,
         monotonic() - started_at,
-        round(_allocated_memory_mb(device), 1) if _allocated_memory_mb(device) is not None else "n/a",
+        round(allocated, 1) if allocated is not None else "n/a",
     )
 
 
 @dataclass
-class _VGGTImports:
-    VGGT: Any
-    load_and_preprocess_images_square: Any
-    pose_encoding_to_extri_intri: Any
-    unproject_depth_map_to_point_map: Any
+class _OmegaImports:
+    VGGTOmega: Any
+    load_and_preprocess_images: Any
+    encoding_to_camera: Any
 
 
 def _resolve_repo_dir() -> str:
-    fallback = os.path.abspath(os.path.join(os.path.dirname(settings.MODEL_CACHE_DIR), "..", "third_party", "vggt"))
+    fallback = os.path.abspath(os.path.join(os.path.dirname(settings.MODEL_CACHE_DIR), "..", "third_party", "vggt-omega"))
     return _ensure_local_repo(str(settings.VGGT_REPO_DIR or fallback), "VGGT_REPO_ARCHIVE_S3_URI")
 
 
@@ -68,15 +67,16 @@ def _resolve_checkpoint_path() -> str:
     repo_dir = _resolve_repo_dir()
     if settings.VGGT_MODEL_CHECKPOINT:
         return _ensure_local_file(str(settings.VGGT_MODEL_CHECKPOINT), "VGGT_MODEL_CHECKPOINT_S3_URI")
-    for candidate in (
-        os.path.abspath("vggt-commercial/vggt_1B_commercial.pt"),
-        os.path.join(repo_dir, "checkpoints", "vggt_1B_commercial.pt"),
-        os.path.join(repo_dir, "vggt_1B_commercial.pt"),
-        os.path.join(repo_dir, "checkpoints", "VGGT-1B-Commercial", "model.pt"),
-    ):
+    cache_root = os.path.expanduser("~/.cache/huggingface/hub/models--facebook--VGGT-Omega/snapshots")
+    candidates = (
+        os.path.join(cache_root, "f9f63d8da7155e6e28990236d4f5a78f394853b0", "vggt_omega_1b_512.pt"),
+        os.path.join(repo_dir, "checkpoints", "vggt_omega_1b_512.pt"),
+        os.path.join(repo_dir, "vggt_omega_1b_512.pt"),
+    )
+    for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate
-    preferred_target = os.path.join(repo_dir, "checkpoints", "vggt_1B_commercial.pt")
+    preferred_target = os.path.join(repo_dir, "checkpoints", "vggt_omega_1b_512.pt")
     Path(preferred_target).parent.mkdir(parents=True, exist_ok=True)
     return _ensure_local_file(preferred_target, "VGGT_MODEL_CHECKPOINT_S3_URI")
 
@@ -144,37 +144,59 @@ def _repo_commit(repo_dir: str) -> str | None:
 
 
 @lru_cache(maxsize=1)
-def _load_imports() -> _VGGTImports:
+def _load_imports() -> _OmegaImports:
     repo_dir = _resolve_repo_dir()
     if repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
     try:
-        from vggt.models.vggt import VGGT
-        from vggt.utils.load_fn import load_and_preprocess_images_square
-        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-        from vggt.utils.geometry import unproject_depth_map_to_point_map
-    except Exception as err:  # pragma: no cover - external runtime
-        raise RuntimeError("Failed to import VGGT-1B-Commercial from the configured repository") from err
-    return _VGGTImports(VGGT, load_and_preprocess_images_square, pose_encoding_to_extri_intri, unproject_depth_map_to_point_map)
+        from vggt_omega.models import VGGTOmega
+        from vggt_omega.utils.load_fn import load_and_preprocess_images
+        from vggt_omega.utils.pose_enc import encoding_to_camera
+    except Exception as error:  # pragma: no cover - external runtime
+        raise RuntimeError("Failed to import VGGT-Omega from the configured repository") from error
+    return _OmegaImports(VGGTOmega, load_and_preprocess_images, encoding_to_camera)
 
 
 @lru_cache(maxsize=1)
 def _load_model() -> Any:
     imports = _load_imports()
     checkpoint_path = _resolve_checkpoint_path()
-    model = imports.VGGT(img_size=int(settings.VGGT_IMAGE_SIZE))
-    state_dict = safetensors_load_file(checkpoint_path, device="cpu") if checkpoint_path.endswith(".safetensors") else torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    model = imports.VGGTOmega()
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
         state_dict = state_dict["state_dict"]
     model.load_state_dict(state_dict, strict=True)
     device = _device()
     model.eval().to(device=device, dtype=_dtype(device))
-    logger.info("Loaded VGGT-1B-Commercial checkpoint=%s device=%s", checkpoint_path, _device())
+    logger.info("Loaded VGGT-Omega checkpoint=%s device=%s", checkpoint_path, device)
     return model
 
 
+def _unproject_depth(depth_map: torch.Tensor, extrinsic: torch.Tensor, intrinsic: torch.Tensor) -> torch.Tensor:
+    """Unproject Omega depth using its documented OpenCV world-to-camera pose."""
+    depth = depth_map.squeeze(-1)
+    frame_count, height, width = depth.shape
+    y, x = torch.meshgrid(
+        torch.arange(height, device=depth.device, dtype=depth.dtype),
+        torch.arange(width, device=depth.device, dtype=depth.dtype),
+        indexing="ij",
+    )
+    x = x.expand(frame_count, -1, -1)
+    y = y.expand(frame_count, -1, -1)
+    fx = intrinsic[:, 0, 0, None, None]
+    fy = intrinsic[:, 1, 1, None, None]
+    cx = intrinsic[:, 0, 2, None, None]
+    cy = intrinsic[:, 1, 2, None, None]
+    camera_points = torch.stack(((x - cx) * depth / fx, (y - cy) * depth / fy, depth), dim=-1)
+    rotation = extrinsic[:, :3, :3]
+    translation = extrinsic[:, :3, 3]
+    return torch.einsum("nij,nhwj->nhwi", rotation.transpose(1, 2), camera_points - translation[:, None, None, :])
+
+
 class VGGTModel:
-    """Runs commercial VGGT and returns CPU tensors that are safe to persist."""
+    """Runs VGGT-Omega and normalizes its outputs for the scene planner."""
+
+    supports_tracks = False
 
     def _ensure_loaded(self) -> None:
         _load_model()
@@ -191,18 +213,27 @@ class VGGTModel:
         checkpoint_path = _resolve_checkpoint_path()
         repo_dir = _resolve_repo_dir()
         return {
-            "model": "VGGT-1B-Commercial",
+            "model": "VGGT-Omega-1B-512",
             "checkpoint_path": checkpoint_path,
             "checkpoint_sha256": _file_sha256(checkpoint_path),
             "repo_dir": repo_dir,
             "repo_commit": _repo_commit(repo_dir),
             "device": self.device,
             "dtype": str(self.dtype).replace("torch.", ""),
+            "image_mode": settings.VGGT_IMAGE_MODE,
+            "track_head": "unavailable",
         }
 
     def load_and_preprocess_images(self, image_paths: list[str]) -> torch.Tensor:
         imports = _load_imports()
-        images, _ = imports.load_and_preprocess_images_square(image_paths, target_size=int(settings.VGGT_IMAGE_SIZE))
+        mode = str(settings.VGGT_IMAGE_MODE).lower()
+        if mode not in {"balanced", "max_size"}:
+            raise RuntimeError("VGGT_IMAGE_MODE must be 'balanced' or 'max_size'")
+        images = imports.load_and_preprocess_images(
+            image_paths,
+            mode=mode,
+            image_resolution=int(settings.VGGT_IMAGE_SIZE),
+        )
         return images.to(self.device, dtype=self.dtype)
 
     def predict(self, image_paths: list[str]) -> dict[str, Any]:
@@ -210,84 +241,53 @@ class VGGTModel:
         model = _load_model()
         started_at = monotonic()
         logger.info(
-            "VGGT_INFERENCE_START images=%s device=%s dtype=%s",
-            len(image_paths),
-            self.device,
-            str(self.dtype).replace("torch.", ""),
+            "VGGT_OMEGA_INFERENCE_START images=%s device=%s dtype=%s",
+            len(image_paths), self.device, str(self.dtype).replace("torch.", ""),
         )
         stage_started_at = monotonic()
         images = self.load_and_preprocess_images(image_paths)[None]
         _log_stage("preprocess", stage_started_at, self.device, len(image_paths))
         with torch.inference_mode():
+            # Omega's public forward hardcodes CUDA autocast. Execute its heads
+            # directly so MPS stays on supported float32 without mutating its repo.
             stage_started_at = monotonic()
             with _autocast(self.device, self.dtype):
-                aggregated_tokens_list, patch_start_idx = model.aggregator(images)
+                aggregated_tokens_list, patch_token_start = model.aggregator(images)
             _log_stage("aggregator", stage_started_at, self.device, len(image_paths))
+            if aggregated_tokens_list[-1] is None:
+                raise RuntimeError("VGGT-Omega did not produce final aggregator tokens")
             stage_started_at = monotonic()
-            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-            extrinsic, intrinsic = imports.pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            pose_encoding = model.camera_head(aggregated_tokens_list, patch_token_start=patch_token_start)
+            extrinsic, intrinsic = imports.encoding_to_camera(pose_encoding, images.shape[-2:])
             _log_stage("camera_head", stage_started_at, self.device, len(image_paths))
             stage_started_at = monotonic()
-            depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, patch_start_idx)
+            depth_map, depth_conf = model.dense_head(
+                aggregated_tokens_list,
+                images=images,
+                patch_token_start=patch_token_start,
+            )
             _log_stage("depth_head", stage_started_at, self.device, len(image_paths))
             stage_started_at = monotonic()
-            point_map, point_conf = model.point_head(aggregated_tokens_list, images, patch_start_idx)
-            _log_stage("point_head", stage_started_at, self.device, len(image_paths))
-            # The official helper returns NumPy world points even when tensors are supplied.
-            stage_started_at = monotonic()
-            unprojected = imports.unproject_depth_map_to_point_map(depth_map.squeeze(0), extrinsic.squeeze(0), intrinsic.squeeze(0))
+            unprojected = _unproject_depth(depth_map.squeeze(0), extrinsic.squeeze(0), intrinsic.squeeze(0))
             _log_stage("unproject", stage_started_at, self.device, len(image_paths))
         runtime = self.runtime_metadata()
         runtime.update({"image_count": len(image_paths), "runtime_seconds": round(monotonic() - started_at, 3)})
-        logger.info(
-            "VGGT_INFERENCE_COMPLETE images=%s runtime_seconds=%.3f",
-            len(image_paths),
-            monotonic() - started_at,
-        )
+        logger.info("VGGT_OMEGA_INFERENCE_COMPLETE images=%s runtime_seconds=%.3f", len(image_paths), monotonic() - started_at)
+        # Omega predicts depth confidence but not a separate point confidence.
+        # The planner uses that same measured confidence for point selection.
         return {
             "extrinsic": extrinsic.squeeze(0).detach().cpu(),
             "intrinsic": intrinsic.squeeze(0).detach().cpu(),
             "depth_map": depth_map.squeeze(0).detach().cpu(),
             "depth_conf": depth_conf.squeeze(0).detach().cpu(),
-            "point_map": point_map.squeeze(0).detach().cpu(),
-            "point_conf": point_conf.squeeze(0).detach().cpu(),
-            "point_map_unprojected": torch.as_tensor(unprojected).detach().cpu(),
+            "point_map": unprojected.detach().cpu(),
+            "point_conf": depth_conf.squeeze(0).detach().cpu(),
+            "point_map_unprojected": unprojected.detach().cpu(),
             "runtime": runtime,
         }
 
     def predict_tracks(self, image_paths: list[str], query_points: torch.Tensor) -> dict[str, Any]:
-        """Track a compact, preselected point set through one verified scene component."""
-        model = _load_model()
-        started_at = monotonic()
-        logger.info(
-            "VGGT_TRACK_START images=%s points=%s device=%s",
-            len(image_paths),
-            len(query_points),
-            self.device,
-        )
-        images = self.load_and_preprocess_images(image_paths)[None]
-        query_points = query_points.to(self.device, dtype=torch.float32)[None]
-        with torch.inference_mode():
-            with _autocast(self.device, self.dtype):
-                aggregated_tokens_list, patch_start_idx = model.aggregator(images)
-            track_list, visibility, confidence = model.track_head(
-                aggregated_tokens_list,
-                images,
-                patch_start_idx,
-                query_points=query_points,
-            )
-        _synchronize_device(self.device)
-        logger.info(
-            "VGGT_TRACK_COMPLETE images=%s points=%s elapsed_seconds=%.3f",
-            len(image_paths),
-            query_points.shape[1],
-            monotonic() - started_at,
-        )
-        return {
-            "track": track_list[-1].squeeze(0).detach().cpu(),
-            "visibility": visibility.squeeze(0).detach().cpu(),
-            "confidence": confidence.squeeze(0).detach().cpu(),
-        }
+        raise NotImplementedError("VGGT-Omega-1B-512 does not expose a track head")
 
 
 vggt_model = VGGTModel()

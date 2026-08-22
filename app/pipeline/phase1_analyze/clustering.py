@@ -290,7 +290,8 @@ def _derive_render_groups(ordered_photos: list[JobPhoto], scene_type: str) -> li
     if len(ordered_photos) == 1:
         return [ordered_photos]
 
-    primary_label = _majority_room_label(ordered_photos).strip().lower()
+    explicit_labels = [str(photo.room_override).strip().lower() for photo in ordered_photos if photo.room_override]
+    primary_label = Counter(explicit_labels).most_common(1)[0][0] if explicit_labels else ""
     if scene_type == "drone":
         max_group_size = 1
     elif any(token in primary_label for token in ("bath", "powder")):
@@ -302,7 +303,6 @@ def _derive_render_groups(ordered_photos: list[JobPhoto], scene_type: str) -> li
         max_group_size = 4
     groups: list[list[JobPhoto]] = []
     current_group: list[JobPhoto] = []
-    current_label: str | None = None
     for photo in ordered_photos:
         editorial_role = str((photo.manual_metadata or {}).get("editorial_role", "auto")).lower()
         if editorial_role in {"opening", "closing"}:
@@ -310,17 +310,13 @@ def _derive_render_groups(ordered_photos: list[JobPhoto], scene_type: str) -> li
                 groups.append(current_group)
                 current_group = []
             groups.append([photo])
-            current_label = None
             continue
-        label = (photo.room_override or photo.room_label or "").strip().lower()
-        if current_group and (
-            (current_label and label and label != current_label)
-            or len(current_group) >= max_group_size
-        ):
+        # VGGT scene geometry owns grouping. Room labels name and story-order a
+        # group, but a weak semantic prediction must never split a 3D component.
+        if current_group and len(current_group) >= max_group_size:
             groups.append(current_group)
             current_group = []
         current_group.append(photo)
-        current_label = label or current_label
     if current_group:
         groups.append(current_group)
     return groups

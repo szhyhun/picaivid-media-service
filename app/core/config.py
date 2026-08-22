@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     # ML Models
     MODEL_CACHE_DIR: str = "./ml_models"
     ANALYSIS_MATCH_ENGINE: str = "vggt_scene_graph"
+    # VGGT-Omega is the private reconstruction runtime. Its repository and
+    # checkpoint are supplied outside source control on each worker.
     VGGT_REPO_DIR: str | None = None
     VGGT_REPO_COMMIT: str | None = None
     VGGT_REPO_ARCHIVE_S3_URI: str | None = None
@@ -43,7 +45,8 @@ class Settings(BaseSettings):
     VGGT_MODEL_CHECKPOINT_S3_URI: str | None = None
     VGGT_DEVICE: str = "auto"
     VGGT_PRECISION: str = "auto"
-    VGGT_IMAGE_SIZE: int = 518
+    VGGT_IMAGE_SIZE: int = 512
+    VGGT_IMAGE_MODE: str = "balanced"
     VGGT_RETRY_WINDOW_SIZE: int = 16
     VGGT_RETRY_WINDOW_OVERLAP: int = 6
     VGGT_FINAL_WINDOW_SIZE: int = 10

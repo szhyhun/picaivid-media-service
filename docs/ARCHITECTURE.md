@@ -18,7 +18,7 @@
    - `scene_component_memberships`
    - `photo_scene_geometry`
    - `photo_relations`
-4. Measured VGGT overlaps, depth agreement, scoped tracks, and deterministic ordering form a renderer-neutral `ShotPlan`.
+4. Confidence-weighted Omega surface overlap, depth agreement, and deterministic ordering form a renderer-neutral `ShotPlan`.
 5. Render clusters and motion decisions are derived from the verified plan.
 6. Phase 2 generates clips from ordered shot-plan inputs.
 
@@ -31,11 +31,12 @@ For any future dense-capture or splat-backed workflow, VGGT should still be trea
   - depth maps
   - point maps
   - optional sparse scene exports
-  - optional track bundles
+  - optional sparse relation evidence
 
 ## Scene-first rules
 
-- geometry decides connectivity
+- Omega's shared 3D geometry decides connectivity
+- `same_scene` groups views of one physical area; `interpolation_safe` is the stricter camera-motion subset
 - room labels are hints, not truth
 - indoor and outdoor components use different thresholds
 - cross-room parallax is only allowed when actual geometry continuity exists

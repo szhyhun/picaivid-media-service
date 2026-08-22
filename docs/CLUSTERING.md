@@ -9,9 +9,9 @@ Phase 1 no longer chooses clips from pair-matcher scores. It reconstructs geomet
 1. load project photos
 2. run VGGT on the project set or overlapping windows
 3. persist per-photo geometry
-4. measure bidirectional depth overlap, depth consistency, normalized reprojection, and relative pose for candidate pairs
-5. classify continuity directly from the jointly reconstructed VGGT geometry and run focused VGGT tracks inside candidate components
-6. split scene components only on `interpolation_safe` edges
+4. measure confidence-weighted bidirectional surface overlap, depth consistency, normalized reprojection, and relative pose
+5. build an adaptive mutual-neighbor graph directly from jointly reconstructed Omega geometry
+6. build scene components from `same_scene` and `interpolation_safe` edges
 7. order photos with deterministic beam search over verified edges
 8. derive one-to-four-photo render groups and a renderer-neutral ShotPlan
 9. choose motion from geometry confidence
@@ -24,7 +24,7 @@ Each component stores:
 - ordered photo IDs
 - hero/bridge/outlier roles
 - geometry confidence
-- track coverage
+- connected-surface coverage
 - depth range
 - recommended motion affordance
 
@@ -44,14 +44,15 @@ Two-photo inspection now answers:
 
 - are they in the same component?
 - how much overlap do they have?
-- how strong is track support?
+- how strong is mutual 3D surface support?
 - is this a bridge edge?
 - what is the relative transform?
 
 Relation classes are intentionally strict:
 
 - `duplicate`: very high overlap and near-zero baseline
-- `interpolation_safe`: VGGT overlap, depth agreement, reprojection, and rotation all pass
+- `interpolation_safe`: same scene with a camera path suitable for continuous interpolation
+- `same_scene`: verified views of one physical scene with a wider camera change; keep them in one storyboard shot and use a matched cinematic transition
 - `doorway_bridge`: editorial continuity only; never used as an interpolation request
 - `cut_only` / `unrelated`: safe editorial cut or no use
 
@@ -68,3 +69,6 @@ metadata before analysis; explicit roles override automatic ranking.
 - weak geometry -> `static` or `micro_push_in`
 - medium geometry -> `reveal` or `parallax`
 - strong geometry -> `multi_view`
+
+Auto room labels name and story-order a geometry group. They never split a verified Omega scene
+component; only explicit editorial overrides may force a separate group.

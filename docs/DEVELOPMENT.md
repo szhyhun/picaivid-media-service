@@ -20,10 +20,10 @@ python -m app.worker
 
 ## Apple Silicon VGGT validation
 
-VGGT-1B-Commercial is the only reconstruction model. Keep its checkpoint at
-`vggt-commercial/vggt_1B_commercial.pt`; it is ignored and must never be committed. The official
-repository is pinned at `../third_party/vggt` (currently
-`a288dd0f14786c93483e45524328726ab7b1b4ce`).
+VGGT-Omega-1B-512 is the reconstruction model. Keep its checkpoint outside the repository and set
+`VGGT_MODEL_CHECKPOINT` to its absolute path; it must never be committed. The official repository
+is pinned at `../third_party/vggt-omega` (currently
+`282ec70363edeff59424bf43731658092fba3d37`).
 
 ```bash
 ./venv/bin/python - <<'PY'

@@ -45,8 +45,8 @@ pip install -r requirements.lock.txt
 
 - Phase 1 selects CUDA, then Apple Silicon MPS, then CPU. CUDA is used for the on-demand worker; MPS is supported for local review.
 - Dense geometry artifacts belong in S3, not Postgres.
-- Synthetic geometry is disabled. Every analysis requires the pinned VGGT-1B-Commercial repository and checkpoint.
-- Production and AWS use the hydrated commercial checkpoint only.
+- Synthetic geometry is disabled. Every analysis requires the pinned VGGT-Omega repository and external 512 checkpoint.
+- The Omega checkpoint is never committed. Workers hydrate the repository and checkpoint from configured local or S3 artifacts.
 
 ## Main Endpoints
 

@@ -29,5 +29,5 @@ Before enabling the on-demand GPU worker, review the JSON and scene-debug API ag
 - repeat runs produce identical ordered plans
 - an editor approves at least five of six complete story plans
 
-Record any failed relation using its saved VGGT geometry and track evidence. Do not compensate
+Record any failed relation using its saved Omega geometry and projection evidence. Do not compensate
 with synthetic geometry or hand-edit a result silently.
