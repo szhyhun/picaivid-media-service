@@ -57,6 +57,7 @@ logs/
 htmlcov/
 .tox/
 .nox/
+tmp_sweep/
 
 # Jupyter
 .ipynb_checkpoints/

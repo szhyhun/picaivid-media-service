@@ -20,6 +20,13 @@ from app.services.storage.s3_client import S3Client
 
 logger = logging.getLogger(__name__)
 
+# Calibrated on 813 verified pairs across 3 human-labeled listings. depth_ok alone
+# collapses precision to 0.13 because transitive closure chains rooms through
+# open-plan seams; bl_over_depth separates them (same-room median 1.04, seam 2.11).
+MEMBERSHIP_DEPTH_OK = 0.20
+MEMBERSHIP_BL_OVER_DEPTH = 2.0
+PAIR_CACHE_RELEASE_EVERY = 25
+
 SOCIAL_LABEL_TOKENS = ("living", "kitchen", "dining", "great room", "family room")
 
 
@@ -506,7 +513,10 @@ def _compute_pair_relations(
                 continue
             other_id = pair[1] if pair[0] == photo_id else pair[0]
             candidates.append((float(metrics["same_scene_score"]), other_id))
-        ranked_neighbors[photo_id] = [other_id for score, other_id in sorted(candidates, reverse=True)[:4] if score >= 0.45]
+        # Neighbor ranking is relative within a reconstruction. Requiring every
+        # candidate to clear one global score fragmented otherwise coherent
+        # interiors when camera rotation made cycle reprojection less precise.
+        ranked_neighbors[photo_id] = [other_id for _, other_id in sorted(candidates, reverse=True)[:6]]
 
     relations: list[PhotoRelationResult] = []
     for pair, metrics in base_metrics.items():
@@ -515,17 +525,24 @@ def _compute_pair_relations(
         right_domain = _scene_type_for_label(room_labels.get(right_id))
         duplicate = metrics["overlap"] >= 0.85 and metrics["normalized_baseline"] <= 0.03
         mutual_neighbor = right_id in ranked_neighbors[left_id] and left_id in ranked_neighbors[right_id]
-        same_scene = mutual_neighbor and metrics["same_scene_score"] >= 0.45
+        same_scene_geometry = (
+            metrics["overlap"] >= 0.22
+            and metrics["depth_consistency"] >= 0.40
+            and metrics["reprojection_error"] <= 0.08
+        )
+        same_scene = mutual_neighbor and same_scene_geometry
         interpolation_safe = (
             same_scene
-            and metrics["overlap"] >= 0.28
+            and metrics["overlap"] >= 0.35
+            and metrics["depth_consistency"] >= 0.50
             and metrics["reprojection_error"] <= 0.025
             and metrics["rotation_degrees"] <= 60.0
         )
         doorway_bridge = (
             not same_scene
-            and metrics["same_scene_score"] >= 0.38
-            and metrics["overlap"] >= 0.08
+            and metrics["same_scene_score"] >= 0.30
+            and metrics["overlap"] >= 0.12
+            and metrics["depth_consistency"] >= 0.30
         )
         if duplicate:
             continuity_type = "duplicate"
@@ -559,6 +576,7 @@ def _compute_pair_relations(
                 **metrics,
                 "verification_source": "vggt_joint_geometry",
                 "mutual_neighbor": mutual_neighbor,
+                "same_scene_geometry": same_scene_geometry,
                 "left_neighbor_rank": ranked_neighbors[left_id].index(right_id) + 1 if right_id in ranked_neighbors[left_id] else None,
                 "right_neighbor_rank": ranked_neighbors[right_id].index(left_id) + 1 if left_id in ranked_neighbors[right_id] else None,
                 "left_domain": left_domain,
@@ -566,6 +584,175 @@ def _compute_pair_relations(
             },
         ))
     return relations
+
+
+
+def _v2_scene_graph(
+    file_by_photo: dict[int, str],
+    labels: dict[int, str],
+    positions: dict[int, int],
+    arrays: dict[int, _PhotoArrays],
+    embeddings: dict[int, list] | None = None,
+    must_not_group: set[tuple[int, int]] | None = None,
+) -> tuple[list[PhotoRelationResult], list[list[int]]]:
+    """Group photos by verifying candidate pairs with 2-photo VGGT runs.
+
+    Replaces the single-global-pass grouping. The global reconstruction still
+    provides the scene map and per-photo depth, but it neither nominates candidates
+    nor decides membership.
+
+    Measured against human labels on three listings: recall 0.32 -> 0.69, 0.66 ->
+    0.84, 0.33 -> 0.65 at equal or better precision.
+    """
+    from app.pipeline.phase1_analyze import pairing, transitions
+    from app.pipeline.phase1_analyze.candidate_pairs import nominate, split_tiers
+    from app.pipeline.phase1_analyze.membership import constrained_merge
+    from app.pipeline.phase1_analyze.pairwise_verify import (
+        DEPTH_AGREEMENT,
+        canonical_order_with_ids,
+        verify_with_cache,
+    )
+
+    photo_ids = sorted(file_by_photo)
+    photos = [{"id": pid, "position": positions.get(pid, 0), "room_label": labels.get(pid)} for pid in photo_ids]
+    centers = {pid: _camera_center(arrays[pid].extrinsic) for pid in photo_ids}
+
+    # Nomination deliberately uses only the primary tier -- room labels, CLIP and
+    # upload adjacency. It does NOT consume global pair metrics: those cost an
+    # all-pairs projection sweep (1,540 pairs on a 56-photo listing) and measured
+    # zero connectivity gain, since the primary tier alone reached every labeled
+    # room on all three calibration listings.
+    candidates, _fallback = split_tiers(nominate(photos, embeddings=embeddings or None))
+    logger.info("VGGT_V2_CANDIDATES photos=%s pairs=%s", len(photo_ids), len(candidates))
+
+    evidence: list[dict] = []
+    cache_hits = computed = 0
+    runtime = vggt_model.runtime_metadata()
+    for index, candidate in enumerate(candidates, 1):
+        a, b = candidate.key
+        try:
+            (path_a, evidence_a), (path_b, evidence_b) = canonical_order_with_ids(
+                file_by_photo[a], a, file_by_photo[b], b
+            )
+            record, cache_hit, _ = verify_with_cache(path_a, path_b, runtime=runtime)
+        except Exception as error:  # a single bad pair must not fail the listing
+            logger.warning("Pair verification failed for %s/%s: %s", a, b, error)
+            continue
+        cache_hits += int(cache_hit)
+        computed += int(not cache_hit)
+        record.update({
+            # Directional pose and image motion use canonical content order.
+            "photo_a_id": evidence_a,
+            "photo_b_id": evidence_b,
+            "sources": sorted(candidate.sources),
+        })
+        evidence.append(record)
+        if not cache_hit and computed % PAIR_CACHE_RELEASE_EVERY == 0:
+            _release_accelerator_cache()
+        if index % PAIR_CACHE_RELEASE_EVERY == 0 or index == len(candidates):
+            logger.info(
+                "VGGT_V2_PAIR_PROGRESS verified=%s/%s computed=%s cache_hits=%s",
+                index,
+                len(candidates),
+                computed,
+                cache_hits,
+            )
+    if computed:
+        _release_accelerator_cache()
+    logger.info(
+        "VGGT_V2_VERIFIED pairs=%s computed=%s cache_hits=%s",
+        len(evidence),
+        computed,
+        cache_hits,
+    )
+
+    # Membership: only strong direct evidence merges, and only human negatives block.
+    merge_edges = [
+        (e["photo_a_id"], e["photo_b_id"], e["depth_ok_min"])
+        for e in evidence
+        if e["depth_ok_min"] > MEMBERSHIP_DEPTH_OK and e["bl_over_depth"] < MEMBERSHIP_BL_OVER_DEPTH
+    ]
+    merge_edge_keys = {(min(a, b), max(a, b)) for a, b, _ in merge_edges}
+    membership = constrained_merge(photo_ids, merge_edges, must_not_group)
+    component_of = membership.component_of()
+
+    transition_keys = {
+        (min(t.photo_a, t.photo_b), max(t.photo_a, t.photo_b))
+        for t in transitions.build(evidence, must_not_group)
+    }
+
+    results: list[PhotoRelationResult] = []
+    for e in evidence:
+        a, b = e["photo_a_id"], e["photo_b_id"]
+        key = (min(a, b), max(a, b))
+        same_component = component_of.get(a) is not None and component_of.get(a) == component_of.get(b)
+        direct_membership_edge = same_component and key in merge_edge_keys
+        is_transition = key in transition_keys
+        # Deliberately NOT emitting `interpolation_safe`. Transition geometry is
+        # provisional: there is no safe/unsafe ground truth for camera motion, so
+        # passing these thresholds is not proof a rendered interpolation will look
+        # right. Everything renders as a cut until that corpus exists; the flag is
+        # carried in debug_metrics.is_transition for review and for building it.
+        if direct_membership_edge:
+            continuity = "same_scene"
+        elif is_transition:
+            continuity = "doorway_bridge"      # provisional: candidate move, renders as a cut
+        elif e["depth_ok_min"] > 0.0:
+            continuity = "cut_only"
+        else:
+            continuity = "unrelated"
+        delta = centers[b] - centers[a]
+        relative_depth_errors = [
+            direction.get("median_relative_depth_error")
+            for direction in (e["forward"], e["backward"])
+            if direction.get("median_relative_depth_error") is not None
+            and np.isfinite(direction["median_relative_depth_error"])
+        ]
+        reprojection_score = (
+            float(np.clip(1.0 - np.median(relative_depth_errors) / DEPTH_AGREEMENT, 0.0, 1.0))
+            if relative_depth_errors
+            else 0.0
+        )
+        results.append(PhotoRelationResult(
+            photo_a_id=a,
+            photo_b_id=b,
+            overlap_score=float(e["depth_ok_min"]),
+            track_support=0.0,
+            reprojection_score=reprojection_score,
+            relation_confidence=float(min(1.0, e["conf_pair"] / 20.0)),
+            baseline_distance=float(e["baseline"]),
+            relative_transform={
+                "translation": [float(v) for v in delta],
+                "rotation_degrees": float(e["rot_deg"]),
+                "bl_over_depth": float(e["bl_over_depth"]),
+                "relative_pose": e.get("relative_pose"),
+            },
+            direction_dx=float(e["forward"]["median_dx"]),
+            direction_dy=float(e["forward"]["median_dy"]),
+            continuity_type=continuity,
+            is_bridge_edge=continuity == "doorway_bridge",
+            is_connected=direct_membership_edge,
+            debug_metrics={
+                "verification_source": "vggt_pairwise_v2",
+                "depth_ok_forward": e["forward"]["depth_ok"],
+                "depth_ok_backward": e["backward"]["depth_ok"],
+                "conf_pair": e["conf_pair"],
+                "bl_over_depth": e["bl_over_depth"],
+                "rotation_degrees": e["rot_deg"],
+                "pair_score": pairing.score_pair(e),
+                "is_duplicate": pairing.is_duplicate(e),
+                "is_transition": is_transition,
+                "same_component": same_component,
+                "direct_membership_edge": direct_membership_edge,
+                "sources": e["sources"],
+            },
+        ))
+
+    blocked = [d for d in membership.merge_log if not d.accepted]
+    if blocked:
+        logger.info("VGGT_V2_MERGES_BLOCKED count=%s", len(blocked))
+    logger.info("VGGT_V2_COMPONENTS count=%s", len(membership.components))
+    return results, membership.components
 
 
 def _relation_lookup(relations: list[PhotoRelationResult]) -> dict[tuple[int, int], PhotoRelationResult]:
@@ -758,6 +945,7 @@ def run_vggt_scene_pipeline(
     s3_client: S3Client | None = None,
     quality_scores: dict[int, float] | None = None,
     editorial_roles: dict[int, str] | None = None,
+    embeddings: dict[int, list] | None = None,
 ) -> tuple[list[PhotoGeometryResult], list[PhotoRelationResult], list[SceneComponentResult]]:
     if not images:
         return [], [], []
@@ -816,8 +1004,13 @@ def run_vggt_scene_pipeline(
         labels = {int(photo_id): str(room_labels[index] if index < len(room_labels) else "") for index, photo_id in enumerate(photo_ids)}
         position_map = {int(photo_id): int(positions[index] if index < len(positions) else index) for index, photo_id in enumerate(photo_ids)}
         file_by_photo = {int(photo_id): filelist[index] for index, photo_id in enumerate(photo_ids)}
-        relations = _compute_pair_relations(arrays, labels)
-        components = _connected_components(photo_ids, relations)
+        if settings.SCENE_GRAPH_V2:
+            relations, components = _v2_scene_graph(
+                file_by_photo, labels, position_map, arrays, embeddings or {}
+            )
+        else:
+            relations = _compute_pair_relations(arrays, labels)
+            components = _connected_components(photo_ids, relations)
         logger.info("SCENE_COMPONENTS_BUILT job_id=%s components=%s", job_id, len(components))
         _enrich_tracks(components, relations, file_by_photo, arrays)
         results: list[SceneComponentResult] = []

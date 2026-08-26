@@ -193,6 +193,50 @@ def _unproject_depth(depth_map: torch.Tensor, extrinsic: torch.Tensor, intrinsic
     return torch.einsum("nij,nhwj->nhwi", rotation.transpose(1, 2), camera_points - translation[:, None, None, :])
 
 
+def _valid_pixel_masks(image_paths: list[str], padded_hw: tuple[int, int]) -> torch.Tensor:
+    """True where a pixel came from the photo, False where preprocessing padded.
+
+    Omega resizes each image to its own patch-aligned shape, then pads the batch to a
+    common size with constant white and no mask (`utils/load_fn.py::_pad_images_to_common_size`).
+    On a mixed-aspect listing that is 5.1-7.1% of every frame -- synthetic pixels that
+    otherwise enter depth, points, overlap denominators and confidence. Thresholds must
+    never be calibrated against them.
+
+    Recomputes each image's pre-padding shape with Omega's own helpers so the mask matches
+    the tensor exactly; it does not re-run or modify the model.
+    """
+    imports = _load_imports()
+    repo_dir = _resolve_repo_dir()
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+    from vggt_omega.utils.load_fn import (  # noqa: PLC0415 - optional third-party path
+        _balanced_target_shape,
+        _crop_to_supported_aspect_ratio,
+        _load_rgb_image,
+        _max_size_target_shape,
+    )
+
+    mode = str(settings.VGGT_IMAGE_MODE).lower()
+    resolution = int(settings.VGGT_IMAGE_SIZE)
+    max_height, max_width = padded_hw
+    masks = torch.zeros((len(image_paths), max_height, max_width), dtype=torch.bool)
+    for index, image_path in enumerate(image_paths):
+        image = _crop_to_supported_aspect_ratio(_load_rgb_image(image_path))
+        width, height = image.size
+        aspect_ratio = height / max(width, 1)
+        if mode == "balanced":
+            target_h, target_w = _balanced_target_shape(aspect_ratio, resolution, 16)
+        else:
+            target_h, target_w = _max_size_target_shape(aspect_ratio, resolution, 16)
+        target_h = min(target_h, max_height)
+        target_w = min(target_w, max_width)
+        # Omega centres the padding, so mirror that placement exactly.
+        top = (max_height - target_h) // 2
+        left = (max_width - target_w) // 2
+        masks[index, top:top + target_h, left:left + target_w] = True
+    return masks
+
+
 class VGGTModel:
     """Runs VGGT-Omega and normalizes its outputs for the scene planner."""
 
@@ -246,6 +290,7 @@ class VGGTModel:
         )
         stage_started_at = monotonic()
         images = self.load_and_preprocess_images(image_paths)[None]
+        valid_mask = _valid_pixel_masks(image_paths, tuple(images.shape[-2:]))
         _log_stage("preprocess", stage_started_at, self.device, len(image_paths))
         with torch.inference_mode():
             # Omega's public forward hardcodes CUDA autocast. Execute its heads
@@ -283,6 +328,8 @@ class VGGTModel:
             "point_map": unprojected.detach().cpu(),
             "point_conf": depth_conf.squeeze(0).detach().cpu(),
             "point_map_unprojected": unprojected.detach().cpu(),
+            # True where a pixel is real image data; False where preprocessing padded.
+            "valid_mask": valid_mask,
             "runtime": runtime,
         }
 

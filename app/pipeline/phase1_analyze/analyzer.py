@@ -16,6 +16,7 @@ from app.pipeline.phase1_analyze.clustering import cluster_photos_by_room
 from app.pipeline.phase1_analyze.scoring import compute_photo_scores
 from app.pipeline.phase1_analyze.motion_planner import plan_motion_for_cluster
 from app.pipeline.phase1_analyze.shot_planner import build_and_persist_shot_plan
+from app.services.rails_webhook import notify_analysis_complete
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,7 @@ class Phase1Analyzer:
             # Update job status
             job.status = "analysis_complete"
             self.db.commit()
+            notify_analysis_complete(job.project_id)
 
             logger.info(f"Phase 1 complete for job {job_id}: {len(clusters)} room clusters")
             total_run_seconds = time.perf_counter() - run_started_at

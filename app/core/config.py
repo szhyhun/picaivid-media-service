@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     # API
     API_KEY: str = "dev-api-key"
-    CORS_ORIGINS: List[str] = ["http://localhost:3001"]
+    CORS_ORIGINS: List[str] = ["http://localhost:3001", "http://localhost:3003"]
 
     # Database (Postgres is system of record)
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/picaivid_development"
@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     VGGT_TRACK_POINTS_PER_IMAGE: int = 64
     VGGT_TRACK_GROUP_MAX: int = 8
     VGGT_MAX_GEOMETRY_POINTS_PER_PAIR: int = 4096
+    # Raw threshold-free pair evidence. Shared with the calibration sweep so a
+    # re-analysis can reuse model inference and only rerun graph policy.
+    VGGT_PAIR_CACHE_DIR: str = "./tmp_sweep/cache"
+    # Pairwise scene graph. V1's single-global-pass grouping is superseded: it
+    # measured recall 0.32/0.66/0.33 against human labels vs 0.69/0.84/0.65 for V2.
+    # Kept as a switch only for emergency rollback.
+    SCENE_GRAPH_V2: bool = True
     ALLOW_SYNTHETIC_GEOMETRY: bool = False
     VGGT_RELATION_SCORE_THRESHOLD: float = 0.50
     VGGT_BRIDGE_SCORE_THRESHOLD: float = 0.42

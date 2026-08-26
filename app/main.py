@@ -5,6 +5,7 @@ from typing import Dict
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -20,6 +21,7 @@ from app.db.models import (
     SceneComponent,
     SceneComponentMembership,
 )
+from app.db.models.scene_truth import TRUTH_SPLITS, TRUTH_STATUSES, SceneTruthSet
 from app.db.session import get_db
 from app.models.warmup import warmup_core_models
 from app.pipeline.orchestrator import PipelineOrchestrator
@@ -40,6 +42,14 @@ from app.schemas.clip import (
     SourcePhotoInfo,
 )
 from app.schemas.job import JobMessage, JobStatusResponse
+from app.schemas.scene_truth import (
+    RoomInstancePayload,
+    SceneTruthSetPayload,
+    SceneTruthSetResponse,
+    TruthPhoto,
+    TruthSetListResponse,
+    TruthSetSummary,
+)
 from app.services.storage.s3_client import s3_client
 
 setup_logging()
@@ -552,3 +562,354 @@ async def debug_photo_relation(project_id: str, payload: PhotoRelationDebugReque
         left_photo=_serialize_photo_debug(left_photo, geometry_map.get(int(left_photo.id)), membership_map.get(int(left_photo.id))),
         right_photo=_serialize_photo_debug(right_photo, geometry_map.get(int(right_photo.id)), membership_map.get(int(right_photo.id))),
     )
+
+
+def _truth_validation_warnings(
+    payload: SceneTruthSetPayload,
+    valid_photo_keys: set[str],
+    describe: dict[str, str] | None = None,
+) -> list[str]:
+    """Validate a truth set per the Scene-Graph V2 plan (Stage 0, §3.2).
+
+    `describe` maps photo keys to what the labeler actually sees on the tile
+    ("#39"); warnings quoting raw UUIDs are useless while labeling.
+    """
+    def shown(photo_key: str) -> str:
+        if describe and photo_key in describe:
+            return describe[photo_key]
+        return f"unknown photo {photo_key[:8]}"
+
+    warnings: list[str] = []
+    seen: dict[str, str] = {}
+    instance_names: set[str] = set()
+
+    for instance in payload.room_instances:
+        name = (instance.instance or "").strip()
+        if not name:
+            warnings.append("A room instance has no name")
+            continue
+        if name in instance_names:
+            warnings.append(f"Duplicate room instance name: {name}")
+        instance_names.add(name)
+        for photo_key in instance.photo_keys:
+            if photo_key not in valid_photo_keys:
+                warnings.append(f"{name}: photo {shown(photo_key)} does not belong to this listing")
+                continue
+            previous = seen.get(photo_key)
+            if previous is not None:
+                warnings.append(f"Photo {shown(photo_key)} is in two rooms ({previous} and {name})")
+            seen[photo_key] = name
+
+    for group in payload.open_plan_groups:
+        for name in group:
+            if name not in instance_names:
+                warnings.append(f"Open-plan group references unknown room: {name}")
+        if len(group) < 2:
+            warnings.append("An open-plan group needs at least two rooms")
+
+    def _same_open_plan(left: str, right: str) -> bool:
+        """Two rooms the labeler linked as one connected open space."""
+        left_room, right_room = seen.get(left), seen.get(right)
+        if left_room is None or right_room is None:
+            return False
+        return any(left_room in group and right_room in group for group in payload.open_plan_groups)
+
+    def _check_pairs(pairs: list[list[str]], label: str, require_same_room: bool | None, allow_open_plan: bool = False) -> None:
+        for pair in pairs:
+            if len(pair) != 2:
+                warnings.append(f"{label}: entries must be photo pairs")
+                continue
+            left, right = pair[0], pair[1]
+            for photo_key in (left, right):
+                if photo_key not in valid_photo_keys:
+                    warnings.append(f"{label}: photo {shown(photo_key)} does not belong to this listing")
+            if left == right:
+                warnings.append(f"{label}: a photo cannot pair with itself ({shown(left)})")
+                continue
+            same_room = seen.get(left) is not None and seen.get(left) == seen.get(right)
+            # A cinematic pair may legitimately span an open-plan seam (kitchen ->
+            # living room); a duplicate may not, since it is the same view twice.
+            acceptable = same_room or (allow_open_plan and _same_open_plan(left, right))
+            if require_same_room is True and not acceptable:
+                warnings.append(f"{label}: photos {shown(left)} + {shown(right)} are not in the same room instance")
+            if require_same_room is False and same_room:
+                warnings.append(f"{label}: photos {shown(left)} + {shown(right)} are marked must-not-group but share room {seen.get(left)}")
+
+    _check_pairs(payload.duplicates, "Duplicates", True)
+    _check_pairs(payload.preferred_pairs, "Preferred pairs", True, allow_open_plan=True)
+    _check_pairs(payload.must_not_group, "Must-not-group", False)
+    # A story bridge is only meaningful between two *different* rooms.
+    _check_pairs(payload.story_bridges, "Story bridges", False)
+    return warnings
+
+
+def _rails_truth_photos(db: Session, project_id: str) -> tuple[list[TruthPhoto], set[str], int]:
+    """Photos straight from the Rails table, for listings not analyzed yet.
+
+    Labeling only needs the photos; the analysis job just adds the v1 overlay.
+    Ground truth is keyed by the Rails photo id either way, so labels made here
+    stay valid once the listing is analyzed.
+    """
+    rows = db.execute(
+        text(
+            "SELECT id, position, filename, room_type, s3_object_key "
+            "FROM photos WHERE project_id = :project_id "
+            "ORDER BY position NULLS LAST, created_at"
+        ),
+        {"project_id": project_id},
+    ).fetchall()
+    result = [
+        TruthPhoto(
+            photo_key=str(row.id),
+            photo_id=0,  # no job_photos row yet
+            position=int(row.position) if row.position is not None else index,
+            filename=row.filename,
+            thumbnail_url=_signed_url(row.s3_object_key),
+            room_label=row.room_type,
+            predicted_component_id=None,
+        )
+        for index, row in enumerate(rows)
+    ]
+    return result, {photo.photo_key for photo in result}, 0
+
+
+def _truth_photos(db: Session, job: Job) -> tuple[list[TruthPhoto], set[str], int]:
+    photos = (
+        db.query(JobPhoto)
+        .filter(JobPhoto.job_id == job.id)
+        .order_by(JobPhoto.position.asc().nulls_last(), JobPhoto.id.asc())
+        .all()
+    )
+    membership_map = _membership_map(db, int(job.id))
+    component_ids: set[int] = set()
+    result: list[TruthPhoto] = []
+    for index, photo in enumerate(photos):
+        membership = membership_map.get(int(photo.id))
+        component_id = _safe_int(getattr(membership, "scene_component_id", None))
+        if component_id is not None:
+            component_ids.add(component_id)
+        result.append(
+            TruthPhoto(
+                photo_key=str(photo.rails_photo_id),
+                photo_id=int(photo.id),
+                position=_safe_int(photo.position) if photo.position is not None else index,
+                filename=photo.filename,
+                thumbnail_url=_signed_url(photo.s3_uri),
+                room_label=photo.room_override or photo.room_label,
+                predicted_component_id=component_id,
+            )
+        )
+    return result, {photo.photo_key for photo in result}, len(component_ids)
+
+
+def _truth_response(
+    project_id: str,
+    job: Job | None,
+    truth: SceneTruthSet | None,
+    db: Session,
+    warnings: list[str] | None = None,
+) -> SceneTruthSetResponse:
+    photos, valid_keys, predicted_components = (
+        _truth_photos(db, job) if job is not None else _rails_truth_photos(db, project_id)
+    )
+    room_instances = [
+        RoomInstancePayload(
+            instance=entry.get("instance", ""),
+            photo_keys=[str(value) for value in entry.get("photo_keys", [])],
+        )
+        for entry in (truth.room_instances if truth else []) or []
+    ]
+    labeled_keys = {key for entry in room_instances for key in entry.photo_keys}
+    # Labels referencing photos that are no longer in the listing (deleted or
+    # replaced between analysis runs) are reported rather than silently dropped.
+    stale = sorted(labeled_keys - valid_keys)
+    return SceneTruthSetResponse(
+        project_id=project_id,
+        job_id=int(job.id) if job is not None else None,
+        listing_slug=(truth.listing_slug if truth else "") or "",
+        split=(truth.split if truth else "calibration") or "calibration",
+        status=(truth.status if truth else "draft") or "draft",
+        room_instances=room_instances,
+        open_plan_groups=(truth.open_plan_groups if truth else []) or [],
+        duplicates=(truth.duplicates if truth else []) or [],
+        must_not_group=(truth.must_not_group if truth else []) or [],
+        preferred_pairs=(truth.preferred_pairs if truth else []) or [],
+        story_bridges=(truth.story_bridges if truth else []) or [],
+        notes=(truth.notes if truth else "") or "",
+        labeled_by=(truth.labeled_by if truth else "") or "",
+        photos=photos,
+        photo_count=len(photos),
+        labeled_count=len(labeled_keys & valid_keys),
+        predicted_component_count=predicted_components,
+        warnings=warnings or [],
+        stale_photo_keys=stale,
+        revision=int(truth.revision or 1) if truth else 1,
+        updated_at=truth.updated_at.isoformat() if truth is not None and truth.updated_at else None,
+    )
+
+
+def _latest_job(db: Session, project_id: str) -> Job | None:
+    return db.query(Job).filter(Job.project_id == project_id).order_by(Job.created_at.desc()).first()
+
+
+@app.get("/api/projects/{project_id}/truth", response_model=SceneTruthSetResponse)
+async def get_project_truth(project_id: str, db: Session = Depends(get_db)):
+    """Labeling state for a project: photos, saved labels, and current predictions."""
+    job = _latest_job(db, project_id)
+    truth = db.query(SceneTruthSet).filter(SceneTruthSet.project_id == project_id).first()
+    photos, valid_keys, _components = (
+        _truth_photos(db, job) if job is not None else _rails_truth_photos(db, project_id)
+    )
+    if not photos:
+        raise HTTPException(status_code=404, detail="This project has no photos yet")
+    # Surface problems while labeling rather than only when "complete" is refused.
+    warnings: list[str] = []
+    if truth is not None:
+        stored = SceneTruthSetPayload(
+            listing_slug=truth.listing_slug or "",
+            split=truth.split or "calibration",
+            status=truth.status or "draft",
+            room_instances=[
+                RoomInstancePayload(instance=entry.get("instance", ""),
+                                    photo_keys=[str(v) for v in entry.get("photo_keys", [])])
+                for entry in (truth.room_instances or [])
+            ],
+            open_plan_groups=truth.open_plan_groups or [],
+            duplicates=truth.duplicates or [],
+            must_not_group=truth.must_not_group or [],
+            preferred_pairs=truth.preferred_pairs or [],
+            story_bridges=truth.story_bridges or [],
+            notes=truth.notes or "",
+            labeled_by=truth.labeled_by or "",
+        )
+        describe = {photo.photo_key: f"#{photo.position}" for photo in photos}
+        warnings = _truth_validation_warnings(stored, valid_keys, describe)
+    return _truth_response(project_id, job, truth, db, warnings)
+
+
+@app.put("/api/projects/{project_id}/truth", response_model=SceneTruthSetResponse)
+async def put_project_truth(project_id: str, payload: SceneTruthSetPayload, db: Session = Depends(get_db)):
+    """Upsert the human ground truth for a project (survives analysis re-runs)."""
+    job = _latest_job(db, project_id)
+    if payload.split not in TRUTH_SPLITS:
+        raise HTTPException(status_code=422, detail=f"split must be one of {TRUTH_SPLITS}")
+    if payload.status not in TRUTH_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be one of {TRUTH_STATUSES}")
+
+    _photos, valid_photo_keys, _components = (
+        _truth_photos(db, job) if job is not None else _rails_truth_photos(db, project_id)
+    )
+    if not valid_photo_keys:
+        raise HTTPException(status_code=404, detail="This project has no photos yet")
+    describe = {photo.photo_key: f"#{photo.position}" for photo in _photos}
+    warnings = _truth_validation_warnings(payload, valid_photo_keys, describe)
+    if payload.status == "complete" and warnings:
+        raise HTTPException(status_code=422, detail={"error": "Cannot mark complete while warnings remain", "warnings": warnings})
+
+    truth = db.query(SceneTruthSet).filter(SceneTruthSet.project_id == project_id).first()
+    if truth is None:
+        truth = SceneTruthSet(project_id=project_id, revision=0)
+        db.add(truth)
+
+    room_instances = [
+        {"instance": entry.instance.strip(), "photo_keys": sorted(set(entry.photo_keys))}
+        for entry in payload.room_instances
+        if entry.instance and entry.instance.strip()
+    ]
+    truth.last_job_id = int(job.id) if job is not None else truth.last_job_id
+    truth.listing_slug = payload.listing_slug.strip()
+    truth.split = payload.split
+    truth.status = payload.status
+    truth.room_instances = room_instances
+    truth.open_plan_groups = [list(group) for group in payload.open_plan_groups]
+    truth.duplicates = [sorted(pair) for pair in payload.duplicates if len(pair) == 2]
+    truth.must_not_group = [sorted(pair) for pair in payload.must_not_group if len(pair) == 2]
+    truth.preferred_pairs = [sorted(pair) for pair in payload.preferred_pairs if len(pair) == 2]
+    truth.story_bridges = [sorted(pair) for pair in payload.story_bridges if len(pair) == 2]
+    truth.notes = payload.notes
+    truth.labeled_by = payload.labeled_by.strip()
+    truth.photo_count = len(valid_photo_keys)
+    truth.labeled_count = len({key for entry in room_instances for key in entry["photo_keys"]} & valid_photo_keys)
+    truth.revision = int(truth.revision or 0) + 1
+    db.commit()
+    db.refresh(truth)
+    return _truth_response(project_id, job, truth, db, warnings)
+
+
+@app.get("/api/truth/sets", response_model=TruthSetListResponse)
+async def list_truth_sets(db: Session = Depends(get_db)):
+    """Corpus progress across every labeled listing."""
+    rows = db.query(SceneTruthSet).order_by(SceneTruthSet.updated_at.desc().nulls_last()).all()
+    summaries = [
+        TruthSetSummary(
+            project_id=str(row.project_id),
+            last_job_id=_safe_int(row.last_job_id),
+            listing_slug=row.listing_slug or "",
+            split=row.split or "calibration",
+            status=row.status or "draft",
+            photo_count=int(row.photo_count or 0),
+            labeled_count=int(row.labeled_count or 0),
+            room_count=len(row.room_instances or []),
+            revision=int(row.revision or 1),
+            updated_at=row.updated_at.isoformat() if row.updated_at else None,
+        )
+        for row in rows
+    ]
+    return TruthSetListResponse(
+        sets=summaries,
+        total_labeled_photos=sum(summary.labeled_count for summary in summaries),
+        complete_count=sum(1 for summary in summaries if summary.status == "complete"),
+    )
+
+
+@app.get("/api/projects/{project_id}/truth/export")
+async def export_project_truth(project_id: str, db: Session = Depends(get_db)):
+    """Fixture JSON in the Scene-Graph V2 plan schema.
+
+    Emits stable rails_photo_ids as the join key, with 0-based upload positions
+    and filenames alongside for human readability.
+    """
+    job = _latest_job(db, project_id)
+    truth = db.query(SceneTruthSet).filter(SceneTruthSet.project_id == project_id).first()
+    if truth is None:
+        raise HTTPException(status_code=404, detail="No ground truth has been saved for this project")
+
+    photos, valid_keys, _components = (
+        _truth_photos(db, job) if job is not None else _rails_truth_photos(db, project_id)
+    )
+    position_by_key = {photo.photo_key: photo.position for photo in photos}
+
+    def _sorted_keys(keys: list) -> list[str]:
+        known = [str(key) for key in keys if str(key) in position_by_key]
+        return sorted(known, key=lambda key: position_by_key[key])
+
+    return {
+        "listing": truth.listing_slug or project_id,
+        "project_id": project_id,
+        "job_ids": [int(job.id)] if job is not None else [],
+        "split": truth.split,
+        "revision": int(truth.revision or 1),
+        "photos": [
+            {"rails_photo_id": photo.photo_key, "position": photo.position, "filename": photo.filename}
+            for photo in photos
+        ],
+        "room_instances": [
+            {
+                "instance": entry.get("instance", ""),
+                "rails_photo_ids": _sorted_keys(entry.get("photo_keys", [])),
+                "positions": [position_by_key[key] for key in _sorted_keys(entry.get("photo_keys", []))],
+            }
+            for entry in (truth.room_instances or [])
+        ],
+        "open_plan_groups": truth.open_plan_groups or [],
+        "duplicates": [_sorted_keys(pair) for pair in (truth.duplicates or [])],
+        "must_not_group": [_sorted_keys(pair) for pair in (truth.must_not_group or [])],
+        "preferred_cinematic_pairs": [_sorted_keys(pair) for pair in (truth.preferred_pairs or [])],
+        "story_bridges": [_sorted_keys(pair) for pair in (truth.story_bridges or [])],
+        "notes": truth.notes or "",
+        "labeled_by": truth.labeled_by or "",
+        "stale_photo_keys": sorted(
+            {key for entry in (truth.room_instances or []) for key in entry.get("photo_keys", [])} - valid_keys
+        ),
+        "tool": "picaivid scene-truth debug page",
+    }

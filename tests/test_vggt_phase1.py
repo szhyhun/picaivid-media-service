@@ -151,6 +151,38 @@ class VGGTPhase1Tests(unittest.TestCase):
         self.assertTrue(relation.is_connected)
         self.assertGreater(relation.relation_confidence, 0.45)
 
+    def test_shared_omega_surface_connects_scene_without_unsafe_interpolation(self) -> None:
+        left = _PhotoArrays(
+            extrinsic=np.hstack((np.eye(3), np.zeros((3, 1)))), intrinsic=np.eye(3),
+            depth=np.ones((2, 2)), depth_conf=np.ones((2, 2)),
+            point_map=np.ones((2, 2, 3)), point_conf=np.ones((2, 2)), world_points=np.ones((2, 2, 3)),
+        )
+        angle = np.deg2rad(83.0)
+        rotation = np.array([
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ])
+        right = _PhotoArrays(
+            extrinsic=np.hstack((rotation, np.array([[0.03], [0.0], [0.0]]))), intrinsic=np.eye(3),
+            depth=np.ones((2, 2)), depth_conf=np.ones((2, 2)),
+            point_map=np.ones((2, 2, 3)), point_conf=np.ones((2, 2)), world_points=np.ones((2, 2, 3)),
+        )
+        measured = {
+            "visible_fraction": 0.377,
+            "frustum_fraction": 0.76,
+            "depth_consistency": 0.579,
+            "reprojection_error": 0.044,
+            "median_image_dx": 100.0,
+            "median_image_dy": 5.0,
+        }
+        with patch.object(vggt_pipeline, "_project_metrics", side_effect=[measured, measured]):
+            relation = _compute_pair_relations({1: left, 2: right}, {1: "living room", 2: "living room"})[0]
+
+        self.assertEqual(relation.continuity_type, "same_scene")
+        self.assertTrue(relation.is_connected)
+        self.assertFalse(relation.is_bridge_edge)
+
     def test_auto_room_labels_do_not_split_geometry_group(self) -> None:
         photos = [
             SimpleNamespace(room_override=None, room_label="dining room", manual_metadata={}),

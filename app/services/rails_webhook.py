@@ -7,6 +7,24 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def notify_analysis_complete(project_id: str) -> bool:
+    """Notify Rails that the renderer-neutral cinematic plan is ready."""
+    if not settings.RAILS_WEBHOOK_URL:
+        logger.warning("RAILS_WEBHOOK_URL not configured, skipping webhook")
+        return False
+
+    url = f"{settings.RAILS_WEBHOOK_URL}/webhooks/media_service/analysis-complete"
+
+    try:
+        response = httpx.post(url, json={"project_id": project_id}, timeout=10.0)
+        response.raise_for_status()
+        logger.info(f"Notified Rails of analysis complete for project {project_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to notify Rails of analysis completion: {e}")
+        return False
+
+
 def notify_render_complete(project_id: str) -> bool:
     """Notify Rails that rendering is complete.
 

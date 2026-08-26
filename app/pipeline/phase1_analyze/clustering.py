@@ -57,6 +57,7 @@ def cluster_photos_by_room(
     photo_map: dict[int, JobPhoto] = {}
     quality_scores: dict[int, float] = {}
     editorial_roles: dict[int, str] = {}
+    embeddings: Dict[int, list] = {}
     for photo in active_photos:
         image = preloaded_images.get(photo.id) if preloaded_images is not None else None
         if image is None:
@@ -73,6 +74,8 @@ def cluster_photos_by_room(
         positions.append(int(photo.position or 0))
         photo_map[int(photo.id)] = photo
         quality_scores[int(photo.id)] = float(photo.final_score or 0.0)
+        if photo.embedding:
+            embeddings[int(photo.id)] = photo.embedding
         editorial_roles[int(photo.id)] = str((photo.manual_metadata or {}).get("editorial_role", "auto"))
         photo.room_cluster_id = None
         photo.cluster_order = None
@@ -86,6 +89,7 @@ def cluster_photos_by_room(
         s3_client=s3_client,
         quality_scores=quality_scores,
         editorial_roles=editorial_roles,
+        embeddings=embeddings,
     )
 
     _replace_scene_state(

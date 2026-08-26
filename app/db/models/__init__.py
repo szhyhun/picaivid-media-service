@@ -5,6 +5,7 @@ from app.db.models.room_cluster import RoomCluster
 from app.db.models.analysis_result import AnalysisResult
 from app.db.models.clip import Clip
 from app.db.models.timeline import Timeline, TimelineClip
+from app.db.models.scene_truth import SceneTruthSet
 from app.db.models.scene_component import (
     SceneComponent,
     SceneComponentMembership,
@@ -24,4 +25,5 @@ __all__ = [
     "SceneComponentMembership",
     "PhotoSceneGeometry",
     "PhotoRelation",
+    "SceneTruthSet",
 ]
