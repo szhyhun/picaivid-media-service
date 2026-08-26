@@ -76,9 +76,11 @@ aws ssm send-command \
 
 The worker is intended to be started and stopped on demand. Existing helper scripts:
 
+- [scripts/aws/gpu.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu.sh)
 - [scripts/aws/gpu-start.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-start.sh)
 - [scripts/aws/gpu-stop.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-stop.sh)
 - [scripts/aws/gpu-status.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-status.sh)
+- [docs/GPU_OPERATIONS.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/GPU_OPERATIONS.md)
 
 They assume:
 
@@ -93,9 +95,9 @@ export AWS_PROFILE=picaivid-admin
 export AWS_REGION=us-west-2
 export GPU_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx
 
-./scripts/aws/gpu-start.sh
-./scripts/aws/gpu-status.sh
-./scripts/aws/gpu-stop.sh
+./scripts/aws/gpu.sh start
+./scripts/aws/gpu.sh status
+./scripts/aws/gpu.sh stop
 ```
 
 ## Required media env values

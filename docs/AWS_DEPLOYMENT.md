@@ -60,9 +60,11 @@ The checkpoint and repo archive are already staged in S3. The remaining work is 
 
 Use the existing lifecycle helpers after the instance exists:
 
+- [gpu.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu.sh)
 - [gpu-start.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-start.sh)
 - [gpu-stop.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-stop.sh)
 - [gpu-status.sh](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/scripts/aws/gpu-status.sh)
+- [GPU_OPERATIONS.md](/Users/serhiizhyhun/Desktop/projects/picaivid/picaivid-media-service/docs/GPU_OPERATIONS.md)
 
 ## Bootstrap checklist
 
