@@ -19,6 +19,12 @@ def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluste
     Phase 2 can consume this plan without taking a dependency on a renderer or a new
     database table.
     """
+    # The session is created with autoflush=False, and plan_motion_for_cluster()
+    # only db.add()s its AnalysisResult rows. Without an explicit flush the query
+    # below returns none of them, `analyses` comes back empty, and the persistence
+    # loop silently `continue`s on every cluster -- producing a job with no shots.
+    db.flush()
+
     photos = db.query(JobPhoto).filter(JobPhoto.job_id == job.id).all()
     photos_by_cluster: dict[int, list[JobPhoto]] = defaultdict(list)
     photo_map = {int(photo.id): photo for photo in photos}
