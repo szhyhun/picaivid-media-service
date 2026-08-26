@@ -165,7 +165,38 @@ class VGGTPhase1Tests(unittest.TestCase):
         self.assertEqual(shot_planner._hero_photo(cluster, [auto, hero]).id, 2)
         shot = shot_planner._build_shot(cluster, [hero], None)
         self.assertEqual(shot["shot_type"], "single_image_move")
+        self.assertEqual(shot["shot_score_kind"], "image_quality")
+        self.assertEqual(shot["shot_score"], 0.1)
         self.assertTrue(shot["rejection_reasons"])
+
+    def test_verified_pair_surfaces_pair_quality_and_raw_evidence(self) -> None:
+        photos = [
+            SimpleNamespace(id=1, final_score=0.8, position=0, manual_metadata={}),
+            SimpleNamespace(id=2, final_score=0.7, position=1, manual_metadata={}),
+        ]
+        cluster = SimpleNamespace(
+            hero_photo_id=1, room_type="living room", sfm_eligible=False,
+            geometry_confidence=0.4, overlap_score=0.5, recommended_motion="micro_push_in",
+            recommended_duration=3.0, id=8, scene_component_id=2,
+        )
+        relation = SimpleNamespace(
+            continuity_type="same_scene", relation_confidence=0.8, overlap_score=0.5,
+            reprojection_score=0.9, direction_dx=12.0, direction_dy=1.0,
+            debug_metrics={
+                "pair_score": 0.83, "depth_ok_forward": 0.5,
+                "depth_ok_backward": 0.45, "rotation_degrees": 72.0,
+                "conf_pair": 11.0, "bl_over_depth": 0.8,
+            },
+        )
+
+        shot = shot_planner._build_shot(cluster, photos, None, {(1, 2): relation})
+
+        self.assertEqual(shot["shot_type"], "verified_pair")
+        self.assertEqual(shot["shot_score_kind"], "pair_quality")
+        self.assertEqual(shot["shot_score"], 0.83)
+        evidence = shot["evidence"]["geometry_connections"][0]
+        self.assertEqual(evidence["rotation_degrees"], 72.0)
+        self.assertEqual(evidence["conf_pair"], 11.0)
 
     def test_similar_neighbor_is_marked_skip_but_retained(self) -> None:
         first = {

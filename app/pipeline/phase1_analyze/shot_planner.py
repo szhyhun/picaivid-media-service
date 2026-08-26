@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models import AnalysisResult, Job, JobPhoto, PhotoRelation, RoomCluster
 
 
-PLANNER_VERSION = "v2.2-paired-scene-map"
+PLANNER_VERSION = "v2.3-typed-shot-score"
 
 
 def build_and_persist_shot_plan(db: Session, job: Job, clusters: list[RoomCluster]) -> dict[str, Any]:
@@ -107,13 +107,16 @@ def _build_shot(
     motion = analysis.recommended_motion if analysis is not None else cluster.recommended_motion
     duration = analysis.recommended_duration if analysis is not None else cluster.recommended_duration
     confidence = float(cluster.geometry_confidence or 0.0)
-    multi_view = bool(cluster.sfm_eligible and len(photos) > 1 and confidence >= 0.56)
+    # `sfm_eligible` is the motion-authorization decision. Do not apply the old
+    # V1 same-scene threshold to V2's differently-scaled component diagnostic.
+    multi_view = bool(cluster.sfm_eligible and len(photos) > 1)
     # A verified two-photo group is still two real photographs even when generated
     # camera motion between them is not authorized (V2 withholds interpolation
     # until transition ground truth exists). Reporting "single image move" for it
     # was simply wrong: the shot contains two images and cuts between them.
     verified_pair = bool(not multi_view and len(photos) > 1)
     connection_evidence = _connection_evidence(photos, relations or {})
+    shot_score, shot_score_kind = _shot_score(connection_evidence, hero)
     return {
         "cluster_id": int(cluster.id),
         "scene_component_id": int(cluster.scene_component_id) if cluster.scene_component_id is not None else None,
@@ -130,6 +133,8 @@ def _build_shot(
         "duration_seconds": float(duration or 3.0),
         "transition_type": "opening",
         "confidence": round(confidence, 4),
+        "shot_score": round(shot_score, 4) if shot_score is not None else None,
+        "shot_score_kind": shot_score_kind,
         "skip_recommended": False,
         "skip_reason": None,
         "duplicate_of_cluster_id": None,
@@ -257,6 +262,7 @@ def _connection_evidence(
         relation = relations.get(pair)
         if relation is None:
             continue
+        metrics = relation.debug_metrics or {}
         evidence.append({
             "from_photo_id": int(left.id),
             "to_photo_id": int(right.id),
@@ -265,8 +271,36 @@ def _connection_evidence(
             "surface_overlap": round(float(relation.overlap_score or 0.0), 4),
             "reprojection_score": round(float(relation.reprojection_score or 0.0), 4),
             "image_motion": [round(float(relation.direction_dx or 0.0), 2), round(float(relation.direction_dy or 0.0), 2)],
+            "pair_score": (
+                round(float(metrics["pair_score"]), 4)
+                if metrics.get("pair_score") is not None
+                else None
+            ),
+            "depth_ok_forward": metrics.get("depth_ok_forward"),
+            "depth_ok_backward": metrics.get("depth_ok_backward"),
+            "rotation_degrees": metrics.get("rotation_degrees"),
+            "conf_pair": metrics.get("conf_pair"),
+            "bl_over_depth": metrics.get("bl_over_depth"),
         })
     return evidence
+
+
+def _shot_score(
+    connection_evidence: list[dict[str, Any]],
+    hero: JobPhoto,
+) -> tuple[float | None, str]:
+    """Return an explicitly typed editorial score, never a fake confidence."""
+    pair_scores = [
+        float(edge["pair_score"])
+        for edge in connection_evidence
+        if edge.get("pair_score") is not None
+    ]
+    if pair_scores:
+        return max(pair_scores), "pair_quality"
+    quality = hero.final_score
+    if quality is not None:
+        return float(quality), "image_quality"
+    return None, "unavailable"
 
 
 def _hero_photo(cluster: RoomCluster, photos: list[JobPhoto]) -> JobPhoto:
