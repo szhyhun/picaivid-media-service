@@ -168,18 +168,27 @@ def _build_shot(
 def _order_component_blocks(
     candidates: list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]],
 ) -> list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]]:
-    blocks: dict[tuple[str, int], list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]]] = defaultdict(list)
+    # Story stage is the primary partition and a geometry component may not drag a
+    # shot out of its stage: front and rear exteriors frequently reconstruct into
+    # one component, and grouping on the component alone let the rear of the house
+    # be emitted before the front. Component grouping (and component-local
+    # sequence order) therefore applies only *within* a single story stage.
+    staged: dict[int, list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]]] = defaultdict(list)
     for candidate in candidates:
-        cluster = candidate[1]
-        component_id = int(cluster.scene_component_id) if cluster.scene_component_id is not None else int(cluster.id)
-        kind = "component" if cluster.scene_component_id is not None else "cluster"
-        blocks[(kind, component_id)].append(candidate)
-    ordered_blocks = sorted(blocks.values(), key=lambda block: min(candidate[0] for candidate in block))
-    return [
-        candidate
-        for block in ordered_blocks
-        for candidate in sorted(block, key=lambda item: (int(item[1].sequence_order or 0), int(item[1].id)))
-    ]
+        staged[int(candidate[0][0])].append(candidate)
+
+    ordered: list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]] = []
+    for stage in sorted(staged):
+        blocks: dict[tuple[str, int], list[tuple[tuple[Any, ...], RoomCluster, dict[str, Any]]]] = defaultdict(list)
+        for candidate in staged[stage]:
+            cluster = candidate[1]
+            component_id = int(cluster.scene_component_id) if cluster.scene_component_id is not None else int(cluster.id)
+            kind = "component" if cluster.scene_component_id is not None else "cluster"
+            blocks[(kind, component_id)].append(candidate)
+        ordered_blocks = sorted(blocks.values(), key=lambda block: min(candidate[0] for candidate in block))
+        for block in ordered_blocks:
+            ordered.extend(sorted(block, key=lambda item: (int(item[1].sequence_order or 0), int(item[1].id))))
+    return ordered
 
 
 def _relation_between_shots(
@@ -350,11 +359,18 @@ def _story_role(cluster: RoomCluster, photos: list[JobPhoto], hero: JobPhoto) ->
     if "closing" in roles:
         return "closing"
     label = (cluster.room_type or "scene").lower()
-    if "drone" in label:
+    if "drone" in label or "aerial" in label:
         return "drone_opener"
+    # Rear/side outdoor space must be tested before the generic "exterior" token.
+    # Otherwise "exterior back" matches "exterior" and the tour opens on the back
+    # of the house; only front-facing exteriors may take the front_exterior slot.
+    if any(token in label for token in ("patio", "deck", "pool", "yard", "garden", "outdoor")) and "front" not in label:
+        return "outdoor_payoff"
+    if ("back" in label or "rear" in label or "side" in label) and "front" not in label:
+        return "outdoor_payoff"
     if any(token in label for token in ("front", "exterior", "facade")):
         return "front_exterior"
-    if any(token in label for token in ("entry", "foyer", "hall", "stair")):
+    if any(token in label for token in ("entry", "entrance", "foyer", "hall", "stair")):
         return "approach_entry"
     if any(token in label for token in ("living", "kitchen", "dining", "great room")):
         return "social_hero" if _editorial_role(hero) == "hero" else "social_room"
