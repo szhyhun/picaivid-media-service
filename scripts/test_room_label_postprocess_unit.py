@@ -15,15 +15,13 @@ class DummyPhoto:
     position: int
     room_label: str
     room_override: str | None = None
-    depth_variance: float | None = None
 
 
 @dataclass
 class DummySimilarity:
     photo_a_id: int
     photo_b_id: int
-    geometric_inliers: int
-    geometric_score: float
+    relation_confidence: float
     is_connected: int = 1
 
 
@@ -47,12 +45,12 @@ class _FakeDB:
 
 
 def test_relabel_front_to_aerial_when_bracketed() -> None:
-    photos = [DummyPhoto(1, 0, "front yard", depth_variance=0.08)]
-    photos.append(DummyPhoto(2, 1, "aerial view", depth_variance=0.09))
-    photos.append(DummyPhoto(3, 2, "front yard", depth_variance=0.08))
-    photos.append(DummyPhoto(4, 3, "aerial view", depth_variance=0.09))
+    photos = [DummyPhoto(1, 0, "front yard")]
+    photos.append(DummyPhoto(2, 1, "aerial view"))
+    photos.append(DummyPhoto(3, 2, "front yard"))
+    photos.append(DummyPhoto(4, 3, "aerial view"))
     for i in range(5, 13):
-        photos.append(DummyPhoto(i, i - 1, "living room", depth_variance=0.04))
+        photos.append(DummyPhoto(i, i - 1, "living room"))
     analyzer = Phase1Analyzer(db=None)  # db not used by this method
     analyzer._postprocess_exterior_room_labels(photos)  # noqa: SLF001
 
@@ -61,12 +59,12 @@ def test_relabel_front_to_aerial_when_bracketed() -> None:
 
 def test_relabel_late_front_to_backyard_with_context() -> None:
     photos = [
-        DummyPhoto(10, 0, "front yard", depth_variance=0.08),
-        DummyPhoto(11, 1, "entrance", depth_variance=0.05),
-        DummyPhoto(12, 2, "living room", depth_variance=0.04),
-        DummyPhoto(13, 3, "patio", depth_variance=0.06),
-        DummyPhoto(14, 4, "backyard", depth_variance=0.06),
-        DummyPhoto(15, 5, "front yard", depth_variance=0.06),
+        DummyPhoto(10, 0, "front yard"),
+        DummyPhoto(11, 1, "entrance"),
+        DummyPhoto(12, 2, "living room"),
+        DummyPhoto(13, 3, "patio"),
+        DummyPhoto(14, 4, "backyard"),
+        DummyPhoto(15, 5, "front yard"),
     ]
     analyzer = Phase1Analyzer(db=None)
     analyzer._postprocess_exterior_room_labels(photos)  # noqa: SLF001
@@ -76,11 +74,11 @@ def test_relabel_late_front_to_backyard_with_context() -> None:
 
 def test_respect_manual_override() -> None:
     photos = [
-        DummyPhoto(20, 0, "front yard", room_override="front yard", depth_variance=0.08),
-        DummyPhoto(21, 1, "aerial view", depth_variance=0.09),
-        DummyPhoto(22, 2, "front yard", depth_variance=0.08),
-        DummyPhoto(23, 3, "aerial view", depth_variance=0.09),
-        DummyPhoto(24, 4, "front yard", depth_variance=0.08),
+        DummyPhoto(20, 0, "front yard", room_override="front yard"),
+        DummyPhoto(21, 1, "aerial view"),
+        DummyPhoto(22, 2, "front yard"),
+        DummyPhoto(23, 3, "aerial view"),
+        DummyPhoto(24, 4, "front yard"),
     ]
     analyzer = Phase1Analyzer(db=None)
     analyzer._postprocess_exterior_room_labels(photos)  # noqa: SLF001
@@ -90,11 +88,11 @@ def test_respect_manual_override() -> None:
 
 def test_relabel_interior_patio_to_kitchen_by_sequence_context() -> None:
     photos = [
-        DummyPhoto(100, 10, "living room", depth_variance=0.04),
-        DummyPhoto(101, 11, "patio", depth_variance=0.04),
-        DummyPhoto(102, 12, "kitchen", depth_variance=0.04),
-        DummyPhoto(103, 13, "kitchen", depth_variance=0.05),
-        DummyPhoto(104, 14, "dining room", depth_variance=0.05),
+        DummyPhoto(100, 10, "living room"),
+        DummyPhoto(101, 11, "patio"),
+        DummyPhoto(102, 12, "kitchen"),
+        DummyPhoto(103, 13, "kitchen"),
+        DummyPhoto(104, 14, "dining room"),
     ]
     analyzer = Phase1Analyzer(db=None)
     analyzer._postprocess_interior_room_labels(photos)  # noqa: SLF001
@@ -104,11 +102,13 @@ def test_relabel_interior_patio_to_kitchen_by_sequence_context() -> None:
 
 def test_relabel_living_to_dining_by_strong_adjacent_geometry() -> None:
     photos = [
-        DummyPhoto(200, 20, "living room", depth_variance=0.05),
-        DummyPhoto(201, 21, "dining room", depth_variance=0.05),
-        DummyPhoto(202, 22, "bedroom", depth_variance=0.05),
+        DummyPhoto(200, 20, "living room"),
+        DummyPhoto(201, 21, "dining room"),
+        DummyPhoto(202, 22, "bedroom"),
     ]
-    similarities = [DummySimilarity(photo_a_id=200, photo_b_id=201, geometric_inliers=24, geometric_score=0.44)]
+    similarities = [
+        DummySimilarity(photo_a_id=200, photo_b_id=201, relation_confidence=0.72)
+    ]
     analyzer = Phase1Analyzer(db=_FakeDB(similarities))
     analyzer._postprocess_interior_room_labels(photos, job_id=1)  # noqa: SLF001
 

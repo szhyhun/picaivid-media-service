@@ -52,7 +52,7 @@ Use:
 The worker needs:
 
 - CUDA
-- the VGGT commercial checkpoint on disk
+- the VGGT-Omega checkpoint on disk
 - repo bootstrap complete
 - `/etc/picaivid/media-worker.env`
 
@@ -78,9 +78,9 @@ cd /srv/picaivid/picaivid-media-service
 Hydrate assets:
 
 ```bash
-sudo mkdir -p /srv/picaivid/third_party/vggt/checkpoints
-aws s3 sync s3://picaivid-prod-media/artifacts/vggt/repo /srv/picaivid/third_party/vggt
-aws s3 sync s3://picaivid-prod-media/artifacts/vggt/checkpoints /srv/picaivid/third_party/vggt/checkpoints
+sudo mkdir -p /srv/picaivid/third_party/vggt-omega /srv/picaivid/models
+aws s3 sync s3://picaivid-prod-media/artifacts/vggt/repo /srv/picaivid/third_party/vggt-omega
+aws s3 sync s3://picaivid-prod-media/artifacts/vggt/checkpoints /srv/picaivid/models
 ```
 
 Start services:

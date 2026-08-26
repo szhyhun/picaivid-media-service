@@ -1,7 +1,7 @@
 """Unit coverage for the V2 candidate/verification primitives.
 
 Covers the defects found in review: canonical pair ordering, cache-key behaviour,
-JSON-serializable evidence, tiered nomination, determinism, and mask placement.
+JSON-serializable evidence, deterministic nomination, and mask placement.
 """
 from __future__ import annotations
 
@@ -17,8 +17,6 @@ from PIL import Image
 from app.pipeline.phase1_analyze.candidate_pairs import (
     CandidatePair,
     nominate,
-    split_tiers,
-    unconnected_photos,
 )
 from app.pipeline.phase1_analyze.pairwise_verify import (
     DirectionEvidence,
@@ -68,24 +66,6 @@ class CandidateNominationTests(unittest.TestCase):
     def test_missing_labels_do_not_nominate(self):
         photos = [_photo(1, 0, None), _photo(2, 5, None)]
         self.assertEqual(nominate(photos, adjacency=0), [])
-
-
-class TierTests(unittest.TestCase):
-    def test_global_only_pairs_are_fallback(self):
-        primary = CandidatePair(1, 2, {"clip"})
-        globalish = CandidatePair(3, 4, {"global_rank", "global_frustum"})
-        both = CandidatePair(5, 6, {"label", "global_rank"})
-        self.assertEqual(primary.tier, "primary")
-        self.assertEqual(globalish.tier, "fallback")
-        self.assertEqual(both.tier, "primary", "a primary source wins over a global one")
-        first, second = split_tiers([primary, globalish, both])
-        self.assertEqual([c.key for c in first], [(1, 2), (5, 6)])
-        self.assertEqual([c.key for c in second], [(3, 4)])
-
-    def test_unconnected_photos_reports_escalation_targets(self):
-        candidates = [CandidatePair(1, 2, {"clip"}), CandidatePair(3, 4, {"clip"})]
-        still_alone = unconnected_photos(candidates, {(1, 2)}, [1, 2, 3, 4])
-        self.assertEqual(still_alone, {3, 4})
 
 
 class CanonicalOrderTests(unittest.TestCase):
@@ -457,24 +437,13 @@ class MotionAuthorizationTests(unittest.TestCase):
 
     def test_v2_keeps_directional_ids_aligned_and_only_connects_direct_gate_edges(self):
         from app.pipeline.phase1_analyze import vggt_pipeline
-        from app.pipeline.phase1_analyze.vggt_pipeline import _PhotoArrays
 
         with tempfile.TemporaryDirectory(prefix="v2-graph-") as directory:
             paths: dict[int, str] = {}
-            arrays: dict[int, _PhotoArrays] = {}
             for photo_id, value in ((1, 20), (2, 120), (3, 220)):
                 path = os.path.join(directory, f"{photo_id}.png")
                 Image.fromarray(np.full((16, 16, 3), value, dtype=np.uint8)).save(path)
                 paths[photo_id] = path
-                arrays[photo_id] = _PhotoArrays(
-                    extrinsic=np.hstack((np.eye(3), np.zeros((3, 1)))),
-                    intrinsic=np.eye(3),
-                    depth=np.ones((2, 2)),
-                    depth_conf=np.ones((2, 2)),
-                    point_map=np.ones((2, 2, 3)),
-                    point_conf=np.ones((2, 2)),
-                    world_points=np.ones((2, 2, 3)),
-                )
 
             candidates = [
                 CandidatePair(1, 2, {"clip"}),
@@ -489,14 +458,14 @@ class MotionAuthorizationTests(unittest.TestCase):
                 patch.object(vggt_pipeline.vggt_model, "runtime_metadata", return_value={}),
                 patch.object(vggt_pipeline, "_release_accelerator_cache"),
             ):
-                relations, components = vggt_pipeline._v2_scene_graph(
+                relations, components, _evidence, stats = vggt_pipeline._v2_scene_graph(
                     paths,
                     {1: "bedroom", 2: "bedroom", 3: "bedroom"},
                     {1: 1, 2: 2, 3: 3},
-                    arrays,
                 )
 
             self.assertEqual(components, [[1, 2, 3]])
+            self.assertEqual(stats["coordinate_scope"], "component_local")
             indirect = next(
                 relation for relation in relations
                 if {relation.photo_a_id, relation.photo_b_id} == {1, 3}

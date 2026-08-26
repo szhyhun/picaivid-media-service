@@ -24,7 +24,7 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the real VGGT-1B-Commercial Phase 1 pipeline.")
+    parser = argparse.ArgumentParser(description="Run the real VGGT-Omega Phase 1 pipeline.")
     parser.add_argument("--images", required=True, type=Path, help="Directory containing owned listing photos")
     parser.add_argument("--count", required=True, type=int, help="Exact number of ordered photos to analyze")
     parser.add_argument("--output", type=Path, help="Optional JSON result path")
@@ -45,8 +45,11 @@ def main() -> int:
         positions=list(range(len(paths))),
         job_id=0,
     )
-    if not geometries or any(geometry.local_metrics.get("runtime", {}).get("model") != "VGGT-1B-Commercial" for geometry in geometries):
-        raise RuntimeError("VGGT did not produce real commercial-model geometry")
+    if not geometries or any(
+        geometry.local_metrics.get("runtime", {}).get("model") != "VGGT-Omega-1B-512"
+        for geometry in geometries
+    ):
+        raise RuntimeError("VGGT did not produce real Omega geometry")
     result = {
         "photo_count": len(paths),
         "runtime": geometries[0].local_metrics.get("runtime", {}),

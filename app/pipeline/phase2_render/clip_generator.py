@@ -258,13 +258,13 @@ Photorealistic."""
 def _camera_direction_recommendation(
     dx: float | None,
     dy: float | None,
-    geometric_inliers: int | None = None,
-    min_verified_inliers: int = 8,
+    relation_confidence: float | None = None,
+    min_relation_confidence: float = 0.45,
 ) -> str:
     """Translate content-shift direction into camera motion recommendation."""
     if (
-        geometric_inliers is None
-        or geometric_inliers < min_verified_inliers
+        relation_confidence is None
+        or relation_confidence < min_relation_confidence
         or dx is None
         or dy is None
     ):
@@ -327,8 +327,7 @@ def _build_direction_prompt_guidance(
                 SELECT
                     direction_dx,
                     direction_dy,
-                    relation_confidence,
-                    track_support
+                    relation_confidence
                 FROM photo_relations
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a_id
@@ -359,15 +358,13 @@ def _build_direction_prompt_guidance(
             dy = float(dy)
 
         relation_confidence = row[2]
-        track_support = row[3]
         rec = _camera_direction_recommendation(
             dx,
             dy,
-            int(round(float(track_support or 0.0) * 100.0)) if track_support is not None else None,
+            float(relation_confidence) if relation_confidence is not None else None,
         )
         confidence_txt = f"{float(relation_confidence):.3f}" if relation_confidence is not None else "N/A"
-        support_txt = f"{float(track_support):.3f}" if track_support is not None else "N/A"
-        lines.append(f"{from_id} -> {to_id}: {rec} (relation_confidence={confidence_txt}, track_support={support_txt}).")
+        lines.append(f"{from_id} -> {to_id}: {rec} (relation_confidence={confidence_txt}).")
 
     if not lines:
         return ""

@@ -131,16 +131,14 @@ s3://picaivid-prod-media/artifacts/
 Recommended instance paths:
 
 ```text
-/srv/picaivid/third_party/vggt
-/srv/picaivid/third_party/vggt/checkpoints/vggt_1B_commercial.pt
+/srv/picaivid/third_party/vggt-omega
+/srv/picaivid/models/vggt_omega_1b_512.pt
 ```
 
-Checkpoint source:
-
-- request access at [facebook/VGGT-1B-Commercial](https://huggingface.co/facebook/VGGT-1B-Commercial)
-- after approval, download with a Hugging Face read token or approved local login
-- upload the approved checkpoint into `s3://picaivid-prod-media/artifacts/vggt/checkpoints/`
-- hydrate it onto the GPU host before starting `picaivid-media-worker`
+The active model is `facebook/VGGT-Omega`. Keep its checkpoint outside Git, upload it only to
+the private model-artifact bucket, and hydrate it onto the GPU host before starting
+`picaivid-media-worker`. Confirm its license is compatible with each deployment environment;
+the current use is owner-directed private testing.
 
 Reference only for a later splat-side project:
 

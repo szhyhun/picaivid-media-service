@@ -54,7 +54,10 @@ def evaluate() -> None:
     try:
         rows = []
         totals = defaultdict(int)
-        for path in sorted(glob.glob(os.path.join(SWEEP, "*.primary.json"))):
+        manifests = sorted(glob.glob(os.path.join(SWEEP, "*.v2.json")))
+        if not manifests:
+            manifests = sorted(glob.glob(os.path.join(SWEEP, "*.primary.json")))
+        for path in manifests:
             payload = json.load(open(path))
             loaded = _load(db, payload["project_id"], payload["job_id"])
             if loaded is None:

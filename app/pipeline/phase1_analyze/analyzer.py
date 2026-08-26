@@ -428,7 +428,6 @@ class Phase1Analyzer:
             bathroom_votes = sum(label == "bathroom" for label in neighbor_labels)
             laundry_votes = sum(label in {"laundry", "laundry room"} for label in neighbor_labels)
             storage_votes = sum(label == "storage" for label in neighbor_labels)
-            depth_var = float(photo.depth_variance or 0.0)
             has_laundry_hint = _looks_like_laundry(photo)
             image = self._get_cached_image(photo, image_cache or {})
             service_scores = _score_service_room_labels(image)
@@ -455,7 +454,7 @@ class Phase1Analyzer:
                 photo.room_label = updated_label
                 changed += 1
                 logger.info(
-                    "Photo %s room relabel: %s -> %s (service-room focused relabel: scores bath=%.3f laundry=%.3f storage=%.3f garage=%.3f, votes bath=%s laundry=%s storage=%s, depth_var=%.3f, laundry_hint=%s)",
+                    "Photo %s room relabel: %s -> %s (service-room focused relabel: scores bath=%.3f laundry=%.3f storage=%.3f garage=%.3f, votes bath=%s laundry=%s storage=%s, laundry_hint=%s)",
                     photo.id,
                     current,
                     updated_label,
@@ -466,7 +465,6 @@ class Phase1Analyzer:
                     bathroom_votes,
                     laundry_votes,
                     storage_votes,
-                    depth_var,
                     "yes" if has_laundry_hint else "no",
                 )
 
@@ -489,23 +487,19 @@ class Phase1Analyzer:
             kitchen_votes = sum(label == "kitchen" for label in neighbor_labels)
             interior_votes = sum(label in interior_social for label in neighbor_labels)
             exterior_votes = sum(label in exterior_like for label in neighbor_labels)
-            depth_var = float(photo.depth_variance or 0.0)
-
             if (
                 kitchen_votes >= 2
                 and interior_votes >= 3
                 and exterior_votes == 0
-                and depth_var <= 0.08
             ):
                 photo.room_label = "kitchen"
                 changed += 1
                 logger.info(
-                    "Photo %s room relabel: %s -> kitchen (interior sequence context: kitchen_votes=%s, interior_votes=%s, depth_var=%.3f)",
+                    "Photo %s room relabel: %s -> kitchen (interior sequence context: kitchen_votes=%s, interior_votes=%s)",
                     photo.id,
                     current,
                     kitchen_votes,
                     interior_votes,
-                    depth_var,
                 )
 
         # Rule 2: living->dining corrections with strong verified adjacent dining links.
@@ -552,10 +546,9 @@ class Phase1Analyzer:
                     candidate.room_label = "dining room"
                     changed += 1
                     logger.info(
-                        "Photo %s room relabel: living room -> dining room (strong dining relation to %s, track_support=%.3f, confidence=%.3f)",
+                        "Photo %s room relabel: living room -> dining room (strong dining relation to %s, confidence=%.3f)",
                         candidate.id,
                         other.id,
-                        float(sim.track_support or 0.0),
                         float(sim.relation_confidence or 0.0),
                     )
 

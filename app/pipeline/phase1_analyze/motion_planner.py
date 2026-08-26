@@ -218,7 +218,6 @@ def plan_motion_for_cluster(
         cfg_scale=ltx2_params["cfg_scale"],
         inference_steps=ltx2_params["inference_steps"],
         debug_metrics={
-            "depth_variance": cluster.depth_variance,
             "image_count": cluster.image_count,
             "sfm_eligible": cluster.sfm_eligible,
             "matching_inferred_motion": inferred_motion,
@@ -501,7 +500,7 @@ def _infer_motion_from_matching(
         "total_transitions": max(0, len(ordered_photos) - 1),
         "evaluated_transitions": 0,
         "verified_transitions": 0,
-        "avg_verified_inliers": 0.0,
+        "avg_relation_confidence": 0.0,
         "avg_dx": 0.0,
         "avg_dy": 0.0,
         "dominant_image_motion": "unknown",
@@ -513,7 +512,7 @@ def _infer_motion_from_matching(
     weighted_dx = 0.0
     weighted_dy = 0.0
     total_weight = 0.0
-    verified_inliers = 0
+    verified_confidence = 0.0
 
     for idx in range(len(ordered_photos) - 1):
         left = int(ordered_photos[idx].id)
@@ -525,7 +524,7 @@ def _infer_motion_from_matching(
         row = db.execute(
             text(
                 """
-                SELECT direction_dx, direction_dy, track_support, relation_confidence
+                SELECT direction_dx, direction_dy, relation_confidence
                 FROM photo_relations
                 WHERE job_id = :job_id
                   AND photo_a_id = :photo_a
@@ -542,16 +541,15 @@ def _infer_motion_from_matching(
 
         dx = row[0]
         dy = row[1]
-        track_support = row[2]
-        relation_confidence = row[3]
+        relation_confidence = row[2]
         if dx is None or dy is None:
             continue
         if relation_confidence is None or float(relation_confidence) < 0.45:
             continue
 
         summary["verified_transitions"] += 1
-        evidence = float(track_support) if track_support is not None and float(track_support) > 0.0 else float(relation_confidence)
-        verified_inliers += int(round(evidence * 100.0))
+        evidence = float(relation_confidence)
+        verified_confidence += evidence
         dx = float(dx)
         dy = float(dy)
         if left != photo_a:
@@ -564,7 +562,9 @@ def _infer_motion_from_matching(
         total_weight += weight
 
     if summary["verified_transitions"] > 0:
-        summary["avg_verified_inliers"] = float(verified_inliers / summary["verified_transitions"])
+        summary["avg_relation_confidence"] = float(
+            verified_confidence / summary["verified_transitions"]
+        )
 
     if total_weight <= 0.0:
         guidance = (
@@ -598,7 +598,7 @@ def _infer_motion_from_matching(
         "Match-guided image-space motion: follow the verified subject movement "
         f"{camera_dir} across transitions "
         f"({summary['verified_transitions']}/{summary['total_transitions']} verified, "
-        f"avg support {summary['avg_verified_inliers']:.1f}); keep movement smooth and consistent."
+        f"avg relation confidence {summary['avg_relation_confidence']:.2f}); keep movement smooth and consistent."
     )
     return inferred, guidance, summary
 

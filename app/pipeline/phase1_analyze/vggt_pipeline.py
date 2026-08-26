@@ -1,28 +1,31 @@
-"""Geometry-first VGGT reconstruction, relation verification, and component ordering."""
+"""VGGT V2 pair verification, component membership, and cinematic ordering.
+
+There is intentionally no whole-listing reconstruction path here. Omega runs on
+candidate photo pairs, cached raw evidence decides membership, and verified
+relative poses create one honest coordinate frame per connected component.
+"""
 from __future__ import annotations
 
 import gc
-import io
 import logging
 import math
 import os
 import tempfile
+import time
+from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 
-from app.core.config import settings
 from app.models.vggt import vggt_model
-from app.services.storage.s3_client import S3Client
-
+from app.pipeline.phase1_analyze.pose_graph import CameraPose, solve_component_poses
 logger = logging.getLogger(__name__)
 
-# Calibrated on 813 verified pairs across 3 human-labeled listings. depth_ok alone
-# collapses precision to 0.13 because transitive closure chains rooms through
-# open-plan seams; bl_over_depth separates them (same-room median 1.04, seam 2.11).
+# Calibrated on 813 verified pairs across three human-labeled listings. These are
+# provisional until a true holdout is labeled; the acceptance target is not met.
 MEMBERSHIP_DEPTH_OK = 0.20
 MEMBERSHIP_BL_OVER_DEPTH = 2.0
 PAIR_CACHE_RELEASE_EVERY = 25
@@ -35,16 +38,12 @@ class PhotoGeometryResult:
     photo_id: int
     pose_confidence: float
     depth_confidence: float
-    point_confidence: float
     visibility_score: float
     reprojection_error: float
     camera_extrinsic: list[list[float]]
-    camera_intrinsic: list[list[float]]
     camera_center: list[float]
     view_direction: list[float]
-    depth_artifact_uri: str | None
-    point_map_artifact_uri: str | None
-    local_metrics: dict
+    local_metrics: dict[str, Any]
 
 
 @dataclass
@@ -52,17 +51,16 @@ class PhotoRelationResult:
     photo_a_id: int
     photo_b_id: int
     overlap_score: float
-    track_support: float
     reprojection_score: float
     relation_confidence: float
     baseline_distance: float
-    relative_transform: dict
+    relative_transform: dict[str, Any]
     direction_dx: float
     direction_dy: float
     continuity_type: str
     is_bridge_edge: bool
     is_connected: bool
-    debug_metrics: dict
+    debug_metrics: dict[str, Any]
 
 
 @dataclass
@@ -73,93 +71,10 @@ class SceneComponentResult:
     scene_type: str
     geometry_confidence: float
     connectivity_confidence: float
-    track_coverage: float
     avg_reprojection_error: float
     hero_photo_id: int
-    depth_range: float
     motion_affordance: str
-    debug_metrics: dict
-
-
-@dataclass
-class _PhotoArrays:
-    extrinsic: np.ndarray
-    intrinsic: np.ndarray
-    depth: np.ndarray
-    depth_conf: np.ndarray
-    point_map: np.ndarray
-    point_conf: np.ndarray
-    world_points: np.ndarray
-
-
-def _normalize(vector: np.ndarray) -> np.ndarray:
-    magnitude = float(np.linalg.norm(vector))
-    return vector / magnitude if magnitude > 1e-8 else np.zeros_like(vector)
-
-
-def _confidence_unit(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    if float(np.nanmax(values, initial=0.0)) <= 1.0:
-        return np.clip(values, 0.0, 1.0)
-    return np.clip(1.0 - np.exp(-(values - 1.0)), 0.0, 1.0)
-
-
-def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
-    values = np.asarray(values, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.float64)
-    total = float(np.sum(weights))
-    return float(np.sum(values * weights) / total) if total > 1e-12 else 0.0
-
-
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    values = np.asarray(values, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.float64)
-    if values.size == 0:
-        return 0.0
-    order = np.argsort(values)
-    ordered_values = values[order]
-    ordered_weights = weights[order]
-    midpoint = 0.5 * float(np.sum(ordered_weights))
-    if midpoint <= 0.0:
-        return float(np.median(ordered_values))
-    index = int(np.searchsorted(np.cumsum(ordered_weights), midpoint, side="left"))
-    return float(ordered_values[min(index, len(ordered_values) - 1)])
-
-
-def _depth_metrics(depth: np.ndarray) -> dict[str, float | int]:
-    """Return scale-invariant cinematic depth metrics from VGGT depth."""
-    values = np.asarray(depth, dtype=np.float64)
-    finite = values[np.isfinite(values) & (values > 0.0)]
-    if finite.size < 16:
-        return {"depth_variance": 0.0, "depth_layers": 1}
-    low, high = np.quantile(finite, [0.02, 0.98])
-    if high - low <= 1e-8:
-        return {"depth_variance": 0.0, "depth_layers": 1}
-    normalized = np.clip((finite - low) / (high - low), 0.0, 1.0)
-    histogram, _ = np.histogram(normalized, bins=8, range=(0.0, 1.0))
-    significant = int(np.count_nonzero(histogram >= max(1, int(0.05 * normalized.size))))
-    return {
-        "depth_variance": float(np.var(normalized)),
-        "depth_layers": max(1, significant),
-    }
-
-
-def _camera_center(extrinsic: np.ndarray) -> np.ndarray:
-    rotation = extrinsic[:3, :3]
-    translation = extrinsic[:3, 3]
-    return -rotation.T @ translation
-
-
-def _view_direction(extrinsic: np.ndarray) -> np.ndarray:
-    return _normalize(np.linalg.inv(np.vstack([extrinsic, [0.0, 0.0, 0.0, 1.0]]))[:3, 2])
-
-
-def _artifact_uri(s3_client: S3Client | None, key: str, array: np.ndarray) -> str | None:
-    if s3_client is None:
-        return None
-    buffer = io.BytesIO()
-    np.savez_compressed(buffer, data=array)
-    return s3_client.upload_bytes(key, buffer.getvalue(), content_type="application/octet-stream")
+    debug_metrics: dict[str, Any]
 
 
 def _save_input_images(images: list[object], photo_ids: list[int]) -> tuple[str, list[str]]:
@@ -190,19 +105,6 @@ def _cleanup_files(directory: str, filelist: list[str]) -> None:
         pass
 
 
-def _scene_type_for_label(label: str | None) -> str:
-    text = str(label or "").lower()
-    if "drone" in text or "aerial" in text:
-        return "drone"
-    if any(token in text for token in ("exterior", "front", "backyard", "yard", "patio", "deck", "pool")):
-        return "exterior"
-    return "interior" if text else "mixed"
-
-
-def _is_oom(error: Exception) -> bool:
-    return "out of memory" in str(error).lower() or "mps backend out of memory" in str(error).lower()
-
-
 def _release_accelerator_cache() -> None:
     gc.collect()
     if torch.cuda.is_available():
@@ -213,669 +115,243 @@ def _release_accelerator_cache() -> None:
         torch.mps.empty_cache()
 
 
-def _window_ranges(count: int, size: int, overlap: int) -> list[tuple[int, int]]:
-    if size <= overlap:
-        raise ValueError("VGGT window size must exceed overlap")
-    if count <= size:
-        return [(0, count)]
-    ranges: list[tuple[int, int]] = []
-    start = 0
-    while start < count:
-        end = min(start + size, count)
-        ranges.append((start, end))
-        if end == count:
-            break
-        start = end - overlap
-    return ranges
+def _scene_type_for_label(label: str | None) -> str:
+    text = str(label or "").lower()
+    if "drone" in text or "aerial" in text:
+        return "drone"
+    if any(token in text for token in ("exterior", "front", "backyard", "yard", "patio", "deck", "pool")):
+        return "exterior"
+    return "interior" if text else "mixed"
 
 
-def _as_numpy_predictions(predictions: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {"runtime": dict(predictions["runtime"])}
-    for key in ("extrinsic", "intrinsic", "depth_map", "depth_conf", "point_map", "point_conf", "point_map_unprojected"):
-        value = predictions[key]
-        result[key] = value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
-    return result
+def _scene_type(component: list[int], room_labels: dict[int, str]) -> str:
+    counts = Counter(_scene_type_for_label(room_labels.get(photo_id)) for photo_id in component)
+    return min(counts, key=lambda value: (-counts[value], value)) if counts else "mixed"
 
 
-def _estimate_similarity(local_points: np.ndarray, global_points: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    local = np.asarray(local_points, dtype=np.float64)
-    target = np.asarray(global_points, dtype=np.float64)
-    if len(local) < 3:
-        raise RuntimeError("Window stitching requires at least three shared points")
-    local_center = local.mean(axis=0)
-    target_center = target.mean(axis=0)
-    local_zero = local - local_center
-    target_zero = target - target_center
-    covariance = (target_zero.T @ local_zero) / len(local)
-    left, singular, right = np.linalg.svd(covariance)
-    correction = np.eye(3)
-    if np.linalg.det(left @ right) < 0:
-        correction[-1, -1] = -1.0
-    rotation = left @ correction @ right
-    variance = float(np.mean(np.sum(local_zero**2, axis=1)))
-    if variance <= 1e-10:
-        raise RuntimeError("Window stitching received degenerate shared points")
-    scale = float(np.sum(singular * np.diag(correction)) / variance)
-    translation = target_center - scale * rotation @ local_center
-    return scale, rotation, translation
+def _confidence_fit(raw_confidence: float) -> float:
+    return float(np.clip(math.log1p(max(raw_confidence - 1.0, 0.0)) / math.log1p(10.0), 0.0, 1.0))
 
 
-def _apply_similarity_to_window(predictions: dict[str, Any], scale: float, rotation: np.ndarray, translation: np.ndarray) -> dict[str, Any]:
-    transformed = {key: value.copy() if isinstance(value, np.ndarray) else value for key, value in predictions.items()}
-    for key in ("point_map", "point_map_unprojected"):
-        points = transformed[key]
-        transformed[key] = (scale * (points @ rotation.T) + translation).astype(np.float32)
-    transformed["depth_map"] = (transformed["depth_map"] * scale).astype(np.float32)
-    extrinsics = transformed["extrinsic"].copy()
-    for index, extrinsic in enumerate(extrinsics):
-        center = _camera_center(extrinsic)
-        camera_rotation = extrinsic[:3, :3] @ rotation.T
-        transformed_center = scale * rotation @ center + translation
-        extrinsics[index, :3, :3] = camera_rotation
-        extrinsics[index, :3, 3] = -camera_rotation @ transformed_center
-    transformed["extrinsic"] = extrinsics
-    return transformed
+def _relative_depth_errors(evidence: dict[str, Any]) -> list[float]:
+    values: list[float] = []
+    for direction in (evidence.get("forward") or {}, evidence.get("backward") or {}):
+        value = direction.get("median_relative_depth_error")
+        if value is not None and math.isfinite(float(value)):
+            values.append(float(value))
+    return values
 
 
-def _shared_correspondences(
-    local_predictions: dict[str, Any],
-    global_predictions: dict[str, Any],
-    local_indices: list[int],
-    global_indices: list[int],
-) -> tuple[np.ndarray, np.ndarray]:
-    source_chunks: list[np.ndarray] = []
-    target_chunks: list[np.ndarray] = []
-    for local_index, global_index in zip(local_indices, global_indices):
-        source = local_predictions["point_map_unprojected"][local_index].reshape(-1, 3)
-        target = global_predictions["point_map_unprojected"][global_index].reshape(-1, 3)
-        source_conf = _confidence_unit(local_predictions["point_conf"][local_index]).reshape(-1)
-        target_conf = _confidence_unit(global_predictions["point_conf"][global_index]).reshape(-1)
-        confidence = np.minimum(source_conf, target_conf)
-        valid = np.isfinite(source).all(axis=1) & np.isfinite(target).all(axis=1) & (confidence >= np.quantile(confidence, 0.75))
-        chosen = np.flatnonzero(valid)
-        if len(chosen) > 512:
-            chosen = chosen[np.linspace(0, len(chosen) - 1, 512, dtype=int)]
-        source_chunks.append(source[chosen])
-        target_chunks.append(target[chosen])
-    if not source_chunks:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
-    return np.concatenate(source_chunks, axis=0), np.concatenate(target_chunks, axis=0)
+def _reprojection_score(evidence: dict[str, Any]) -> float:
+    from app.pipeline.phase1_analyze.pairwise_verify import DEPTH_AGREEMENT
+
+    errors = _relative_depth_errors(evidence)
+    if not errors:
+        return 0.0
+    return float(np.clip(1.0 - np.median(errors) / DEPTH_AGREEMENT, 0.0, 1.0))
 
 
-def _merge_window_predictions(filelist: list[str], windows: list[tuple[int, int]]) -> tuple[dict[str, Any], dict[str, Any]]:
-    merged: dict[str, Any] | None = None
-    filled: set[int] = set()
-    strategy = {"kind": "windowed", "windows": windows, "stitching": []}
-    for start, end in windows:
-        current = _as_numpy_predictions(vggt_model.predict(filelist[start:end]))
-        if merged is None:
-            merged = {
-                key: np.zeros((len(filelist), *value.shape[1:]), dtype=value.dtype)
-                for key, value in current.items()
-                if isinstance(value, np.ndarray)
-            }
-            for key, value in current.items():
-                if isinstance(value, np.ndarray):
-                    merged[key][start:end] = value
-            merged["runtime"] = current["runtime"]
-            filled.update(range(start, end))
-            continue
-        shared_global = [index for index in range(start, end) if index in filled]
-        shared_local = [index - start for index in shared_global]
-        source, target = _shared_correspondences(current, merged, shared_local, shared_global)
-        point_count = min(len(source), len(target))
-        scale, rotation, translation = _estimate_similarity(source[:point_count], target[:point_count])
-        current = _apply_similarity_to_window(current, scale, rotation, translation)
-        residual = float(np.median(np.linalg.norm(scale * (source[:point_count] @ rotation.T) + translation - target[:point_count], axis=1)))
-        strategy["stitching"].append({"window": [start, end], "shared_frames": len(shared_global), "scale": scale, "residual": residual})
-        for key, value in current.items():
-            if not isinstance(value, np.ndarray):
-                continue
-            for local_index, global_index in enumerate(range(start, end)):
-                if global_index not in filled:
-                    merged[key][global_index] = value[local_index]
-        filled.update(range(start, end))
-    if merged is None:
-        raise RuntimeError("VGGT received no windows")
-    return merged, strategy
-
-
-def _predict_with_retries(filelist: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _normalized_pair_translation(evidence: dict[str, Any]) -> list[float]:
+    pose = evidence.get("relative_pose") or {}
     try:
-        prediction = _as_numpy_predictions(vggt_model.predict(filelist))
-        return prediction, {"kind": "global", "windows": [[0, len(filelist)]]}
-    except Exception as error:
-        if not _is_oom(error):
-            raise
-        _release_accelerator_cache()
-        logger.warning("VGGT global inference ran out of memory; retrying in windows: %s", error)
-    retry_configs = (
-        (int(settings.VGGT_RETRY_WINDOW_SIZE), int(settings.VGGT_RETRY_WINDOW_OVERLAP)),
-        (int(settings.VGGT_FINAL_WINDOW_SIZE), int(settings.VGGT_FINAL_WINDOW_OVERLAP)),
-    )
-    last_error: Exception | None = None
-    for size, overlap in retry_configs:
-        try:
-            return _merge_window_predictions(filelist, _window_ranges(len(filelist), size, overlap))
-        except Exception as error:
-            last_error = error
-            if not _is_oom(error):
-                raise
-            _release_accelerator_cache()
-            logger.warning("VGGT window size=%s ran out of memory", size)
-    raise RuntimeError("VGGT inference exhausted all configured window strategies") from last_error
-
-
-def _project_metrics(source: _PhotoArrays, target: _PhotoArrays) -> dict[str, float]:
-    source_points = source.world_points.reshape(-1, 3)
-    source_depth = source.depth.reshape(-1)
-    source_conf = _confidence_unit(np.asarray(source.depth_conf, dtype=np.float64)).reshape(-1)
-    valid = (
-        np.isfinite(source_points).all(axis=1)
-        & np.isfinite(source_depth)
-        & (source_depth > 1e-8)
-    )
-    indices = np.flatnonzero(valid)
-    maximum = int(settings.VGGT_MAX_GEOMETRY_POINTS_PER_PAIR)
-    if len(indices) > maximum:
-        indices = indices[np.linspace(0, len(indices) - 1, maximum, dtype=int)]
-    if len(indices) == 0:
-        return {
-            "visible_fraction": 0.0,
-            "frustum_fraction": 0.0,
-            "depth_consistency": 0.0,
-            "reprojection_error": 1.0,
-            "median_image_dx": 0.0,
-            "median_image_dy": 0.0,
-        }
-    points = source_points[indices]
-    # Confidence is a soft reliability weight. The reconstructed world points,
-    # not an arbitrary confidence percentile, determine surface overlap.
-    source_weights = 0.10 + 0.90 * np.nan_to_num(source_conf[indices], nan=0.0, posinf=1.0, neginf=0.0)
-    source_height, source_width = source.depth.shape[:2]
-    source_pixels = np.column_stack((indices % source_width, indices // source_width)).astype(np.float64)
-    camera = points @ target.extrinsic[:3, :3].T + target.extrinsic[:3, 3]
-    depth = camera[:, 2]
-    projected = camera @ target.intrinsic.T
-    pixels = projected[:, :2] / np.maximum(projected[:, 2:3], 1e-8)
-    height, width = target.depth.shape[:2]
-    x = np.rint(pixels[:, 0]).astype(int)
-    y = np.rint(pixels[:, 1]).astype(int)
-    visible = (depth > 1e-6) & (x >= 0) & (x < width) & (y >= 0) & (y < height)
-    if not np.any(visible):
-        return {
-            "visible_fraction": 0.0,
-            "frustum_fraction": 0.0,
-            "depth_consistency": 0.0,
-            "reprojection_error": 1.0,
-            "median_image_dx": 0.0,
-            "median_image_dy": 0.0,
-        }
-    x_visible, y_visible, z_visible = x[visible], y[visible], depth[visible]
-    target_depth = np.asarray(target.depth[y_visible, x_visible]).reshape(-1)
-    target_conf = _confidence_unit(np.asarray(target.depth_conf[y_visible, x_visible], dtype=np.float64)).reshape(-1)
-    target_valid = (
-        np.isfinite(target_depth)
-        & (target_depth > 1e-8)
-    )
-    visible_source_weights = source_weights[visible]
-    pair_weights = np.minimum(
-        visible_source_weights,
-        0.10 + 0.90 * np.nan_to_num(target_conf, nan=0.0, posinf=1.0, neginf=0.0),
-    )
-    relative_depth_error = np.full_like(z_visible, np.inf, dtype=np.float64)
-    relative_depth_error[target_valid] = (
-        np.abs(z_visible[target_valid] - target_depth[target_valid])
-        / np.maximum(np.maximum(np.abs(z_visible[target_valid]), np.abs(target_depth[target_valid])), 1e-6)
-    )
-    consistent = target_valid & (relative_depth_error <= 0.15)
-
-    reprojection_error = 1.0
-    median_image_dx = 0.0
-    median_image_dy = 0.0
-    if np.any(consistent):
-        target_points = target.world_points[y_visible[consistent], x_visible[consistent]]
-        source_camera = target_points @ source.extrinsic[:3, :3].T + source.extrinsic[:3, 3]
-        source_projected = source_camera @ source.intrinsic.T
-        source_projected = source_projected[:, :2] / np.maximum(source_projected[:, 2:3], 1e-8)
-        source_reference = source_pixels[visible][consistent]
-        diagonal = math.hypot(source_width, source_height)
-        cycle_error = np.linalg.norm(source_projected - source_reference, axis=1) / max(diagonal, 1.0)
-        reprojection_error = _weighted_median(cycle_error, pair_weights[consistent]) if len(cycle_error) else 1.0
-        image_flow = pixels[visible][consistent] - source_reference
-        median_image_dx = _weighted_median(image_flow[:, 0], pair_weights[consistent])
-        median_image_dy = _weighted_median(image_flow[:, 1], pair_weights[consistent])
-
-    frustum_fraction = float(np.sum(visible_source_weights) / max(float(np.sum(source_weights)), 1e-12))
-    visible_fraction = float(np.sum(pair_weights[consistent]) / max(float(np.sum(source_weights)), 1e-12))
-    depth_consistency = _weighted_mean(consistent[target_valid], pair_weights[target_valid]) if np.any(target_valid) else 0.0
-    return {
-        "visible_fraction": visible_fraction,
-        "frustum_fraction": frustum_fraction,
-        "depth_consistency": depth_consistency,
-        "reprojection_error": reprojection_error,
-        "median_image_dx": median_image_dx,
-        "median_image_dy": median_image_dy,
-    }
-
-
-def _relative_rotation_degrees(left: np.ndarray, right: np.ndarray) -> float:
-    rotation = left[:3, :3] @ right[:3, :3].T
-    value = float(np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0))
-    return math.degrees(math.acos(value))
-
-
-def _compute_pair_relations(
-    photo_arrays: dict[int, _PhotoArrays],
-    room_labels: dict[int, str],
-) -> list[PhotoRelationResult]:
-    photo_ids = sorted(photo_arrays)
-    centers = {photo_id: _camera_center(photo_arrays[photo_id].extrinsic) for photo_id in photo_ids}
-    all_distances = [float(np.linalg.norm(centers[left] - centers[right])) for index, left in enumerate(photo_ids) for right in photo_ids[index + 1:]]
-    scene_scale = max(float(np.median(all_distances)) if all_distances else 1.0, 1e-4)
-    base_metrics: dict[tuple[int, int], dict[str, Any]] = {}
-    for index, left_id in enumerate(photo_ids):
-        for right_id in photo_ids[index + 1:]:
-            forward = _project_metrics(photo_arrays[left_id], photo_arrays[right_id])
-            backward = _project_metrics(photo_arrays[right_id], photo_arrays[left_id])
-            baseline = float(np.linalg.norm(centers[right_id] - centers[left_id]))
-            base_metrics[(left_id, right_id)] = {
-                "overlap": 0.5 * (forward["visible_fraction"] + backward["visible_fraction"]),
-                "mutual_overlap": min(forward["visible_fraction"], backward["visible_fraction"]),
-                "depth_consistency": 0.5 * (forward["depth_consistency"] + backward["depth_consistency"]),
-                "reprojection_error": 0.5 * (forward["reprojection_error"] + backward["reprojection_error"]),
-                "baseline": baseline,
-                "normalized_baseline": baseline / scene_scale,
-                "rotation_degrees": _relative_rotation_degrees(photo_arrays[left_id].extrinsic, photo_arrays[right_id].extrinsic),
-                "forward": forward,
-                "backward": backward,
-            }
-            metrics = base_metrics[(left_id, right_id)]
-            reprojection_quality = math.exp(-metrics["reprojection_error"] / 0.03)
-            metrics["same_scene_score"] = float(np.clip(
-                0.35 * metrics["overlap"]
-                + 0.25 * metrics["mutual_overlap"]
-                + 0.25 * metrics["depth_consistency"]
-                + 0.15 * reprojection_quality,
-                0.0,
-                1.0,
-            ))
-    logger.info(
-        "VGGT_RELATION_GEOMETRY_COMPLETE photos=%s all_pairs=%s",
-        len(photo_ids),
-        len(base_metrics),
-    )
-    ranked_neighbors: dict[int, list[int]] = {photo_id: [] for photo_id in photo_ids}
-    for photo_id in photo_ids:
-        candidates = []
-        for pair, metrics in base_metrics.items():
-            if photo_id not in pair:
-                continue
-            other_id = pair[1] if pair[0] == photo_id else pair[0]
-            candidates.append((float(metrics["same_scene_score"]), other_id))
-        # Neighbor ranking is relative within a reconstruction. Requiring every
-        # candidate to clear one global score fragmented otherwise coherent
-        # interiors when camera rotation made cycle reprojection less precise.
-        ranked_neighbors[photo_id] = [other_id for _, other_id in sorted(candidates, reverse=True)[:6]]
-
-    relations: list[PhotoRelationResult] = []
-    for pair, metrics in base_metrics.items():
-        left_id, right_id = pair
-        left_domain = _scene_type_for_label(room_labels.get(left_id))
-        right_domain = _scene_type_for_label(room_labels.get(right_id))
-        duplicate = metrics["overlap"] >= 0.85 and metrics["normalized_baseline"] <= 0.03
-        mutual_neighbor = right_id in ranked_neighbors[left_id] and left_id in ranked_neighbors[right_id]
-        same_scene_geometry = (
-            metrics["overlap"] >= 0.22
-            and metrics["depth_consistency"] >= 0.40
-            and metrics["reprojection_error"] <= 0.08
-        )
-        same_scene = mutual_neighbor and same_scene_geometry
-        interpolation_safe = (
-            same_scene
-            and metrics["overlap"] >= 0.35
-            and metrics["depth_consistency"] >= 0.50
-            and metrics["reprojection_error"] <= 0.025
-            and metrics["rotation_degrees"] <= 60.0
-        )
-        doorway_bridge = (
-            not same_scene
-            and metrics["same_scene_score"] >= 0.30
-            and metrics["overlap"] >= 0.12
-            and metrics["depth_consistency"] >= 0.30
-        )
-        if duplicate:
-            continuity_type = "duplicate"
-        elif interpolation_safe:
-            continuity_type = "interpolation_safe"
-        elif same_scene:
-            continuity_type = "same_scene"
-        elif doorway_bridge:
-            continuity_type = "doorway_bridge"
-        elif metrics["same_scene_score"] >= 0.25:
-            continuity_type = "cut_only"
-        else:
-            continuity_type = "unrelated"
-        relation_confidence = float(metrics["same_scene_score"])
-        delta = centers[right_id] - centers[left_id]
-        relations.append(PhotoRelationResult(
-            photo_a_id=left_id,
-            photo_b_id=right_id,
-            overlap_score=float(metrics["overlap"]),
-            track_support=0.0,
-            reprojection_score=float(np.clip(1.0 - metrics["reprojection_error"] / 0.05, 0.0, 1.0)),
-            relation_confidence=relation_confidence,
-            baseline_distance=float(metrics["baseline"]),
-            relative_transform={"translation": [float(value) for value in delta], "normalized_baseline": float(metrics["normalized_baseline"]), "rotation_degrees": float(metrics["rotation_degrees"])},
-            direction_dx=float(metrics["forward"]["median_image_dx"]),
-            direction_dy=float(metrics["forward"]["median_image_dy"]),
-            continuity_type=continuity_type,
-            is_bridge_edge=continuity_type == "doorway_bridge",
-            is_connected=continuity_type in {"interpolation_safe", "same_scene"},
-            debug_metrics={
-                **metrics,
-                "verification_source": "vggt_joint_geometry",
-                "mutual_neighbor": mutual_neighbor,
-                "same_scene_geometry": same_scene_geometry,
-                "left_neighbor_rank": ranked_neighbors[left_id].index(right_id) + 1 if right_id in ranked_neighbors[left_id] else None,
-                "right_neighbor_rank": ranked_neighbors[right_id].index(left_id) + 1 if left_id in ranked_neighbors[right_id] else None,
-                "left_domain": left_domain,
-                "right_domain": right_domain,
-            },
-        ))
-    return relations
-
+        translation = np.asarray(pose["translation"], dtype=np.float64)
+        scale = float(pose["scale"])
+    except (KeyError, TypeError, ValueError):
+        return [0.0, 0.0, 0.0]
+    if translation.shape != (3,) or not np.isfinite(translation).all() or abs(scale) <= 1e-9:
+        return [0.0, 0.0, 0.0]
+    return [float(value) for value in translation / scale]
 
 
 def _v2_scene_graph(
     file_by_photo: dict[int, str],
     labels: dict[int, str],
     positions: dict[int, int],
-    arrays: dict[int, _PhotoArrays],
     embeddings: dict[int, list] | None = None,
     must_not_group: set[tuple[int, int]] | None = None,
-) -> tuple[list[PhotoRelationResult], list[list[int]]]:
-    """Group photos by verifying candidate pairs with 2-photo VGGT runs.
-
-    Replaces the single-global-pass grouping. The global reconstruction still
-    provides the scene map and per-photo depth, but it neither nominates candidates
-    nor decides membership.
-
-    Measured against human labels on three listings: recall 0.32 -> 0.69, 0.66 ->
-    0.84, 0.33 -> 0.65 at equal or better precision.
-    """
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> tuple[list[PhotoRelationResult], list[list[int]], list[dict[str, Any]], dict[str, Any]]:
+    """Verify nominated pairs and build constrained physical-room components."""
     from app.pipeline.phase1_analyze import pairing, transitions
-    from app.pipeline.phase1_analyze.candidate_pairs import nominate, split_tiers
+    from app.pipeline.phase1_analyze.candidate_pairs import nominate
     from app.pipeline.phase1_analyze.membership import constrained_merge
     from app.pipeline.phase1_analyze.pairwise_verify import (
-        DEPTH_AGREEMENT,
         canonical_order_with_ids,
         verify_with_cache,
     )
 
     photo_ids = sorted(file_by_photo)
-    photos = [{"id": pid, "position": positions.get(pid, 0), "room_label": labels.get(pid)} for pid in photo_ids]
-    centers = {pid: _camera_center(arrays[pid].extrinsic) for pid in photo_ids}
+    photos = [
+        {"id": photo_id, "position": positions.get(photo_id, 0), "room_label": labels.get(photo_id)}
+        for photo_id in photo_ids
+    ]
+    candidates = nominate(photos, embeddings=embeddings or None)
+    logger.info(
+        "VGGT_V2_CANDIDATES photos=%s pairs=%s",
+        len(photo_ids),
+        len(candidates),
+    )
 
-    # Nomination deliberately uses only the primary tier -- room labels, CLIP and
-    # upload adjacency. It does NOT consume global pair metrics: those cost an
-    # all-pairs projection sweep (1,540 pairs on a 56-photo listing) and measured
-    # zero connectivity gain, since the primary tier alone reached every labeled
-    # room on all three calibration listings.
-    candidates, _fallback = split_tiers(nominate(photos, embeddings=embeddings or None))
-    logger.info("VGGT_V2_CANDIDATES photos=%s pairs=%s", len(photo_ids), len(candidates))
-
-    evidence: list[dict] = []
-    cache_hits = computed = 0
-    runtime = vggt_model.runtime_metadata()
+    runtime = runtime or vggt_model.runtime_metadata()
+    evidence: list[dict[str, Any]] = []
+    cache_hits = computed = failed = released_at = 0
     for index, candidate in enumerate(candidates, 1):
-        a, b = candidate.key
+        left, right = candidate.key
         try:
             (path_a, evidence_a), (path_b, evidence_b) = canonical_order_with_ids(
-                file_by_photo[a], a, file_by_photo[b], b
+                file_by_photo[left], left, file_by_photo[right], right
             )
             record, cache_hit, _ = verify_with_cache(path_a, path_b, runtime=runtime)
-        except Exception as error:  # a single bad pair must not fail the listing
-            logger.warning("Pair verification failed for %s/%s: %s", a, b, error)
-            continue
-        cache_hits += int(cache_hit)
-        computed += int(not cache_hit)
-        record.update({
-            # Directional pose and image motion use canonical content order.
-            "photo_a_id": evidence_a,
-            "photo_b_id": evidence_b,
-            "sources": sorted(candidate.sources),
-        })
-        evidence.append(record)
-        if not cache_hit and computed % PAIR_CACHE_RELEASE_EVERY == 0:
-            _release_accelerator_cache()
+            cache_hits += int(cache_hit)
+            computed += int(not cache_hit)
+            record.update(
+                {
+                    "photo_a_id": evidence_a,
+                    "photo_b_id": evidence_b,
+                    "sources": sorted(candidate.sources),
+                }
+            )
+            evidence.append(record)
+            if not cache_hit and computed - released_at >= PAIR_CACHE_RELEASE_EVERY:
+                _release_accelerator_cache()
+                released_at = computed
+        except Exception as error:  # one bad pair must not fail the listing
+            failed += 1
+            logger.warning("Pair verification failed for %s/%s: %s", left, right, error)
         if index % PAIR_CACHE_RELEASE_EVERY == 0 or index == len(candidates):
             logger.info(
-                "VGGT_V2_PAIR_PROGRESS verified=%s/%s computed=%s cache_hits=%s",
+                "VGGT_V2_PAIR_PROGRESS attempted=%s/%s computed=%s cache_hits=%s failed=%s",
                 index,
                 len(candidates),
                 computed,
                 cache_hits,
+                failed,
             )
-    if computed:
+    if computed > released_at:
         _release_accelerator_cache()
-    logger.info(
-        "VGGT_V2_VERIFIED pairs=%s computed=%s cache_hits=%s",
-        len(evidence),
-        computed,
-        cache_hits,
-    )
 
-    # Membership: only strong direct evidence merges, and only human negatives block.
     merge_edges = [
-        (e["photo_a_id"], e["photo_b_id"], e["depth_ok_min"])
-        for e in evidence
-        if e["depth_ok_min"] > MEMBERSHIP_DEPTH_OK and e["bl_over_depth"] < MEMBERSHIP_BL_OVER_DEPTH
+        (record["photo_a_id"], record["photo_b_id"], float(record["depth_ok_min"]))
+        for record in evidence
+        if record["depth_ok_min"] > MEMBERSHIP_DEPTH_OK
+        and record["bl_over_depth"] < MEMBERSHIP_BL_OVER_DEPTH
     ]
-    merge_edge_keys = {(min(a, b), max(a, b)) for a, b, _ in merge_edges}
+    merge_edge_keys = {(min(left, right), max(left, right)) for left, right, _ in merge_edges}
     membership = constrained_merge(photo_ids, merge_edges, must_not_group)
     component_of = membership.component_of()
 
     transition_keys = {
-        (min(t.photo_a, t.photo_b), max(t.photo_a, t.photo_b))
-        for t in transitions.build(evidence, must_not_group)
+        (min(item.photo_a, item.photo_b), max(item.photo_a, item.photo_b))
+        for item in transitions.build(evidence, must_not_group)
     }
-
-    results: list[PhotoRelationResult] = []
-    for e in evidence:
-        a, b = e["photo_a_id"], e["photo_b_id"]
-        key = (min(a, b), max(a, b))
-        same_component = component_of.get(a) is not None and component_of.get(a) == component_of.get(b)
+    relations: list[PhotoRelationResult] = []
+    for record in evidence:
+        left = int(record["photo_a_id"])
+        right = int(record["photo_b_id"])
+        key = (min(left, right), max(left, right))
+        same_component = component_of.get(left) is not None and component_of.get(left) == component_of.get(right)
         direct_membership_edge = same_component and key in merge_edge_keys
         is_transition = key in transition_keys
-        # Deliberately NOT emitting `interpolation_safe`. Transition geometry is
-        # provisional: there is no safe/unsafe ground truth for camera motion, so
-        # passing these thresholds is not proof a rendered interpolation will look
-        # right. Everything renders as a cut until that corpus exists; the flag is
-        # carried in debug_metrics.is_transition for review and for building it.
         if direct_membership_edge:
             continuity = "same_scene"
         elif is_transition:
-            continuity = "doorway_bridge"      # provisional: candidate move, renders as a cut
-        elif e["depth_ok_min"] > 0.0:
+            continuity = "doorway_bridge"
+        elif record["depth_ok_min"] > 0.0:
             continuity = "cut_only"
         else:
             continuity = "unrelated"
-        delta = centers[b] - centers[a]
-        relative_depth_errors = [
-            direction.get("median_relative_depth_error")
-            for direction in (e["forward"], e["backward"])
-            if direction.get("median_relative_depth_error") is not None
-            and np.isfinite(direction["median_relative_depth_error"])
-        ]
-        reprojection_score = (
-            float(np.clip(1.0 - np.median(relative_depth_errors) / DEPTH_AGREEMENT, 0.0, 1.0))
-            if relative_depth_errors
-            else 0.0
+        relations.append(
+            PhotoRelationResult(
+                photo_a_id=left,
+                photo_b_id=right,
+                overlap_score=float(record["depth_ok_min"]),
+                reprojection_score=_reprojection_score(record),
+                relation_confidence=_confidence_fit(float(record["conf_pair"])),
+                baseline_distance=float(record["baseline"]),
+                relative_transform={
+                    "translation": _normalized_pair_translation(record),
+                    "rotation_degrees": float(record["rot_deg"]),
+                    "bl_over_depth": float(record["bl_over_depth"]),
+                    "relative_pose": record.get("relative_pose"),
+                    "coordinate_frame": "pair_local",
+                },
+                direction_dx=float(record["forward"]["median_dx"]),
+                direction_dy=float(record["forward"]["median_dy"]),
+                continuity_type=continuity,
+                is_bridge_edge=continuity == "doorway_bridge",
+                is_connected=direct_membership_edge,
+                debug_metrics={
+                    "verification_source": "vggt_pairwise_v2",
+                    "depth_ok_forward": record["forward"]["depth_ok"],
+                    "depth_ok_backward": record["backward"]["depth_ok"],
+                    "conf_pair": record["conf_pair"],
+                    "bl_over_depth": record["bl_over_depth"],
+                    "rotation_degrees": record["rot_deg"],
+                    "pair_score": pairing.score_pair(record),
+                    "is_duplicate": pairing.is_duplicate(record),
+                    "is_transition": is_transition,
+                    "same_component": same_component,
+                    "direct_membership_edge": direct_membership_edge,
+                    "sources": record["sources"],
+                },
+            )
         )
-        results.append(PhotoRelationResult(
-            photo_a_id=a,
-            photo_b_id=b,
-            overlap_score=float(e["depth_ok_min"]),
-            track_support=0.0,
-            reprojection_score=reprojection_score,
-            relation_confidence=float(min(1.0, e["conf_pair"] / 20.0)),
-            baseline_distance=float(e["baseline"]),
-            relative_transform={
-                "translation": [float(v) for v in delta],
-                "rotation_degrees": float(e["rot_deg"]),
-                "bl_over_depth": float(e["bl_over_depth"]),
-                "relative_pose": e.get("relative_pose"),
-            },
-            direction_dx=float(e["forward"]["median_dx"]),
-            direction_dy=float(e["forward"]["median_dy"]),
-            continuity_type=continuity,
-            is_bridge_edge=continuity == "doorway_bridge",
-            is_connected=direct_membership_edge,
-            debug_metrics={
-                "verification_source": "vggt_pairwise_v2",
-                "depth_ok_forward": e["forward"]["depth_ok"],
-                "depth_ok_backward": e["backward"]["depth_ok"],
-                "conf_pair": e["conf_pair"],
-                "bl_over_depth": e["bl_over_depth"],
-                "rotation_degrees": e["rot_deg"],
-                "pair_score": pairing.score_pair(e),
-                "is_duplicate": pairing.is_duplicate(e),
-                "is_transition": is_transition,
-                "same_component": same_component,
-                "direct_membership_edge": direct_membership_edge,
-                "sources": e["sources"],
-            },
-        ))
 
-    blocked = [d for d in membership.merge_log if not d.accepted]
-    if blocked:
-        logger.info("VGGT_V2_MERGES_BLOCKED count=%s", len(blocked))
-    logger.info("VGGT_V2_COMPONENTS count=%s", len(membership.components))
-    return results, membership.components
+    blocked = sum(1 for decision in membership.merge_log if not decision.accepted)
+    stats = {
+        "candidate_pairs": len(candidates),
+        "verified_pairs": len(evidence),
+        "computed_pairs": computed,
+        "cache_hits": cache_hits,
+        "failed_pairs": failed,
+        "blocked_merges": blocked,
+        "coordinate_scope": "component_local",
+    }
+    logger.info(
+        "VGGT_V2_COMPONENTS count=%s blocked_merges=%s",
+        len(membership.components),
+        blocked,
+    )
+    return relations, membership.components, evidence, stats
 
 
 def _relation_lookup(relations: list[PhotoRelationResult]) -> dict[tuple[int, int], PhotoRelationResult]:
-    return {(min(relation.photo_a_id, relation.photo_b_id), max(relation.photo_a_id, relation.photo_b_id)): relation for relation in relations}
+    return {
+        (min(relation.photo_a_id, relation.photo_b_id), max(relation.photo_a_id, relation.photo_b_id)): relation
+        for relation in relations
+    }
 
 
-def _connected_components(photo_ids: Iterable[int], relations: list[PhotoRelationResult]) -> list[list[int]]:
-    adjacency = {int(photo_id): set() for photo_id in photo_ids}
-    for relation in relations:
-        if relation.is_connected:
-            adjacency[relation.photo_a_id].add(relation.photo_b_id)
-            adjacency[relation.photo_b_id].add(relation.photo_a_id)
-    result: list[list[int]] = []
-    seen: set[int] = set()
-    for photo_id in sorted(adjacency):
-        if photo_id in seen:
-            continue
-        stack, component = [photo_id], []
-        while stack:
-            current = stack.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            component.append(current)
-            stack.extend(sorted(adjacency[current] - seen))
-        result.append(sorted(component))
-    return result
-
-
-def _query_points_from_confidence(confidence: np.ndarray, count: int) -> torch.Tensor:
-    confidence = _confidence_unit(confidence)
-    height, width = confidence.shape[:2]
-    side = max(1, int(math.ceil(math.sqrt(count))))
-    points: list[list[float]] = []
-    for y_start in np.linspace(0, height, side + 1, dtype=int)[:-1]:
-        y_end = min(height, y_start + max(1, int(math.ceil(height / side))))
-        for x_start in np.linspace(0, width, side + 1, dtype=int)[:-1]:
-            x_end = min(width, x_start + max(1, int(math.ceil(width / side))))
-            cell = confidence[y_start:y_end, x_start:x_end]
-            if cell.size == 0:
-                continue
-            row, column = np.unravel_index(int(np.argmax(cell)), cell.shape)
-            points.append([float(x_start + column), float(y_start + row)])
-    return torch.tensor(points[:count], dtype=torch.float32)
-
-
-def _enrich_tracks(components: list[list[int]], relations: list[PhotoRelationResult], file_by_photo: dict[int, str], arrays: dict[int, _PhotoArrays]) -> None:
-    relation_by_pair = _relation_lookup(relations)
-    if not getattr(vggt_model, "supports_tracks", False):
-        for relation in relations:
-            relation.debug_metrics["track_status"] = "unavailable_for_vggt_omega"
-        logger.info("VGGT track verification skipped: VGGT-Omega has no public track head")
-        return
-    for component in components:
-        # A pathological global component must never turn into an all-listing track request.
-        group_size = max(2, int(settings.VGGT_TRACK_GROUP_MAX))
-        for start in range(0, len(component), group_size):
-            group = component[start:start + group_size]
-            if len(group) < 2:
-                continue
-            anchor = group[0]
-            query_points = _query_points_from_confidence(arrays[anchor].depth_conf, int(settings.VGGT_TRACK_POINTS_PER_IMAGE))
-            try:
-                tracks = vggt_model.predict_tracks([file_by_photo[photo_id] for photo_id in group], query_points)
-            except Exception as error:  # Do not create a fake track score.
-                logger.warning("VGGT track verification unavailable for component=%s: %s", group, error)
-                for left_index, left_id in enumerate(group):
-                    for right_id in group[left_index + 1:]:
-                        relation = relation_by_pair.get((min(left_id, right_id), max(left_id, right_id)))
-                        if relation is not None:
-                            relation.debug_metrics["track_status"] = "unavailable"
-                continue
-            visibility = _confidence_unit(tracks["visibility"].numpy())
-            confidence = _confidence_unit(tracks["confidence"].numpy())
-            track_positions = tracks["track"].numpy()
-            for left_index, left_id in enumerate(group):
-                for right_index in range(left_index + 1, len(group)):
-                    right_id = group[right_index]
-                    relation = relation_by_pair.get((min(left_id, right_id), max(left_id, right_id)))
-                    if relation is None:
-                        continue
-                    valid = (visibility[left_index] >= 0.5) & (visibility[right_index] >= 0.5) & (confidence[left_index] >= 0.5) & (confidence[right_index] >= 0.5)
-                    support = float(np.mean(valid)) if len(valid) else 0.0
-                    motion = np.median(track_positions[right_index, valid] - track_positions[left_index, valid], axis=0) if np.any(valid) else np.zeros(2)
-                    valid_indices = np.flatnonzero(valid)
-                    if len(valid_indices) > 24:
-                        valid_indices = valid_indices[np.linspace(0, len(valid_indices) - 1, 24, dtype=int)]
-                    track_matches = [
-                        {
-                            "from": [round(float(value), 2) for value in track_positions[left_index, point_index]],
-                            "to": [round(float(value), 2) for value in track_positions[right_index, point_index]],
-                        }
-                        for point_index in valid_indices
-                    ]
-                    relation.track_support = support
-                    relation.direction_dx = float(motion[0])
-                    relation.direction_dy = float(motion[1])
-                    relation.relation_confidence = float(np.clip(0.85 * relation.relation_confidence + 0.15 * support, 0.0, 1.0))
-                    relation.debug_metrics.update({
-                        "track_status": "verified",
-                        "track_points": int(len(valid)),
-                        "track_visible_fraction": support,
-                        "track_group_size": len(group),
-                        "track_matches": track_matches,
-                    })
-
-
-def _edge_score(left_id: int, right_id: int, relations: dict[tuple[int, int], PhotoRelationResult], positions: dict[int, int]) -> float:
+def _edge_score(
+    left_id: int,
+    right_id: int,
+    relations: dict[tuple[int, int], PhotoRelationResult],
+    positions: dict[int, int],
+) -> float:
     relation = relations.get((min(left_id, right_id), max(left_id, right_id)))
     if relation is None or not relation.is_connected:
         return -1e9
-    reprojection = relation.reprojection_score
     upload_proximity = math.exp(-abs(positions.get(left_id, 0) - positions.get(right_id, 0)) / 8.0)
     camera_motion = math.hypot(relation.direction_dx, relation.direction_dy)
     smoothness = math.exp(-max(camera_motion - 160.0, 0.0) / 160.0)
-    return 0.35 * relation.relation_confidence + 0.25 * relation.overlap_score + 0.20 * reprojection + 0.10 * smoothness + 0.10 * upload_proximity
+    return (
+        0.35 * relation.relation_confidence
+        + 0.25 * relation.overlap_score
+        + 0.20 * relation.reprojection_score
+        + 0.10 * smoothness
+        + 0.10 * upload_proximity
+    )
 
 
-def _order_component(component: list[int], relations: list[PhotoRelationResult], positions: dict[int, int]) -> list[int]:
+def _order_component(
+    component: list[int],
+    relations: list[PhotoRelationResult],
+    positions: dict[int, int],
+) -> list[int]:
     if len(component) <= 1:
-        return component
+        return list(component)
     relation_by_pair = _relation_lookup(relations)
-    width = 32
     states: list[tuple[float, list[int]]] = [(0.0, [photo_id]) for photo_id in component]
     for _ in range(1, len(component)):
         next_states: list[tuple[float, list[int]]] = []
@@ -889,50 +365,136 @@ def _order_component(component: list[int], relations: list[PhotoRelationResult],
                 next_states.append((score + edge, path + [candidate]))
         if not next_states:
             break
-        states = sorted(next_states, key=lambda state: (state[0], [-positions.get(photo_id, 0) for photo_id in state[1]]), reverse=True)[:width]
+        states = sorted(
+            next_states,
+            key=lambda state: (state[0], [-positions.get(photo_id, 0) for photo_id in state[1]]),
+            reverse=True,
+        )[:32]
     complete = [state for state in states if len(state[1]) == len(component)]
     if complete:
         return max(complete, key=lambda state: state[0])[1]
-    return sorted(component, key=lambda photo_id: positions.get(photo_id, 0))
+    return sorted(component, key=lambda photo_id: (positions.get(photo_id, 0), photo_id))
 
 
-def _scene_type(component: list[int], room_labels: dict[int, str]) -> str:
-    types = [_scene_type_for_label(room_labels.get(photo_id)) for photo_id in component]
-    return max(set(types), key=types.count) if types else "interior"
+def _incident_records(evidence: list[dict[str, Any]], photo_id: int) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in evidence
+        if int(record["photo_a_id"]) == photo_id or int(record["photo_b_id"]) == photo_id
+    ]
+
+
+def _photo_stats(
+    photo_id: int,
+    evidence: list[dict[str, Any]],
+    relations: list[PhotoRelationResult],
+) -> dict[str, float | int]:
+    records = _incident_records(evidence, photo_id)
+    raw_confidence: list[float] = []
+    valid_fraction: list[float] = []
+    directional_overlap: list[float] = []
+    errors: list[float] = []
+    for record in records:
+        is_a = int(record["photo_a_id"]) == photo_id
+        raw_confidence.append(float(record["conf_frame_a"] if is_a else record["conf_frame_b"]))
+        valid_fraction.append(float(record["valid_fraction_a"] if is_a else record["valid_fraction_b"]))
+        direction = record["forward"] if is_a else record["backward"]
+        directional_overlap.append(float(direction["depth_ok"]))
+        error = direction.get("median_relative_depth_error")
+        if error is not None and math.isfinite(float(error)):
+            errors.append(float(error))
+    direct = [
+        relation
+        for relation in relations
+        if relation.is_connected and photo_id in (relation.photo_a_id, relation.photo_b_id)
+    ]
+    depth_confidence = float(np.median([_confidence_fit(value) for value in raw_confidence])) if raw_confidence else 0.0
+    direct_confidence = float(np.mean([relation.relation_confidence for relation in direct])) if direct else 0.0
+    return {
+        "pose_confidence": 0.60 * depth_confidence + 0.40 * direct_confidence,
+        "depth_confidence": depth_confidence,
+        "visibility_score": float(np.mean(directional_overlap)) if directional_overlap else 0.0,
+        "reprojection_error": float(np.median(errors)) if errors else 0.0,
+        "valid_fraction": float(np.mean(valid_fraction)) if valid_fraction else 1.0,
+        "incident_pair_count": len(records),
+        "direct_edge_count": len(direct),
+    }
+
+
+def _hero_photo(
+    component: list[int],
+    evidence: list[dict[str, Any]],
+    relations: list[PhotoRelationResult],
+    quality_scores: dict[int, float],
+    room_labels: dict[int, str],
+    editorial_roles: dict[int, str],
+) -> int:
+    forced = sorted(photo_id for photo_id in component if editorial_roles.get(photo_id) == "hero")
+    if forced:
+        return forced[0]
+
+    def score(photo_id: int) -> tuple[float, int]:
+        stats = _photo_stats(photo_id, evidence, relations)
+        incident = _incident_records(evidence, photo_id)
+        novelty = max(
+            (min(abs(float(record["rot_deg"])) / 120.0, 1.0) for record in incident),
+            default=0.0,
+        )
+        importance = 1.0 if any(
+            token in str(room_labels.get(photo_id, "")).lower() for token in SOCIAL_LABEL_TOKENS
+        ) else 0.45
+        value = (
+            0.30 * float(np.clip(quality_scores.get(photo_id, 0.0), 0.0, 1.0))
+            + 0.25 * importance
+            + 0.20 * float(stats["visibility_score"])
+            + 0.15 * float(stats["pose_confidence"])
+            + 0.10 * novelty
+        )
+        return value, -photo_id
+
+    return max(component, key=score)
 
 
 def _motion_affordance(component: list[int], relations: list[PhotoRelationResult]) -> str:
-    internal = [
-        relation
-        for relation in relations
-        if relation.photo_a_id in component
-        and relation.photo_b_id in component
-        and relation.is_connected
-    ]
     if len(component) == 1:
         return "micro_push_in"
-    average_confidence = float(np.mean([relation.relation_confidence for relation in internal])) if internal else 0.0
-    safe_interpolation_fraction = float(np.mean([relation.continuity_type == "interpolation_safe" for relation in internal])) if internal else 0.0
-    if average_confidence >= 0.68 and safe_interpolation_fraction >= 0.50:
-        return "multi_view"
-    if average_confidence >= 0.45:
-        return "parallax"
-    return "reveal" if average_confidence >= 0.35 else "micro_push_in"
+    safe = [
+        relation
+        for relation in relations
+        if relation.is_connected
+        and relation.continuity_type == "interpolation_safe"
+        and relation.photo_a_id in component
+        and relation.photo_b_id in component
+    ]
+    return "multi_view" if safe else "micro_push_in"
 
 
-def _hero_photo(component: list[int], arrays: dict[int, _PhotoArrays], quality_scores: dict[int, float], room_labels: dict[int, str], editorial_roles: dict[int, str]) -> int:
-    forced = [photo_id for photo_id in component if editorial_roles.get(photo_id) == "hero"]
-    if forced:
-        return forced[0]
-    def score(photo_id: int) -> float:
-        data = arrays[photo_id]
-        quality = float(np.clip(quality_scores.get(photo_id, 0.0), 0.0, 1.0))
-        importance = 1.0 if any(token in str(room_labels.get(photo_id, "")).lower() for token in SOCIAL_LABEL_TOKENS) else 0.45
-        coverage = float(np.mean(_confidence_unit(data.point_conf) >= 0.5))
-        geometry = 0.5 * float(np.mean(_confidence_unit(data.depth_conf))) + 0.5 * float(np.mean(_confidence_unit(data.point_conf)))
-        novelty = min(1.0, float(np.std(data.depth)) / max(float(np.mean(data.depth)), 1e-6))
-        return 0.30 * quality + 0.25 * importance + 0.20 * coverage + 0.15 * geometry + 0.10 * novelty
-    return max(component, key=score)
+def _geometry_result(
+    photo_id: int,
+    component_key: str,
+    pose: CameraPose,
+    evidence: list[dict[str, Any]],
+    relations: list[PhotoRelationResult],
+    runtime: dict[str, Any],
+) -> PhotoGeometryResult:
+    stats = _photo_stats(photo_id, evidence, relations)
+    return PhotoGeometryResult(
+        photo_id=photo_id,
+        pose_confidence=float(stats["pose_confidence"]),
+        depth_confidence=float(stats["depth_confidence"]),
+        visibility_score=float(stats["visibility_score"]),
+        reprojection_error=float(stats["reprojection_error"]),
+        camera_extrinsic=pose.extrinsic().tolist(),
+        camera_center=pose.center.tolist(),
+        view_direction=pose.view_direction.tolist(),
+        local_metrics={
+            **stats,
+            "geometry_source": "vggt_pairwise_pose_graph",
+            "coordinate_frame": component_key,
+            "coordinate_scope": "component_local",
+            "runtime": runtime,
+        },
+    )
 
 
 def run_vggt_scene_pipeline(
@@ -942,108 +504,117 @@ def run_vggt_scene_pipeline(
     positions: list[int],
     *,
     job_id: int,
-    s3_client: S3Client | None = None,
     quality_scores: dict[int, float] | None = None,
     editorial_roles: dict[int, str] | None = None,
     embeddings: dict[int, list] | None = None,
 ) -> tuple[list[PhotoGeometryResult], list[PhotoRelationResult], list[SceneComponentResult]]:
+    """Run the V2-only scene graph without whole-listing Omega inference."""
     if not images:
         return [], [], []
+    if len(images) != len(photo_ids):
+        raise ValueError("images and photo_ids must have the same length")
+
     quality_scores = quality_scores or {}
     editorial_roles = editorial_roles or {}
-    logger.info("VGGT_SCENE_PIPELINE_START job_id=%s photos=%s", job_id, len(images))
+    labels = {
+        int(photo_id): str(room_labels[index] if index < len(room_labels) else "")
+        for index, photo_id in enumerate(photo_ids)
+    }
+    position_map = {
+        int(photo_id): int(positions[index] if index < len(positions) else index)
+        for index, photo_id in enumerate(photo_ids)
+    }
+    logger.info("VGGT_V2_PIPELINE_START job_id=%s photos=%s", job_id, len(images))
+    started = time.monotonic()
     directory, filelist = _save_input_images(images, photo_ids)
     try:
-        predictions, window_strategy = _predict_with_retries(filelist)
-        logger.info(
-            "VGGT_RECONSTRUCTION_COMPLETE job_id=%s photos=%s strategy=%s runtime_seconds=%s",
-            job_id,
-            len(images),
-            window_strategy.get("kind"),
-            predictions.get("runtime", {}).get("runtime_seconds"),
-        )
-        predictions["runtime"]["window_strategy"] = window_strategy
-        arrays: dict[int, _PhotoArrays] = {}
-        geometries: list[PhotoGeometryResult] = []
-        for index, photo_id in enumerate(photo_ids):
-            data = _PhotoArrays(
-                extrinsic=np.asarray(predictions["extrinsic"][index], dtype=np.float64),
-                intrinsic=np.asarray(predictions["intrinsic"][index], dtype=np.float64),
-                depth=np.asarray(predictions["depth_map"][index], dtype=np.float64),
-                depth_conf=np.asarray(predictions["depth_conf"][index], dtype=np.float64),
-                point_map=np.asarray(predictions["point_map"][index], dtype=np.float64),
-                point_conf=np.asarray(predictions["point_conf"][index], dtype=np.float64),
-                world_points=np.asarray(predictions["point_map_unprojected"][index], dtype=np.float64),
-            )
-            arrays[int(photo_id)] = data
-            depth_confidence = float(np.mean(_confidence_unit(data.depth_conf)))
-            point_confidence = float(np.mean(_confidence_unit(data.point_conf)))
-            cinematic_depth = _depth_metrics(data.depth)
-            depth_uri = _artifact_uri(s3_client, f"jobs/{job_id}/geometry/photo_{photo_id}_depth.npz", data.depth)
-            point_uri = _artifact_uri(s3_client, f"jobs/{job_id}/geometry/photo_{photo_id}_pointmap.npz", data.world_points)
-            geometries.append(PhotoGeometryResult(
-                photo_id=int(photo_id),
-                pose_confidence=float(0.5 * depth_confidence + 0.5 * point_confidence),
-                depth_confidence=depth_confidence,
-                point_confidence=point_confidence,
-                visibility_score=float(np.mean(_confidence_unit(data.point_conf) >= 0.5)),
-                reprojection_error=0.0,
-                camera_extrinsic=data.extrinsic.tolist(),
-                camera_intrinsic=data.intrinsic.tolist(),
-                camera_center=_camera_center(data.extrinsic).tolist(),
-                view_direction=_view_direction(data.extrinsic).tolist(),
-                depth_artifact_uri=depth_uri,
-                point_map_artifact_uri=point_uri,
-                local_metrics={
-                    "depth_mean": float(np.mean(data.depth)),
-                    "depth_std": float(np.std(data.depth)),
-                    **cinematic_depth,
-                    "runtime": predictions["runtime"],
-                },
-            ))
-        labels = {int(photo_id): str(room_labels[index] if index < len(room_labels) else "") for index, photo_id in enumerate(photo_ids)}
-        position_map = {int(photo_id): int(positions[index] if index < len(positions) else index) for index, photo_id in enumerate(photo_ids)}
+        runtime = vggt_model.runtime_metadata()
         file_by_photo = {int(photo_id): filelist[index] for index, photo_id in enumerate(photo_ids)}
-        if settings.SCENE_GRAPH_V2:
-            relations, components = _v2_scene_graph(
-                file_by_photo, labels, position_map, arrays, embeddings or {}
-            )
-        else:
-            relations = _compute_pair_relations(arrays, labels)
-            components = _connected_components(photo_ids, relations)
-        logger.info("SCENE_COMPONENTS_BUILT job_id=%s components=%s", job_id, len(components))
-        _enrich_tracks(components, relations, file_by_photo, arrays)
+        relations, components, evidence, graph_stats = _v2_scene_graph(
+            file_by_photo,
+            labels,
+            position_map,
+            embeddings or {},
+            runtime=runtime,
+        )
+        runtime = {
+            **runtime,
+            **graph_stats,
+            "image_count": len(images),
+            "runtime_seconds": time.monotonic() - started,
+            "planner": "scene_graph_v2_pairwise_only",
+        }
+
+        geometry_by_photo: dict[int, PhotoGeometryResult] = {}
         results: list[SceneComponentResult] = []
         for index, component in enumerate(components):
+            component_key = f"component-{index + 1}"
             ordered = _order_component(component, relations, position_map)
             internal = [
                 relation
                 for relation in relations
-                if relation.photo_a_id in component
+                if relation.is_connected
+                and relation.photo_a_id in component
                 and relation.photo_b_id in component
-                and relation.is_connected
             ]
-            component_geometries = [geometry for geometry in geometries if geometry.photo_id in component]
-            results.append(SceneComponentResult(
-                component_key=f"component-{index + 1}",
-                photo_ids=component,
-                ordered_photo_ids=ordered,
-                scene_type=_scene_type(component, labels),
-                geometry_confidence=float(np.mean([geometry.pose_confidence for geometry in component_geometries])),
-                connectivity_confidence=float(np.mean([relation.relation_confidence for relation in internal])) if internal else 0.0,
-                track_coverage=float(np.mean([relation.track_support for relation in internal])) if internal else 0.0,
-                avg_reprojection_error=float(np.mean([1.0 - relation.reprojection_score for relation in internal])) if internal else 0.0,
-                hero_photo_id=_hero_photo(component, arrays, quality_scores, labels, editorial_roles),
-                depth_range=float(np.ptp([float(np.mean(arrays[photo_id].depth)) for photo_id in component])),
-                motion_affordance=_motion_affordance(component, relations),
-                debug_metrics={"runtime": predictions["runtime"], "photo_ids": component, "ordered_photo_ids": ordered, "verified_edge_count": sum(1 for relation in internal if relation.is_connected)},
-            ))
+            poses, pose_stats = solve_component_poses(component, relations)
+            for photo_id in component:
+                geometry_by_photo[photo_id] = _geometry_result(
+                    photo_id,
+                    component_key,
+                    poses[photo_id],
+                    evidence,
+                    relations,
+                    runtime,
+                )
+            component_geometries = [geometry_by_photo[photo_id] for photo_id in component]
+            results.append(
+                SceneComponentResult(
+                    component_key=component_key,
+                    photo_ids=list(component),
+                    ordered_photo_ids=ordered,
+                    scene_type=_scene_type(component, labels),
+                    geometry_confidence=float(
+                        np.mean([geometry.pose_confidence for geometry in component_geometries])
+                    ),
+                    connectivity_confidence=(
+                        float(np.mean([relation.relation_confidence for relation in internal]))
+                        if internal
+                        else 0.0
+                    ),
+                    avg_reprojection_error=(
+                        float(np.mean([1.0 - relation.reprojection_score for relation in internal]))
+                        if internal
+                        else 0.0
+                    ),
+                    hero_photo_id=_hero_photo(
+                        component,
+                        evidence,
+                        relations,
+                        quality_scores,
+                        labels,
+                        editorial_roles,
+                    ),
+                    motion_affordance=_motion_affordance(component, relations),
+                    debug_metrics={
+                        "runtime": runtime,
+                        "photo_ids": list(component),
+                        "ordered_photo_ids": ordered,
+                        "verified_edge_count": len(internal),
+                        "coordinate_frame": component_key,
+                        "pose_graph": pose_stats,
+                    },
+                )
+            )
+
+        geometries = [geometry_by_photo[int(photo_id)] for photo_id in photo_ids]
         logger.info(
-            "VGGT_SCENE_PIPELINE_COMPLETE job_id=%s geometries=%s relations=%s components=%s",
+            "VGGT_V2_PIPELINE_COMPLETE job_id=%s geometries=%s relations=%s components=%s runtime_seconds=%.3f",
             job_id,
             len(geometries),
             len(relations),
             len(results),
+            time.monotonic() - started,
         )
         return geometries, relations, results
     finally:

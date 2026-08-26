@@ -15,25 +15,21 @@ import sys
 import tempfile
 import time
 
-import numpy as np
 from sqlalchemy import text
 
 import torch
 
 from app.db.session import SessionLocal
 from app.models.vggt import vggt_model
-from app.pipeline.phase1_analyze.candidate_pairs import nominate, split_tiers
+from app.pipeline.phase1_analyze.candidate_pairs import nominate
 from app.pipeline.phase1_analyze.pairwise_verify import (
-    EVIDENCE_SCHEMA_VERSION,
     canonical_order_with_ids,
-    evidence_key,
-    verify,
+    verify_with_cache,
 )
 from app.core.config import settings
 from app.services.storage.s3_client import s3_client
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "tmp_sweep")
-CACHE = os.path.join(OUT, "cache")
 # Sustained MPS inference degrades badly without periodic release: the first run
 # went 0.85 -> 4.3 s/pair over ~350 calls on a cold machine with 12 GB free, so it
 # was allocator growth rather than thermal or system memory pressure.
@@ -47,22 +43,6 @@ def _release_accelerator() -> None:
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-
-
-def _cached(key: str) -> dict | None:
-    path = os.path.join(CACHE, f"{key}.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as handle:
-            record = json.load(handle)
-        if not isinstance(record, dict):
-            return None
-        if record.get("_evidence_schema_version") != EVIDENCE_SCHEMA_VERSION:
-            return None
-        return record
-    except (json.JSONDecodeError, OSError):
-        return None   # a torn write from an interrupted run; just recompute
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -80,10 +60,6 @@ def _write_json_atomic(path: str, payload: dict) -> None:
             os.unlink(temporary)
 
 
-def _store(key: str, record: dict) -> None:
-    _write_json_atomic(os.path.join(CACHE, f"{key}.json"), record)
-
-
 def _download(db, job_id: int, directory: str) -> dict[int, str]:
     rows = db.execute(
         text("SELECT id, s3_uri FROM job_photos WHERE job_id = :j ORDER BY position"), {"j": job_id}
@@ -98,7 +74,7 @@ def _download(db, job_id: int, directory: str) -> dict[int, str]:
     return paths
 
 
-def sweep(project_id: str, limit: int | None = None, tier: str = "primary") -> dict:
+def sweep(project_id: str, limit: int | None = None) -> dict:
     db = SessionLocal()
     try:
         truth = db.execute(
@@ -113,25 +89,9 @@ def sweep(project_id: str, limit: int | None = None, tier: str = "primary") -> d
             text("SELECT id, rails_photo_id, position, room_label, embedding "
                  "FROM job_photos WHERE job_id = :j"), {"j": job_id}
         ).fetchall()
-        geo = db.execute(
-            text("SELECT photo_id, camera_center, view_direction FROM photo_scene_geometry WHERE job_id = :j"),
-            {"j": job_id},
-        ).fetchall()
-        rels = db.execute(
-            text("SELECT photo_a_id a, photo_b_id b, debug_metrics->>'same_scene_score' s "
-                 "FROM photo_relations WHERE job_id = :j"), {"j": job_id}
-        ).fetchall()
-
         photos = [{"id": r.id, "position": r.position, "room_label": r.room_label} for r in rows]
         embeddings = {int(r.id): r.embedding for r in rows if r.embedding}
-        centers = {int(g.photo_id): np.array(g.camera_center, dtype=float) for g in geo if g.camera_center}
-        views = {int(g.photo_id): np.array(g.view_direction, dtype=float) for g in geo if g.view_direction}
-        scores = {(int(r.a), int(r.b)): float(r.s) for r in rels if r.s is not None}
-
-        candidates = nominate(photos, embeddings=embeddings, global_scores=scores,
-                              centers=centers, views=views)
-        primary, fallback = split_tiers(candidates)
-        candidates = primary if tier == "primary" else fallback if tier == "fallback" else candidates
+        candidates = nominate(photos, embeddings=embeddings)
         if limit:
             candidates = candidates[:limit]
 
@@ -151,11 +111,7 @@ def sweep(project_id: str, limit: int | None = None, tier: str = "primary") -> d
         db.close()
 
     runtime = vggt_model.runtime_metadata()
-    checkpoint_sha = str(runtime["checkpoint_sha256"])
-    model_revision = str(runtime.get("repo_commit") or "")
-    precision = str(runtime.get("dtype") or "")
-    mode, size = str(settings.VGGT_IMAGE_MODE).lower(), int(settings.VGGT_IMAGE_SIZE)
-    print(f"\n=== {slug}: {len(photos)} photos, {len(candidates)} {tier} pairs ===", flush=True)
+    print(f"\n=== {slug}: {len(photos)} photos, {len(candidates)} V2 pairs ===", flush=True)
     results = []
     started = time.monotonic()
     computed = hits = 0
@@ -164,32 +120,17 @@ def sweep(project_id: str, limit: int | None = None, tier: str = "primary") -> d
         (path_a, evidence_a), (path_b, evidence_b) = canonical_order_with_ids(
             paths[a], a, paths[b], b
         )
-        key = evidence_key(
-            path_a,
-            path_b,
-            checkpoint_sha,
-            mode,
-            size,
-            model_revision=model_revision,
-            precision=precision,
-        )
-        record = _cached(key)
-        if record is None:
-            evidence = verify(path_a, path_b)
-            record = evidence.to_dict()
-            record["_evidence_schema_version"] = EVIDENCE_SCHEMA_VERSION
-            _store(key, record)          # persisted per pair: an interrupt loses one run
-            computed += 1
-            if computed % RELEASE_EVERY == 0:
-                _release_accelerator()
-        else:
-            hits += 1
+        record, cache_hit, _ = verify_with_cache(path_a, path_b, runtime=runtime)
+        computed += int(not cache_hit)
+        hits += int(cache_hit)
+        if not cache_hit and computed % RELEASE_EVERY == 0:
+            _release_accelerator()
         record = dict(record)
         record.update({
             # Directional pose/motion in `record` is canonical A -> B, so the
             # attached ids must use the same content-hash order.
             "photo_a_id": evidence_a, "photo_b_id": evidence_b,
-            "sources": sorted(pair.sources), "tier": pair.tier,
+            "sources": sorted(pair.sources),
             "room_a": room_of.get(evidence_a), "room_b": room_of.get(evidence_b),
             "same_room": (
                 room_of.get(evidence_a) is not None
@@ -207,14 +148,13 @@ def sweep(project_id: str, limit: int | None = None, tier: str = "primary") -> d
 
     # A partial run must never overwrite a completed sweep of the same listing.
     suffix = f".partial-{len(results)}" if limit else ""
-    out_path = os.path.join(OUT, f"{slug}.{tier}{suffix}.json")
+    out_path = os.path.join(OUT, f"{slug}.v2{suffix}.json")
     _write_json_atomic(
         out_path,
         {
             "listing": slug,
             "project_id": project_id,
             "job_id": job_id,
-            "tier": tier,
             "photos": len(photos),
             "pairs": results,
         },
@@ -228,7 +168,6 @@ def sweep(project_id: str, limit: int | None = None, tier: str = "primary") -> d
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--tier", choices=["primary", "fallback", "all"], default="primary")
     args = parser.parse_args()
     db = SessionLocal()
     try:
@@ -238,7 +177,7 @@ def main() -> None:
     finally:
         db.close()
     for project_id in project_ids:
-        sweep(project_id, args.limit, args.tier)
+        sweep(project_id, args.limit)
     print("\nSWEEP COMPLETE", flush=True)
 
 

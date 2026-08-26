@@ -1,5 +1,6 @@
 """Application configuration loaded from environment variables."""
 from typing import List
+
 from pydantic_settings import BaseSettings
 
 
@@ -47,41 +48,11 @@ class Settings(BaseSettings):
     VGGT_PRECISION: str = "auto"
     VGGT_IMAGE_SIZE: int = 512
     VGGT_IMAGE_MODE: str = "balanced"
-    VGGT_RETRY_WINDOW_SIZE: int = 16
-    VGGT_RETRY_WINDOW_OVERLAP: int = 6
-    VGGT_FINAL_WINDOW_SIZE: int = 10
-    VGGT_FINAL_WINDOW_OVERLAP: int = 4
-    VGGT_TRACK_POINTS_PER_IMAGE: int = 64
-    VGGT_TRACK_GROUP_MAX: int = 8
-    VGGT_MAX_GEOMETRY_POINTS_PER_PAIR: int = 4096
     # Raw threshold-free pair evidence. Shared with the calibration sweep so a
     # re-analysis can reuse model inference and only rerun graph policy.
     VGGT_PAIR_CACHE_DIR: str = "./tmp_sweep/cache"
-    # Pairwise scene graph. V1's single-global-pass grouping is superseded: it
-    # measured recall 0.32/0.66/0.33 against human labels vs 0.69/0.84/0.65 for V2.
-    # Kept as a switch only for emergency rollback.
-    SCENE_GRAPH_V2: bool = True
-    ALLOW_SYNTHETIC_GEOMETRY: bool = False
-    VGGT_RELATION_SCORE_THRESHOLD: float = 0.50
-    VGGT_BRIDGE_SCORE_THRESHOLD: float = 0.42
-    VGGT_USE_BUNDLE_ADJUSTMENT_EXPORT: bool = False
-    VGGT_INTERIOR_EXTERIOR_PENALTY: float = 0.18
-    VGGT_INTERIOR_DRONE_PENALTY: float = 0.24
-    VGGT_EXTERIOR_DRONE_PENALTY: float = 0.12
-    VGGT_CROSS_DOMAIN_CONFIDENCE_BONUS: float = 0.08
-    VGGT_BRIDGE_POSITION_GAP_MAX: int = 3
-    VGGT_OUTLIER_CONFIDENCE_THRESHOLD: float = 0.44
-    VGGT_MIXED_COMPONENT_SPLIT_THRESHOLD: float = 0.56
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
-
-    # Clustering behavior
-    DELETE_OBVIOUS_DUPLICATES: bool = True
-    GEOMETRY_ONLY_CLUSTER_MEMBERSHIP: bool = True
-    SCENE_RELATION_POSITION_GAP_WEIGHT: float = 0.08
-    SCENE_RELATION_ROOM_LABEL_WEIGHT: float = 0.12
-    SCENE_INTERIOR_CONFIDENCE_THRESHOLD: float = 0.60
-    SCENE_EXTERIOR_CONFIDENCE_THRESHOLD: float = 0.52
 
     # Logging
     LOG_LEVEL: str = "INFO"

@@ -86,7 +86,6 @@ def cluster_photos_by_room(
         room_labels=room_labels,
         positions=positions,
         job_id=int(job.id),
-        s3_client=s3_client,
         quality_scores=quality_scores,
         editorial_roles=editorial_roles,
         embeddings=embeddings,
@@ -141,10 +140,10 @@ def _replace_scene_state(
             photo_count=len(component.photo_ids),
             geometry_confidence=component.geometry_confidence,
             connectivity_confidence=component.connectivity_confidence,
-            track_coverage=component.track_coverage,
+            track_coverage=None,
             avg_reprojection_error=component.avg_reprojection_error,
             hero_photo_id=component.hero_photo_id,
-            depth_range=component.depth_range,
+            depth_range=None,
             motion_affordance=component.motion_affordance,
             debug_metrics=component.debug_metrics,
         )
@@ -179,8 +178,10 @@ def _replace_scene_state(
     for geometry in geometries:
         photo = photo_map.get(int(geometry.photo_id))
         if photo is not None:
-            photo.depth_variance = float(geometry.local_metrics.get("depth_variance", 0.0))
-            photo.depth_layers = int(geometry.local_metrics.get("depth_layers", 1))
+            # V2 does not run a whole-listing depth pass. Clear legacy values so a
+            # re-analysis cannot silently reuse stale V1 metrics.
+            photo.depth_variance = None
+            photo.depth_layers = None
         component_id = next(
             (
                 component_id_by_key[component.component_key]
@@ -196,15 +197,15 @@ def _replace_scene_state(
                 scene_component_id=component_id,
                 pose_confidence=geometry.pose_confidence,
                 depth_confidence=geometry.depth_confidence,
-                point_confidence=geometry.point_confidence,
+                point_confidence=None,
                 visibility_score=geometry.visibility_score,
                 reprojection_error=geometry.reprojection_error,
                 camera_extrinsic=geometry.camera_extrinsic,
-                camera_intrinsic=geometry.camera_intrinsic,
+                camera_intrinsic=None,
                 camera_center=geometry.camera_center,
                 view_direction=geometry.view_direction,
-                depth_artifact_uri=geometry.depth_artifact_uri,
-                point_map_artifact_uri=geometry.point_map_artifact_uri,
+                depth_artifact_uri=None,
+                point_map_artifact_uri=None,
                 local_metrics={**geometry.local_metrics, "photo_role": role_by_photo.get(int(geometry.photo_id), "support")},
             )
         )
@@ -222,7 +223,7 @@ def _replace_scene_state(
                 photo_b_id=int(relation.photo_b_id),
                 scene_component_id=component_id,
                 overlap_score=relation.overlap_score,
-                track_support=relation.track_support,
+                track_support=None,
                 reprojection_score=relation.reprojection_score,
                 relation_confidence=relation.relation_confidence,
                 baseline_distance=relation.baseline_distance,
@@ -264,7 +265,6 @@ def _materialize_room_clusters(
             geometry_confidence = component.geometry_confidence
             confidence_tier = _confidence_tier(geometry_confidence, component.motion_affordance, len(cluster_photos))
             overlap_score = _cluster_overlap_score(cluster_photos, relation_by_pair)
-            depth_variance = _cluster_depth_variance(cluster_photos)
             cluster = RoomCluster(
                 job_id=int(job.id),
                 scene_component_id=int(scene_row.id),
@@ -273,7 +273,7 @@ def _materialize_room_clusters(
                 sfm_eligible=component.motion_affordance in {"parallax", "multi_view"} and len(cluster_photos) >= 2,
                 image_count=len(cluster_photos),
                 overlap_score=overlap_score,
-                depth_variance=depth_variance,
+                depth_variance=None,
                 geometry_confidence=geometry_confidence,
                 sequence_order=sequence_order,
                 recommended_motion=component.motion_affordance,
@@ -344,8 +344,3 @@ def _cluster_overlap_score(photos: list[JobPhoto], relations_by_pair: dict[tuple
         if relation is not None:
             scores.append(float(relation.overlap_score))
     return float(sum(scores) / len(scores)) if scores else 0.0
-
-
-def _cluster_depth_variance(photos: list[JobPhoto]) -> float:
-    values = [float(photo.depth_variance) for photo in photos if photo.depth_variance is not None]
-    return float(sum(values) / len(values)) if values else 0.0
