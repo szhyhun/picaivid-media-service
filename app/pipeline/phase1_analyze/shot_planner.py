@@ -108,6 +108,11 @@ def _build_shot(
     duration = analysis.recommended_duration if analysis is not None else cluster.recommended_duration
     confidence = float(cluster.geometry_confidence or 0.0)
     multi_view = bool(cluster.sfm_eligible and len(photos) > 1 and confidence >= 0.56)
+    # A verified two-photo group is still two real photographs even when generated
+    # camera motion between them is not authorized (V2 withholds interpolation
+    # until transition ground truth exists). Reporting "single image move" for it
+    # was simply wrong: the shot contains two images and cuts between them.
+    verified_pair = bool(not multi_view and len(photos) > 1)
     connection_evidence = _connection_evidence(photos, relations or {})
     return {
         "cluster_id": int(cluster.id),
@@ -116,7 +121,11 @@ def _build_shot(
         "story_role": role,
         "ordered_photo_ids": [int(photo.id) for photo in photos],
         "hero_photo_id": int(hero.id),
-        "shot_type": "verified_multi_view" if multi_view else "single_image_move",
+        "shot_type": (
+            "verified_multi_view" if multi_view
+            else "verified_pair" if verified_pair
+            else "single_image_move"
+        ),
         "motion_intent": motion or "subtle_pan",
         "duration_seconds": float(duration or 3.0),
         "transition_type": "opening",
@@ -141,7 +150,7 @@ def _build_shot(
                 else "single_view"
             ),
         },
-        "rejection_reasons": _rejection_reasons(multi_view, analysis),
+        "rejection_reasons": _rejection_reasons(multi_view, analysis, verified_pair),
     }
 
 
@@ -274,13 +283,23 @@ def _editorial_role(photo: JobPhoto) -> str:
     return role if role in {"auto", "opening", "hero", "closing", "exclude"} else "auto"
 
 
-def _rejection_reasons(multi_view: bool, analysis: AnalysisResult | None) -> list[str]:
+def _rejection_reasons(
+    multi_view: bool, analysis: AnalysisResult | None, verified_pair: bool = False
+) -> list[str]:
     reason = None
     if analysis is not None and isinstance(analysis.debug_metrics, dict):
         reason = analysis.debug_metrics.get("motion_fallback_reason")
     reasons = [str(reason)] if reason else []
     if not multi_view:
-        reasons.insert(0, "Insufficient verified multi-view continuity; use a single-image move.")
+        # Distinguish "the photos are not verified together" from "they are
+        # verified together but generated motion between them is not authorized".
+        # Reporting the first for both was misleading.
+        reasons.insert(0, (
+            "Verified same-room pair; generated camera motion between the two views "
+            "is withheld until transition safety is labeled. Cut between them."
+            if verified_pair else
+            "Insufficient verified multi-view continuity; use a single-image move."
+        ))
     return reasons
 
 

@@ -40,9 +40,11 @@ def _allocated_memory_mb(device: str) -> float | None:
 
 
 def _log_stage(stage: str, started_at: float, device: str, image_count: int) -> None:
-    _synchronize_device(device)
+    if settings.VGGT_PROFILE_STAGES:
+        _synchronize_device(device)
     allocated = _allocated_memory_mb(device)
-    logger.info(
+    log = logger.info if settings.VGGT_PROFILE_STAGES else logger.debug
+    log(
         "VGGT_OMEGA_STAGE_COMPLETE stage=%s images=%s elapsed_seconds=%.3f allocated_mb=%s",
         stage,
         image_count,
@@ -58,11 +60,20 @@ class _OmegaImports:
     encoding_to_camera: Any
 
 
+@dataclass(frozen=True)
+class PreparedImage:
+    """One exactly preprocessed Omega frame kept on CPU for pair reuse."""
+
+    tensor: torch.Tensor
+
+
+@lru_cache(maxsize=1)
 def _resolve_repo_dir() -> str:
     fallback = os.path.abspath(os.path.join(os.path.dirname(settings.MODEL_CACHE_DIR), "..", "third_party", "vggt-omega"))
     return _ensure_local_repo(str(settings.VGGT_REPO_DIR or fallback), "VGGT_REPO_ARCHIVE_S3_URI")
 
 
+@lru_cache(maxsize=1)
 def _resolve_checkpoint_path() -> str:
     repo_dir = _resolve_repo_dir()
     if settings.VGGT_MODEL_CHECKPOINT:
@@ -136,6 +147,7 @@ def _file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=2)
 def _repo_commit(repo_dir: str) -> str | None:
     try:
         return subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "HEAD"], text=True).strip()
@@ -237,6 +249,37 @@ def _valid_pixel_masks(image_paths: list[str], padded_hw: tuple[int, int]) -> to
     return masks
 
 
+def _stack_prepared_images(prepared: list[PreparedImage]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reproduce Omega's centered white padding for cached single-image tensors."""
+    if not prepared:
+        raise ValueError("At least one prepared image is required")
+    max_height = max(int(item.tensor.shape[1]) for item in prepared)
+    max_width = max(int(item.tensor.shape[2]) for item in prepared)
+    images: list[torch.Tensor] = []
+    masks: list[torch.Tensor] = []
+    for item in prepared:
+        image = item.tensor
+        height, width = int(image.shape[1]), int(image.shape[2])
+        height_padding = max_height - height
+        width_padding = max_width - width
+        top = height_padding // 2
+        bottom = height_padding - top
+        left = width_padding // 2
+        right = width_padding - left
+        if height_padding or width_padding:
+            image = torch.nn.functional.pad(
+                image,
+                (left, right, top, bottom),
+                mode="constant",
+                value=1.0,
+            )
+        mask = torch.zeros((max_height, max_width), dtype=torch.bool)
+        mask[top : top + height, left : left + width] = True
+        images.append(image)
+        masks.append(mask)
+    return torch.stack(images), torch.stack(masks)
+
+
 class VGGTModel:
     """Runs VGGT-Omega and normalizes its outputs for the scene planner."""
 
@@ -280,54 +323,91 @@ class VGGTModel:
         )
         return images.to(self.device, dtype=self.dtype)
 
-    def predict(self, image_paths: list[str]) -> dict[str, Any]:
+    def prepare_image(self, image_path: str) -> PreparedImage:
+        """Preprocess one image once on CPU for reuse across candidate pairs."""
         imports = _load_imports()
-        model = _load_model()
-        started_at = monotonic()
-        logger.info(
-            "VGGT_OMEGA_INFERENCE_START images=%s device=%s dtype=%s",
-            len(image_paths), self.device, str(self.dtype).replace("torch.", ""),
-        )
+        mode = str(settings.VGGT_IMAGE_MODE).lower()
+        if mode not in {"balanced", "max_size"}:
+            raise RuntimeError("VGGT_IMAGE_MODE must be 'balanced' or 'max_size'")
+        tensor = imports.load_and_preprocess_images(
+            [image_path],
+            mode=mode,
+            image_resolution=int(settings.VGGT_IMAGE_SIZE),
+        )[0]
+        return PreparedImage(tensor=tensor.contiguous())
+
+    def predict_prepared(self, prepared: list[PreparedImage]) -> dict[str, Any]:
+        """Run Omega on cached frames with byte-identical official pair padding."""
+        images, valid_mask = _stack_prepared_images(prepared)
+        return self._predict_tensors(images, valid_mask)
+
+    def predict(self, image_paths: list[str]) -> dict[str, Any]:
         stage_started_at = monotonic()
-        images = self.load_and_preprocess_images(image_paths)[None]
+        images = self.load_and_preprocess_images(image_paths)
         valid_mask = _valid_pixel_masks(image_paths, tuple(images.shape[-2:]))
         _log_stage("preprocess", stage_started_at, self.device, len(image_paths))
+        return self._predict_tensors(images, valid_mask)
+
+    def _predict_tensors(
+        self,
+        images: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, Any]:
+        imports = _load_imports()
+        model = _load_model()
+        image_count = int(images.shape[0])
+        started_at = monotonic()
+        logger.debug(
+            "VGGT_OMEGA_INFERENCE_START images=%s device=%s dtype=%s",
+            image_count,
+            self.device,
+            str(self.dtype).replace("torch.", ""),
+        )
+        images = images.to(self.device, dtype=self.dtype)[None]
         with torch.inference_mode():
             # Omega's public forward hardcodes CUDA autocast. Execute its heads
             # directly so MPS stays on supported float32 without mutating its repo.
             stage_started_at = monotonic()
             with _autocast(self.device, self.dtype):
                 aggregated_tokens_list, patch_token_start = model.aggregator(images)
-            _log_stage("aggregator", stage_started_at, self.device, len(image_paths))
+            _log_stage("aggregator", stage_started_at, self.device, image_count)
             if aggregated_tokens_list[-1] is None:
                 raise RuntimeError("VGGT-Omega did not produce final aggregator tokens")
             stage_started_at = monotonic()
             pose_encoding = model.camera_head(aggregated_tokens_list, patch_token_start=patch_token_start)
             extrinsic, intrinsic = imports.encoding_to_camera(pose_encoding, images.shape[-2:])
-            _log_stage("camera_head", stage_started_at, self.device, len(image_paths))
+            _log_stage("camera_head", stage_started_at, self.device, image_count)
             stage_started_at = monotonic()
             depth_map, depth_conf = model.dense_head(
                 aggregated_tokens_list,
                 images=images,
                 patch_token_start=patch_token_start,
             )
-            _log_stage("depth_head", stage_started_at, self.device, len(image_paths))
+            _log_stage("depth_head", stage_started_at, self.device, image_count)
             stage_started_at = monotonic()
             unprojected = _unproject_depth(depth_map.squeeze(0), extrinsic.squeeze(0), intrinsic.squeeze(0))
-            _log_stage("unproject", stage_started_at, self.device, len(image_paths))
+            _log_stage("unproject", stage_started_at, self.device, image_count)
+        # These copies are the single synchronization point in normal operation.
+        # Do not copy aliases (`point_conf`, `point_map_unprojected`) a second time.
+        extrinsic_cpu = extrinsic.squeeze(0).detach().cpu()
+        intrinsic_cpu = intrinsic.squeeze(0).detach().cpu()
+        depth_cpu = depth_map.squeeze(0).detach().cpu()
+        confidence_cpu = depth_conf.squeeze(0).detach().cpu()
+        points_cpu = unprojected.detach().cpu()
         runtime = self.runtime_metadata()
-        runtime.update({"image_count": len(image_paths), "runtime_seconds": round(monotonic() - started_at, 3)})
-        logger.info("VGGT_OMEGA_INFERENCE_COMPLETE images=%s runtime_seconds=%.3f", len(image_paths), monotonic() - started_at)
-        # Omega predicts depth confidence but not a separate point confidence.
-        # The planner uses that same measured confidence for point selection.
+        runtime.update({"image_count": image_count, "runtime_seconds": round(monotonic() - started_at, 3)})
+        completion_log = logger.info if settings.VGGT_PROFILE_STAGES else logger.debug
+        completion_log(
+            "VGGT_OMEGA_INFERENCE_COMPLETE images=%s runtime_seconds=%.3f",
+            image_count,
+            monotonic() - started_at,
+        )
         return {
-            "extrinsic": extrinsic.squeeze(0).detach().cpu(),
-            "intrinsic": intrinsic.squeeze(0).detach().cpu(),
-            "depth_map": depth_map.squeeze(0).detach().cpu(),
-            "depth_conf": depth_conf.squeeze(0).detach().cpu(),
-            "point_map": unprojected.detach().cpu(),
-            "point_conf": depth_conf.squeeze(0).detach().cpu(),
-            "point_map_unprojected": unprojected.detach().cpu(),
+            "extrinsic": extrinsic_cpu,
+            "intrinsic": intrinsic_cpu,
+            "depth_map": depth_cpu,
+            "depth_conf": confidence_cpu,
+            "point_map": points_cpu,
             # True where a pixel is real image data; False where preprocessing padded.
             "valid_mask": valid_mask,
             "runtime": runtime,

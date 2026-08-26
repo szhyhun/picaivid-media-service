@@ -45,14 +45,19 @@ def main() -> int:
         positions=list(range(len(paths))),
         job_id=0,
     )
-    if not geometries or any(
-        geometry.local_metrics.get("runtime", {}).get("model") != "VGGT-Omega-1B-512"
-        for geometry in geometries
-    ):
+    runtime = next(
+        (
+            component.debug_metrics["runtime"]
+            for component in components
+            if isinstance(component.debug_metrics.get("runtime"), dict)
+        ),
+        {},
+    )
+    if not geometries or runtime.get("model") != "VGGT-Omega-1B-512":
         raise RuntimeError("VGGT did not produce real Omega geometry")
     result = {
         "photo_count": len(paths),
-        "runtime": geometries[0].local_metrics.get("runtime", {}),
+        "runtime": runtime,
         "geometry_count": len(geometries),
         "relation_count": len(relations),
         "component_count": len(components),

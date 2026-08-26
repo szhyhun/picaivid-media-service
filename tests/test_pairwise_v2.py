@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -203,6 +203,33 @@ class ProductionEvidenceCacheTests(unittest.TestCase):
             self.assertEqual(first, second)
             mocked_verify.assert_called_once()
 
+    def test_cache_hit_skips_preprocessing_and_supplied_digests_skip_hashing(self):
+        with tempfile.TemporaryDirectory(prefix="pair-cache-") as directory:
+            paths = []
+            for index, value in enumerate((50, 150)):
+                path = os.path.join(directory, f"{index}.png")
+                Image.fromarray(np.full((16, 16, 3), value, dtype=np.uint8)).save(path)
+                paths.append(path)
+            runtime = {"checkpoint_sha256": "sha", "repo_commit": "repo", "dtype": "float32"}
+            evidence = PairEvidence(photo_a="digest-a", photo_b="digest-b")
+            prepared_loader = Mock(side_effect=(object(), object()))
+            cache_dir = os.path.join(directory, "cache")
+            with (
+                patch("app.pipeline.phase1_analyze.pairwise_verify.file_sha256") as hash_file,
+                patch("app.pipeline.phase1_analyze.pairwise_verify.verify", return_value=evidence),
+            ):
+                verify_with_cache(
+                    paths[0], paths[1], runtime=runtime, cache_dir=cache_dir,
+                    image_digests=("digest-a", "digest-b"), prepared_loader=prepared_loader,
+                )
+                verify_with_cache(
+                    paths[1], paths[0], runtime=runtime, cache_dir=cache_dir,
+                    image_digests=("digest-b", "digest-a"), prepared_loader=prepared_loader,
+                )
+
+            hash_file.assert_not_called()
+            self.assertEqual(prepared_loader.call_count, 2)
+
 
 class ValidMaskTests(unittest.TestCase):
     """The mask must land exactly on Omega's padding, which is constant white."""
@@ -240,6 +267,16 @@ class ValidMaskTests(unittest.TestCase):
         images = vggt_model.load_and_preprocess_images(paths)
         masks = _valid_pixel_masks(paths, tuple(images.shape[-2:])).numpy()
         self.assertTrue(masks.all(), "same-aspect photos are never padded")
+
+    def test_cached_preprocessing_exactly_matches_official_batch(self):
+        from app.models.vggt import _stack_prepared_images, vggt_model
+
+        paths = [self._write("e.png", 2048, 1365), self._write("f.png", 2048, 1536)]
+        official = vggt_model.load_and_preprocess_images(paths).cpu().numpy()
+        cached, masks = _stack_prepared_images([vggt_model.prepare_image(path) for path in paths])
+
+        self.assertTrue(np.array_equal(official, cached.numpy()))
+        self.assertEqual(masks.shape, official.shape[0:1] + official.shape[-2:])
 
 
 if __name__ == "__main__":

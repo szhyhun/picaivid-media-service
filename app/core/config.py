@@ -48,11 +48,19 @@ class Settings(BaseSettings):
     VGGT_PRECISION: str = "auto"
     VGGT_IMAGE_SIZE: int = 512
     VGGT_IMAGE_MODE: str = "balanced"
+    VGGT_IMAGE_SAVE_WORKERS: int = 4
+    # Stage profiling synchronizes the accelerator after every Omega head and is
+    # intentionally off in normal runs because those barriers serialize GPU work.
+    VGGT_PROFILE_STAGES: bool = False
+    # MPS allocator growth was measured to degrade sustained pair inference. CUDA
+    # keeps its caching allocator warm and is released only at the end of a job.
+    VGGT_MPS_CACHE_RELEASE_EVERY: int = 25
     # Raw threshold-free pair evidence. Shared with the calibration sweep so a
     # re-analysis can reuse model inference and only rerun graph policy.
     VGGT_PAIR_CACHE_DIR: str = "./tmp_sweep/cache"
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
+    OPENCLIP_BATCH_SIZE: int = 16
 
     # Logging
     LOG_LEVEL: str = "INFO"

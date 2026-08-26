@@ -238,8 +238,6 @@ def plan_motion_for_cluster(
     # Select hero photo for cluster
     _select_hero_photo(cluster, photos=ordered_photos)
 
-    db.commit()
-
     logger.info(
         f"Planned motion for cluster {cluster.id}: "
         f"{recommended} ({tier} tier, {duration}s, {model_recommendation}, "

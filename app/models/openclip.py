@@ -193,17 +193,25 @@ class OpenCLIPModel:
     def _precompute_text_features(self) -> None:
         """Pre-compute text embeddings for room types."""
         with torch.no_grad():
-            room_features = []
+            prompts: list[str] = []
+            prompt_counts: list[int] = []
             for room in ROOM_TYPES:
-                prompts = ROOM_PROMPTS.get(room, [f"a photo of a {room}"])
-                text_tokens = self._tokenizer(prompts).to(self._device)
-                text_features = self._model.encode_text(text_tokens)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                room_prompts = ROOM_PROMPTS.get(room, [f"a photo of a {room}"])
+                prompts.extend(room_prompts)
+                prompt_counts.append(len(room_prompts))
+            text_tokens = self._tokenizer(prompts).to(self._device)
+            encoded = self._model.encode_text(text_tokens)
+            encoded = encoded / encoded.norm(dim=-1, keepdim=True)
 
-                # Use centroid of prompts for a more robust room concept vector.
-                room_feature = text_features.mean(dim=0, keepdim=True)
+            room_features = []
+            offset = 0
+            for count in prompt_counts:
+                # Use the same per-room prompt centroid as before, but encode all
+                # prompts in one model call instead of one call per room type.
+                room_feature = encoded[offset : offset + count].mean(dim=0, keepdim=True)
                 room_feature = room_feature / room_feature.norm(dim=-1, keepdim=True)
                 room_features.append(room_feature)
+                offset += count
 
             self._text_features = torch.cat(room_features, dim=0)
 
@@ -245,18 +253,27 @@ class OpenCLIPModel:
         with torch.no_grad():
             image_features = self._model.encode_image(image_tensor)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        return self._classify_features(image_features)[0]
 
-            # Compute similarity with room types
-            similarity = (image_features @ self._text_features.T).squeeze(0)
+    def classify_embeddings(self, embeddings: np.ndarray) -> list[tuple[str, float]]:
+        """Classify normalized stored embeddings without re-encoding images."""
+        self._ensure_loaded()
+        features = torch.as_tensor(embeddings, dtype=torch.float32, device=self._device)
+        if features.ndim == 1:
+            features = features.unsqueeze(0)
+        features = features / features.norm(dim=-1, keepdim=True)
+        return self._classify_features(features)
+
+    def _classify_features(self, features: torch.Tensor) -> list[tuple[str, float]]:
+        with torch.no_grad():
+            similarity = features @ self._text_features.T
             logit_scale = self._model.logit_scale.exp() if hasattr(self._model, "logit_scale") else 1.0
-            similarity = similarity * logit_scale
-            probs = similarity.softmax(dim=-1)
-
-            # Get top prediction
-            top_idx = probs.argmax().item()
-            confidence = probs[top_idx].item()
-
-        return ROOM_TYPES[top_idx], confidence
+            probabilities = (similarity * logit_scale).softmax(dim=-1)
+            top_indices = probabilities.argmax(dim=-1)
+        return [
+            (ROOM_TYPES[int(index)], float(probabilities[row, index].item()))
+            for row, index in enumerate(top_indices.tolist())
+        ]
 
     def get_batch_embeddings(self, images: List[Image.Image]) -> np.ndarray:
         """Get embeddings for multiple images.
@@ -286,39 +303,38 @@ class OpenCLIPModel:
     ) -> Dict[str, float]:
         """Score an image against arbitrary text labels with CLIP cosine similarity."""
         self._ensure_loaded()
-        unique_labels = tuple(str(label) for label in labels if str(label).strip())
-        if not unique_labels:
-            return {}
-
-        cache_key = tuple(unique_labels) + tuple(prompt_templates or ())
-        text_features = self._prompt_feature_cache.get(cache_key)
-        if text_features is None:
-            prompts: list[str] = []
-            for label in unique_labels:
-                if prompt_templates:
-                    prompts.extend(template.format(label=label) for template in prompt_templates)
-                else:
-                    prompts.append(f"a photo of a {label}")
-            with torch.no_grad():
-                text_tokens = self._tokenizer(prompts).to(self._device)
-                encoded = self._model.encode_text(text_tokens)
-                encoded = encoded / encoded.norm(dim=-1, keepdim=True)
-                if prompt_templates:
-                    grouped = []
-                    chunk = len(prompt_templates)
-                    for idx in range(0, encoded.shape[0], chunk):
-                        feature = encoded[idx : idx + chunk].mean(dim=0, keepdim=True)
-                        feature = feature / feature.norm(dim=-1, keepdim=True)
-                        grouped.append(feature)
-                    text_features = torch.cat(grouped, dim=0)
-                else:
-                    text_features = encoded
-            self._prompt_feature_cache[cache_key] = text_features
-
         image_tensor = self._preprocess(image).unsqueeze(0).to(self._device)
         with torch.no_grad():
             image_features = self._model.encode_image(image_tensor)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        unique_labels = tuple(str(label) for label in labels if str(label).strip())
+        return self._score_features(image_features, unique_labels, prompt_templates)
+
+    def score_embedding(
+        self,
+        embedding: Sequence[float] | np.ndarray,
+        labels: Sequence[str],
+        prompt_templates: Sequence[str] | None = None,
+    ) -> Dict[str, float]:
+        """Score arbitrary labels from a stored normalized image embedding."""
+        self._ensure_loaded()
+        unique_labels = tuple(str(label) for label in labels if str(label).strip())
+        if not unique_labels:
+            return {}
+        image_features = torch.as_tensor(embedding, dtype=torch.float32, device=self._device).reshape(1, -1)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        return self._score_features(image_features, unique_labels, prompt_templates)
+
+    def _score_features(
+        self,
+        image_features: torch.Tensor,
+        unique_labels: tuple[str, ...],
+        prompt_templates: Sequence[str] | None,
+    ) -> Dict[str, float]:
+        if not unique_labels:
+            return {}
+        text_features = self._features_for_labels(unique_labels, prompt_templates)
+        with torch.no_grad():
             similarities = (image_features @ text_features.T).squeeze(0)
 
         return {
@@ -326,8 +342,40 @@ class OpenCLIPModel:
             for idx, label in enumerate(unique_labels)
         }
 
+    def _features_for_labels(
+        self,
+        unique_labels: tuple[str, ...],
+        prompt_templates: Sequence[str] | None,
+    ) -> torch.Tensor:
+        cache_key = unique_labels + tuple(prompt_templates or ())
+        cached = self._prompt_feature_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        prompts: list[str] = []
+        for label in unique_labels:
+            if prompt_templates:
+                prompts.extend(template.format(label=label) for template in prompt_templates)
+            else:
+                prompts.append(f"a photo of a {label}")
+        with torch.no_grad():
+            text_tokens = self._tokenizer(prompts).to(self._device)
+            encoded = self._model.encode_text(text_tokens)
+            encoded = encoded / encoded.norm(dim=-1, keepdim=True)
+            if prompt_templates:
+                grouped = []
+                chunk = len(prompt_templates)
+                for idx in range(0, encoded.shape[0], chunk):
+                    feature = encoded[idx : idx + chunk].mean(dim=0, keepdim=True)
+                    feature = feature / feature.norm(dim=-1, keepdim=True)
+                    grouped.append(feature)
+                encoded = torch.cat(grouped, dim=0)
+        self._prompt_feature_cache[cache_key] = encoded
+        return encoded
+
     def release(self) -> None:
         """Release accelerator-resident weights after the CLIP pipeline stage."""
+        if self._model is None:
+            return
         self._model = None
         self._preprocess = None
         self._tokenizer = None

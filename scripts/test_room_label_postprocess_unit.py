@@ -110,7 +110,7 @@ def test_relabel_living_to_dining_by_strong_adjacent_geometry() -> None:
         DummySimilarity(photo_a_id=200, photo_b_id=201, relation_confidence=0.72)
     ]
     analyzer = Phase1Analyzer(db=_FakeDB(similarities))
-    analyzer._postprocess_interior_room_labels(photos, job_id=1)  # noqa: SLF001
+    analyzer._postprocess_interior_geometry_labels(photos, job_id=1)  # noqa: SLF001
 
     assert photos[0].room_label == "dining room", "Expected living room shot to relabel to dining room from strong adjacent dining geometry"
 

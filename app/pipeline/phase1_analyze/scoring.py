@@ -57,11 +57,17 @@ def _score_photo(photo: JobPhoto, image: Image.Image) -> None:
         image = image.convert("RGB")
 
     img_array = np.array(image)
+    gray = np.mean(img_array, axis=2)
+    luminance = (
+        0.299 * img_array[:, :, 0]
+        + 0.587 * img_array[:, :, 1]
+        + 0.114 * img_array[:, :, 2]
+    )
 
     # Compute individual scores
-    photo.sharpness = _compute_sharpness(img_array)
-    photo.exposure_score = _compute_exposure_score(img_array)
-    photo.composition_score = _compute_composition_score(img_array)
+    photo.sharpness = _compute_sharpness(img_array, gray=gray)
+    photo.exposure_score = _compute_exposure_score(img_array, luminance=luminance)
+    photo.composition_score = _compute_composition_score(img_array, gray=gray)
 
     # Compute base score (weighted average)
     photo.base_score = (
@@ -80,7 +86,7 @@ def _score_photo(photo: JobPhoto, image: Image.Image) -> None:
     )
 
 
-def _compute_sharpness(img_array: np.ndarray) -> float:
+def _compute_sharpness(img_array: np.ndarray, *, gray: np.ndarray | None = None) -> float:
     """Compute sharpness using Laplacian variance.
 
     Args:
@@ -90,7 +96,8 @@ def _compute_sharpness(img_array: np.ndarray) -> float:
         Sharpness score 0-1
     """
     # Convert to grayscale
-    gray = np.mean(img_array, axis=2)
+    if gray is None:
+        gray = np.mean(img_array, axis=2)
 
     # Laplacian kernel
     laplacian = np.array([
@@ -110,7 +117,11 @@ def _compute_sharpness(img_array: np.ndarray) -> float:
     return float(score)
 
 
-def _compute_exposure_score(img_array: np.ndarray) -> float:
+def _compute_exposure_score(
+    img_array: np.ndarray,
+    *,
+    luminance: np.ndarray | None = None,
+) -> float:
     """Compute exposure score from histogram.
 
     Good exposure has well-distributed histogram with
@@ -123,7 +134,12 @@ def _compute_exposure_score(img_array: np.ndarray) -> float:
         Exposure score 0-1
     """
     # Compute luminance
-    luminance = 0.299 * img_array[:, :, 0] + 0.587 * img_array[:, :, 1] + 0.114 * img_array[:, :, 2]
+    if luminance is None:
+        luminance = (
+            0.299 * img_array[:, :, 0]
+            + 0.587 * img_array[:, :, 1]
+            + 0.114 * img_array[:, :, 2]
+        )
 
     # Check for clipping
     dark_ratio = np.mean(luminance < 20)
@@ -144,7 +160,7 @@ def _compute_exposure_score(img_array: np.ndarray) -> float:
     return float(max(0.0, min(1.0, score)))
 
 
-def _compute_composition_score(img_array: np.ndarray) -> float:
+def _compute_composition_score(img_array: np.ndarray, *, gray: np.ndarray | None = None) -> float:
     """Compute composition score.
 
     Simple heuristic based on:
@@ -158,7 +174,8 @@ def _compute_composition_score(img_array: np.ndarray) -> float:
         Composition score 0-1
     """
     h, w = img_array.shape[:2]
-    gray = np.mean(img_array, axis=2)
+    if gray is None:
+        gray = np.mean(img_array, axis=2)
 
     # Simple edge detection using gradient
     gy, gx = np.gradient(gray)

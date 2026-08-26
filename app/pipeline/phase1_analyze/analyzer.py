@@ -5,9 +5,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
 
+import numpy as np
 from sqlalchemy.orm import Session
-from PIL import Image
+from PIL import Image, ImageOps
 
+from app.core.config import settings
 from app.db.models import Job, JobPhoto, RoomCluster, PhotoRelation
 from app.models.openclip import openclip_model
 from app.services.storage.s3_client import s3_client
@@ -19,6 +21,18 @@ from app.pipeline.phase1_analyze.shot_planner import build_and_persist_shot_plan
 from app.services.rails_webhook import notify_analysis_complete
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_cached_image(image: Image.Image) -> Image.Image:
+    """Decode and orient one S3 image once before every analysis consumer."""
+    try:
+        oriented = ImageOps.exif_transpose(image)
+    except Exception:
+        oriented = image
+    oriented.load()
+    if oriented is not image:
+        image.close()
+    return oriented
 
 
 class Phase1Analyzer:
@@ -93,20 +107,18 @@ class Phase1Analyzer:
 
             # Step 4: Classify room types
             self._classify_rooms(job_photos, image_cache)
-            self.db.commit()
 
             # Step 5: Correct common exterior label confusions using sequence context.
             self._postprocess_exterior_room_labels(job_photos)
-            self.db.commit()
 
             # Step 5b: Correct common interior label confusions using
             # local sequence context (kitchen/living/dining).
             self._postprocess_interior_room_labels(job_photos, image_cache=image_cache)
-            self.db.commit()
 
             # Step 6: Compute quality scores
             compute_photo_scores(job_photos, image_cache=image_cache)
             self.db.commit()
+            openclip_model.release()
 
             # Step 7: Cluster photos by room (with visual overlap detection)
             clusters = cluster_photos_by_room(
@@ -119,9 +131,8 @@ class Phase1Analyzer:
 
             # Step 7b: Refine interior labels using verified geometric links
             # (e.g., living vs dining confusion in adjacent shots).
-            self._postprocess_interior_room_labels(job_photos, job_id=job.id, image_cache=image_cache)
+            self._postprocess_interior_geometry_labels(job_photos, job_id=job.id)
             self.db.commit()
-            openclip_model.release()
 
             # Step 8: Plan motion for each cluster
             photos_by_cluster: Dict[int, List[JobPhoto]] = {}
@@ -138,9 +149,6 @@ class Phase1Analyzer:
 
             # Store an editorial plan independently of the later video renderer.
             build_and_persist_shot_plan(self.db, job, clusters)
-            self.db.commit()
-
-            # Update job status
             job.status = "analysis_complete"
             self.db.commit()
             notify_analysis_complete(job.project_id)
@@ -227,7 +235,7 @@ class Phase1Analyzer:
         prefetch_started_at = time.perf_counter()
 
         def _download(photo: JobPhoto):
-            return photo.id, s3_client.download_image(photo.s3_uri)
+            return photo.id, _prepare_cached_image(s3_client.download_image(photo.s3_uri))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_download, p): p for p in missing}
@@ -256,7 +264,7 @@ class Phase1Analyzer:
         # Fallback for photos missed by prefetch (e.g. added after prefetch ran)
         self._image_cache_misses += 1
         started_at = time.perf_counter()
-        image = s3_client.download_image(photo.s3_uri)
+        image = _prepare_cached_image(s3_client.download_image(photo.s3_uri))
         self._image_download_seconds += (time.perf_counter() - started_at)
         image_cache[photo.id] = image
         return image
@@ -264,24 +272,44 @@ class Phase1Analyzer:
     def _compute_embeddings(self, photos: List[JobPhoto], image_cache: Dict[int, Image.Image]) -> None:
         """Compute OpenCLIP embeddings for all photos."""
         logger.info("Computing embeddings...")
-
-        for i, photo in enumerate(photos):
-            if photo.embedding is not None:
+        pending = [photo for photo in photos if photo.embedding is None]
+        batch_size = max(1, int(settings.OPENCLIP_BATCH_SIZE))
+        for offset in range(0, len(pending), batch_size):
+            batch = pending[offset : offset + batch_size]
+            loaded: list[tuple[JobPhoto, Image.Image]] = []
+            for photo in batch:
+                try:
+                    loaded.append((photo, self._get_cached_image(photo, image_cache)))
+                except Exception as error:
+                    logger.error("FAILED to load photo %s for embedding: %s", photo.id, error, exc_info=True)
+                    photo.embedding = None
+            if not loaded:
                 continue
-
             try:
-                image = self._get_cached_image(photo, image_cache)
-                embedding = openclip_model.get_embedding(image)
-                photo.embedding = embedding.tolist()
-                logger.info(f"Embedding computed for photo {i+1}/{len(photos)}")
-            except Exception as e:
-                logger.error(f"FAILED to compute embedding for photo {photo.id}: {e}", exc_info=True)
-                photo.embedding = None
+                embeddings = openclip_model.get_batch_embeddings([image for _, image in loaded])
+                for (photo, _), embedding in zip(loaded, embeddings):
+                    photo.embedding = embedding.tolist()
+            except Exception as error:
+                # Keep one malformed image or accelerator batch limit from losing
+                # the whole chunk; the fallback preserves previous behavior.
+                logger.warning("OpenCLIP batch failed; retrying %s photos individually: %s", len(loaded), error)
+                for photo, image in loaded:
+                    try:
+                        photo.embedding = openclip_model.get_embedding(image).tolist()
+                    except Exception as item_error:
+                        logger.error(
+                            "FAILED to compute embedding for photo %s: %s",
+                            photo.id,
+                            item_error,
+                            exc_info=True,
+                        )
+                        photo.embedding = None
+            logger.info("Embeddings computed for %s/%s photos", min(offset + len(batch), len(pending)), len(pending))
 
     def _classify_rooms(self, photos: List[JobPhoto], image_cache: Dict[int, Image.Image]) -> None:
         """Classify room type for each photo."""
         logger.info("Classifying rooms...")
-
+        pending: list[JobPhoto] = []
         for photo in photos:
             # Skip if manually overridden
             if photo.room_override:
@@ -290,24 +318,31 @@ class Phase1Analyzer:
 
             if photo.room_label:
                 continue
+            pending.append(photo)
 
+        predictions: dict[int, tuple[str, float]] = {}
+        embedded = [photo for photo in pending if photo.embedding is not None]
+        if embedded:
             try:
-                image = self._get_cached_image(photo, image_cache)
-                room_type, confidence = openclip_model.classify_room(image)
+                values = np.asarray([photo.embedding for photo in embedded], dtype=np.float32)
+                predictions.update(zip((int(photo.id) for photo in embedded), openclip_model.classify_embeddings(values)))
+            except Exception as error:
+                logger.warning("Stored-embedding room classification failed; retrying individually: %s", error)
 
-                # Lightweight metadata guardrail for a common confusion:
-                # laundry rooms can be misclassified as kitchens.
-                if (
-                    room_type in {"kitchen", "bathroom", "unknown"}
-                    and _looks_like_laundry(photo)
-                ):
+        for photo in pending:
+            try:
+                prediction = predictions.get(int(photo.id))
+                if prediction is None:
+                    image = self._get_cached_image(photo, image_cache)
+                    prediction = openclip_model.classify_room(image)
+                room_type, confidence = prediction
+                if room_type in {"kitchen", "bathroom", "unknown"} and _looks_like_laundry(photo):
                     room_type = "laundry room"
-                    logger.info(f"Photo {photo.id}: remapped to laundry room via metadata hint")
-
+                    logger.info("Photo %s: remapped to laundry room via metadata hint", photo.id)
                 photo.room_label = room_type
-                logger.info(f"Photo {photo.id}: {room_type} ({confidence:.2f})")
-            except Exception as e:
-                logger.error(f"FAILED to classify room for photo {photo.id}: {e}", exc_info=True)
+                logger.info("Photo %s: %s (%.2f)", photo.id, room_type, confidence)
+            except Exception as error:
+                logger.error("FAILED to classify room for photo %s: %s", photo.id, error, exc_info=True)
                 photo.room_label = "unknown"
 
     def _postprocess_exterior_room_labels(self, photos: List[JobPhoto]) -> None:
@@ -376,7 +411,6 @@ class Phase1Analyzer:
     def _postprocess_interior_room_labels(
         self,
         photos: List[JobPhoto],
-        job_id: int | None = None,
         image_cache: Dict[int, Image.Image] | None = None,
     ) -> None:
         """Correct common interior room label confusions.
@@ -384,8 +418,7 @@ class Phase1Analyzer:
         Sequence-context rules:
         - patio/exterior false-positive inside kitchen/living/dining runs -> kitchen
 
-        Geometry-context rules (when job_id provided and similarities are available):
-        - living room frame with strong adjacent dining geometric link -> dining room
+        Geometry-dependent corrections run once in a separate post-analysis pass.
         """
         if not photos:
             return
@@ -429,8 +462,14 @@ class Phase1Analyzer:
             laundry_votes = sum(label in {"laundry", "laundry room"} for label in neighbor_labels)
             storage_votes = sum(label == "storage" for label in neighbor_labels)
             has_laundry_hint = _looks_like_laundry(photo)
-            image = self._get_cached_image(photo, image_cache or {})
-            service_scores = _score_service_room_labels(image)
+            service_scores = _score_service_room_labels(
+                embedding=photo.embedding,
+                image=(
+                    None
+                    if photo.embedding is not None
+                    else self._get_cached_image(photo, image_cache or {})
+                ),
+            )
             bathroom_score = float(service_scores.get("bathroom", 0.0))
             laundry_score = float(service_scores.get("laundry room", 0.0))
             storage_score = float(service_scores.get("storage", 0.0))
@@ -502,58 +541,57 @@ class Phase1Analyzer:
                     interior_votes,
                 )
 
-        # Rule 2: living->dining corrections with strong verified adjacent dining links.
-        if job_id is not None and self.db is not None:
-            strong_links = (
-                self.db.query(PhotoRelation)
-                .filter(PhotoRelation.job_id == job_id)
-                .filter(PhotoRelation.is_connected.is_(True))
-                .filter(PhotoRelation.relation_confidence.isnot(None))
-                .filter(PhotoRelation.relation_confidence >= 0.52)
-                .all()
-            )
-
-            photo_by_id = {p.id: p for p in photos}
-            for sim in strong_links:
-                left = photo_by_id.get(int(sim.photo_a_id))
-                right = photo_by_id.get(int(sim.photo_b_id))
-                if left is None or right is None:
-                    continue
-
-                for candidate, other in ((left, right), (right, left)):
-                    if candidate.room_override:
-                        continue
-                    if _normalize_room_label(candidate.room_label) != "living room":
-                        continue
-                    if _normalize_room_label(other.room_label) != "dining room":
-                        continue
-
-                    cand_pos = int(candidate.position or 0)
-                    other_pos = int(other.position or 0)
-                    if abs(cand_pos - other_pos) > 1:
-                        continue
-
-                    photo_by_pos = {int(p.position or 0): p for p in ordered}
-                    prev_photo = photo_by_pos.get(cand_pos - 1)
-                    next_photo = photo_by_pos.get(cand_pos + 1)
-                    adjacent_labels = {
-                        _normalize_room_label(prev_photo.room_label) if prev_photo else "",
-                        _normalize_room_label(next_photo.room_label) if next_photo else "",
-                    }
-                    if "kitchen" in adjacent_labels:
-                        continue
-
-                    candidate.room_label = "dining room"
-                    changed += 1
-                    logger.info(
-                        "Photo %s room relabel: living room -> dining room (strong dining relation to %s, confidence=%.3f)",
-                        candidate.id,
-                        other.id,
-                        float(sim.relation_confidence or 0.0),
-                    )
-
         if changed:
             logger.info("Interior room-label postprocess changed %s photos", changed)
+
+    def _postprocess_interior_geometry_labels(self, photos: List[JobPhoto], job_id: int) -> None:
+        """Apply only the geometry-dependent correction after scene analysis."""
+        if not photos or self.db is None:
+            return
+        strong_links = (
+            self.db.query(PhotoRelation)
+            .filter(PhotoRelation.job_id == job_id)
+            .filter(PhotoRelation.is_connected.is_(True))
+            .filter(PhotoRelation.relation_confidence.isnot(None))
+            .filter(PhotoRelation.relation_confidence >= 0.52)
+            .all()
+        )
+        photo_by_id = {int(photo.id): photo for photo in photos}
+        photo_by_pos = {int(photo.position or 0): photo for photo in photos}
+        changed = 0
+        for relation in strong_links:
+            left = photo_by_id.get(int(relation.photo_a_id))
+            right = photo_by_id.get(int(relation.photo_b_id))
+            if left is None or right is None:
+                continue
+            for candidate, other in ((left, right), (right, left)):
+                if candidate.room_override:
+                    continue
+                if _normalize_room_label(candidate.room_label) != "living room":
+                    continue
+                if _normalize_room_label(other.room_label) != "dining room":
+                    continue
+                candidate_position = int(candidate.position or 0)
+                if abs(candidate_position - int(other.position or 0)) > 1:
+                    continue
+                previous = photo_by_pos.get(candidate_position - 1)
+                following = photo_by_pos.get(candidate_position + 1)
+                adjacent_labels = {
+                    _normalize_room_label(previous.room_label) if previous else "",
+                    _normalize_room_label(following.room_label) if following else "",
+                }
+                if "kitchen" in adjacent_labels:
+                    continue
+                candidate.room_label = "dining room"
+                changed += 1
+                logger.info(
+                    "Photo %s room relabel: living room -> dining room (strong dining relation to %s, confidence=%.3f)",
+                    candidate.id,
+                    other.id,
+                    float(relation.relation_confidence or 0.0),
+                )
+        if changed:
+            logger.info("Geometry room-label postprocess changed %s photos", changed)
 
 
 def _looks_like_laundry(photo: JobPhoto) -> bool:
@@ -587,15 +625,22 @@ SERVICE_ROOM_LABEL_PROMPTS = {
 }
 
 
-def _score_service_room_labels(image: Image.Image) -> Dict[str, float]:
-    raw_scores = openclip_model.score_labels(
-        image,
-        list(SERVICE_ROOM_LABEL_PROMPTS.values()),
-        prompt_templates=[
-            "a real estate photo of a {label}",
-            "an interior listing photo of a {label}",
-        ],
-    )
+def _score_service_room_labels(
+    image: Image.Image | None = None,
+    *,
+    embedding: List[float] | None = None,
+) -> Dict[str, float]:
+    labels = list(SERVICE_ROOM_LABEL_PROMPTS.values())
+    templates = [
+        "a real estate photo of a {label}",
+        "an interior listing photo of a {label}",
+    ]
+    if embedding is not None:
+        raw_scores = openclip_model.score_embedding(embedding, labels, templates)
+    elif image is not None:
+        raw_scores = openclip_model.score_labels(image, labels, templates)
+    else:
+        return {}
     return {
         canonical: float(raw_scores.get(prompt_label, 0.0))
         for canonical, prompt_label in SERVICE_ROOM_LABEL_PROMPTS.items()

@@ -21,12 +21,12 @@ import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from app.core.config import settings
-from app.models.vggt import vggt_model
+from app.models.vggt import PreparedImage, vggt_model
 
 SAMPLE_POINTS = 4096
 DEPTH_AGREEMENT = 0.15
@@ -115,6 +115,7 @@ def evidence_key(
     model_revision: str = "",
     precision: str = "",
     schema_version: str = EVIDENCE_SCHEMA_VERSION,
+    image_digests: tuple[str, str] | None = None,
 ) -> str:
     """Content-addressed cache key.
 
@@ -124,7 +125,7 @@ def evidence_key(
     schema, model implementation and precision are included because they can
     change the measured evidence itself.
     """
-    digests = sorted(_file_sha256(path) for path in (path_a, path_b))
+    digests = sorted(image_digests or (file_sha256(path_a), file_sha256(path_b)))
     parts = [
         *digests,
         checkpoint_sha,
@@ -137,7 +138,8 @@ def evidence_key(
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
-def _file_sha256(path: str) -> str:
+def file_sha256(path: str) -> str:
+    """Hash an image once at job scope, then pass the digest to pair helpers."""
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -254,6 +256,9 @@ def canonical_order_with_ids(
     photo_a_id: int,
     path_b: str,
     photo_b_id: int,
+    *,
+    digest_a: str | None = None,
+    digest_b: str | None = None,
 ) -> tuple[tuple[str, int], tuple[str, int]]:
     """Keep external photo ids aligned with canonical directional evidence.
 
@@ -262,22 +267,28 @@ def canonical_order_with_ids(
     same ordering or it can silently assign A-to-B motion to B-to-A photos.
     """
     pairs = [
-        (_file_sha256(path_a), path_a, photo_a_id),
-        (_file_sha256(path_b), path_b, photo_b_id),
+        (digest_a or file_sha256(path_a), path_a, photo_a_id),
+        (digest_b or file_sha256(path_b), path_b, photo_b_id),
     ]
     pairs.sort(key=lambda item: (item[0], item[1]))
     return (pairs[0][1], pairs[0][2]), (pairs[1][1], pairs[1][2])
 
 
 def _finite_masked_values(values: np.ndarray, mask: np.ndarray, name: str) -> np.ndarray:
-    selected = np.asarray(values)[mask].reshape(-1)
+    selected = np.asarray(values)[mask].reshape(-1).astype(np.float64, copy=False)
     selected = selected[np.isfinite(selected)]
     if selected.size == 0:
         raise RuntimeError(f"VGGT pair inference produced no finite {name} values")
     return selected
 
 
-def verify(path_a: str, path_b: str) -> PairEvidence:
+def verify(
+    path_a: str,
+    path_b: str,
+    *,
+    image_digests: tuple[str, str] | None = None,
+    prepared_images: tuple[PreparedImage, PreparedImage] | None = None,
+) -> PairEvidence:
     """Run one 2-photo reconstruction and return raw evidence (no thresholds).
 
     Evidence is returned in canonical (content-hash) order regardless of argument
@@ -285,14 +296,27 @@ def verify(path_a: str, path_b: str) -> PairEvidence:
     """
     from time import monotonic
 
-    path_a, path_b = canonical_order(path_a, path_b)
+    digest_a, digest_b = image_digests or (file_sha256(path_a), file_sha256(path_b))
+    ordered = [
+        (digest_a, path_a, prepared_images[0] if prepared_images else None),
+        (digest_b, path_b, prepared_images[1] if prepared_images else None),
+    ]
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    (digest_a, path_a, prepared_a), (digest_b, path_b, prepared_b) = ordered
     started = monotonic()
-    predictions = vggt_model.predict([path_a, path_b])
+    predictions = (
+        vggt_model.predict_prepared([prepared_a, prepared_b])
+        if prepared_a is not None and prepared_b is not None
+        else vggt_model.predict([path_a, path_b])
+    )
     extrinsic = predictions["extrinsic"].numpy().astype(np.float64)
     intrinsic = predictions["intrinsic"].numpy().astype(np.float64)
-    depth = predictions["depth_map"].numpy().squeeze(-1).astype(np.float64)
-    points = predictions["point_map"].numpy().astype(np.float64)
-    conf = predictions["depth_conf"].numpy().astype(np.float64)
+    # Keep dense model outputs in their native float32. Projection promotes only
+    # sampled points against float64 camera matrices, avoiding three full-frame
+    # float64 copies per pair with no loss of model information.
+    depth = predictions["depth_map"].numpy().squeeze(-1)
+    points = predictions["point_map"].numpy()
+    conf = predictions["depth_conf"].numpy()
     masks = predictions["valid_mask"].numpy()
 
     depth_a = _finite_masked_values(depth[0], masks[0], "depth for frame A")
@@ -311,8 +335,8 @@ def verify(path_a: str, path_b: str) -> PairEvidence:
     translation_ab = extrinsic[1][:3, 3] - rotation_ab @ extrinsic[0][:3, 3]
 
     return PairEvidence(
-        photo_a=_file_sha256(path_a),
-        photo_b=_file_sha256(path_b),
+        photo_a=digest_a,
+        photo_b=digest_b,
         # Confidence over real pixels only; padded regions carry no information.
         conf_pair=float(np.median(np.concatenate([conf_a, conf_b]))),
         conf_frame_a=float(np.median(conf_a)),
@@ -368,6 +392,8 @@ def verify_with_cache(
     *,
     runtime: dict[str, Any] | None = None,
     cache_dir: str | None = None,
+    image_digests: tuple[str, str] | None = None,
+    prepared_loader: Callable[[str], PreparedImage] | None = None,
 ) -> tuple[dict[str, Any], bool, str]:
     """Return raw pair evidence, reusing content-addressed inference when possible.
 
@@ -375,6 +401,7 @@ def verify_with_cache(
     membership and pairing policy can be retuned without rerunning VGGT.
     """
     runtime = runtime or vggt_model.runtime_metadata()
+    digest_a, digest_b = image_digests or (file_sha256(path_a), file_sha256(path_b))
     key = evidence_key(
         path_a,
         path_b,
@@ -383,6 +410,7 @@ def verify_with_cache(
         int(settings.VGGT_IMAGE_SIZE),
         model_revision=str(runtime.get("repo_commit") or ""),
         precision=str(runtime.get("dtype") or ""),
+        image_digests=(digest_a, digest_b),
     )
     directory = os.path.abspath(cache_dir or settings.VGGT_PAIR_CACHE_DIR)
     cache_path = os.path.join(directory, f"{key}.json")
@@ -390,7 +418,17 @@ def verify_with_cache(
     if cached is not None:
         return dict(cached), True, key
 
-    record = verify(path_a, path_b).to_dict()
+    prepared = (
+        (prepared_loader(path_a), prepared_loader(path_b))
+        if prepared_loader is not None
+        else None
+    )
+    record = verify(
+        path_a,
+        path_b,
+        image_digests=(digest_a, digest_b),
+        prepared_images=prepared,
+    ).to_dict()
     record["_evidence_schema_version"] = EVIDENCE_SCHEMA_VERSION
     _write_cache_record(cache_path, record)
     return dict(record), False, key

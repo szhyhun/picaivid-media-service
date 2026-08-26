@@ -12,7 +12,8 @@ import math
 import os
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from app.core.config import settings
 from app.models.vggt import vggt_model
 from app.pipeline.phase1_analyze.pose_graph import CameraPose, solve_component_poses
 logger = logging.getLogger(__name__)
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 # provisional until a true holdout is labeled; the acceptance target is not met.
 MEMBERSHIP_DEPTH_OK = 0.20
 MEMBERSHIP_BL_OVER_DEPTH = 2.0
-PAIR_CACHE_RELEASE_EVERY = 25
+PAIR_PROGRESS_LOG_EVERY = 25
 
 SOCIAL_LABEL_TOKENS = ("living", "kitchen", "dining", "great room", "family room")
 
@@ -79,17 +81,33 @@ class SceneComponentResult:
 
 def _save_input_images(images: list[object], photo_ids: list[int]) -> tuple[str, list[str]]:
     directory = tempfile.mkdtemp(prefix="vggt_scene_")
-    filelist: list[str] = []
-    for index, (image, photo_id) in enumerate(zip(images, photo_ids)):
+    entries = list(enumerate(zip(images, photo_ids)))
+    filelist = [
+        os.path.join(directory, f"{index:03d}_{int(photo_id)}.png")
+        for index, (_, photo_id) in entries
+    ]
+
+    def save_one(entry: tuple[int, tuple[object, int]]) -> None:
+        index, (image, _photo_id) = entry
         if isinstance(image, Image.Image):
             pil_image = image
         elif isinstance(image, np.ndarray):
             pil_image = Image.fromarray(image)
         else:
             raise RuntimeError(f"Unsupported VGGT image type: {type(image)!r}")
-        path = os.path.join(directory, f"{index:03d}_{int(photo_id)}.png")
-        pil_image.convert("RGB").save(path)
-        filelist.append(path)
+        converted = pil_image.convert("RGB")
+        try:
+            converted.save(filelist[index])
+        finally:
+            converted.close()
+
+    try:
+        workers = min(len(entries), max(1, int(settings.VGGT_IMAGE_SAVE_WORKERS)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(save_one, entries))
+    except Exception:
+        _cleanup_files(directory, filelist)
+        raise
     return directory, filelist
 
 
@@ -105,12 +123,14 @@ def _cleanup_files(directory: str, filelist: list[str]) -> None:
         pass
 
 
-def _release_accelerator_cache() -> None:
-    gc.collect()
-    if torch.cuda.is_available():
+def _release_accelerator_cache(device: str | None = None, *, final: bool = False) -> None:
+    """Release MPS periodically; preserve CUDA's warm allocator until job end."""
+    if final:
+        gc.collect()
+    if device == "cuda" and final and torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    if device == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         torch.mps.synchronize()
         torch.mps.empty_cache()
 
@@ -178,6 +198,7 @@ def _v2_scene_graph(
     from app.pipeline.phase1_analyze.membership import constrained_merge
     from app.pipeline.phase1_analyze.pairwise_verify import (
         canonical_order_with_ids,
+        file_sha256,
         verify_with_cache,
     )
 
@@ -195,14 +216,50 @@ def _v2_scene_graph(
 
     runtime = runtime or vggt_model.runtime_metadata()
     evidence: list[dict[str, Any]] = []
+    digest_by_photo: dict[int, str] = {}
+    prepared_by_path: dict[str, Any] = {}
+
+    def photo_digest(photo_id: int) -> str:
+        digest = digest_by_photo.get(photo_id)
+        if digest is None:
+            digest = file_sha256(file_by_photo[photo_id])
+            digest_by_photo[photo_id] = digest
+        return digest
+
+    def prepared_image(path: str) -> Any:
+        prepared = prepared_by_path.get(path)
+        if prepared is None:
+            prepared = vggt_model.prepare_image(path)
+            prepared_by_path[path] = prepared
+        return prepared
+
+    runtime_device = str(runtime.get("device") or "")
+    release_every = (
+        max(0, int(settings.VGGT_MPS_CACHE_RELEASE_EVERY))
+        if runtime_device == "mps"
+        else 0
+    )
     cache_hits = computed = failed = released_at = 0
     for index, candidate in enumerate(candidates, 1):
         left, right = candidate.key
         try:
+            digest_left = photo_digest(left)
+            digest_right = photo_digest(right)
             (path_a, evidence_a), (path_b, evidence_b) = canonical_order_with_ids(
-                file_by_photo[left], left, file_by_photo[right], right
+                file_by_photo[left],
+                left,
+                file_by_photo[right],
+                right,
+                digest_a=digest_left,
+                digest_b=digest_right,
             )
-            record, cache_hit, _ = verify_with_cache(path_a, path_b, runtime=runtime)
+            record, cache_hit, _ = verify_with_cache(
+                path_a,
+                path_b,
+                runtime=runtime,
+                image_digests=(digest_by_photo[evidence_a], digest_by_photo[evidence_b]),
+                prepared_loader=prepared_image,
+            )
             cache_hits += int(cache_hit)
             computed += int(not cache_hit)
             record.update(
@@ -213,13 +270,13 @@ def _v2_scene_graph(
                 }
             )
             evidence.append(record)
-            if not cache_hit and computed - released_at >= PAIR_CACHE_RELEASE_EVERY:
-                _release_accelerator_cache()
+            if release_every and not cache_hit and computed - released_at >= release_every:
+                _release_accelerator_cache(runtime_device)
                 released_at = computed
         except Exception as error:  # one bad pair must not fail the listing
             failed += 1
             logger.warning("Pair verification failed for %s/%s: %s", left, right, error)
-        if index % PAIR_CACHE_RELEASE_EVERY == 0 or index == len(candidates):
+        if index % PAIR_PROGRESS_LOG_EVERY == 0 or index == len(candidates):
             logger.info(
                 "VGGT_V2_PAIR_PROGRESS attempted=%s/%s computed=%s cache_hits=%s failed=%s",
                 index,
@@ -228,9 +285,8 @@ def _v2_scene_graph(
                 cache_hits,
                 failed,
             )
-    if computed > released_at:
-        _release_accelerator_cache()
-
+    prepared_image_count = len(prepared_by_path)
+    prepared_by_path.clear()
     merge_edges = [
         (record["photo_a_id"], record["photo_b_id"], float(record["depth_ok_min"]))
         for record in evidence
@@ -307,6 +363,8 @@ def _v2_scene_graph(
         "failed_pairs": failed,
         "blocked_merges": blocked,
         "coordinate_scope": "component_local",
+        "hashed_images": len(digest_by_photo),
+        "prepared_images": prepared_image_count,
     }
     logger.info(
         "VGGT_V2_COMPONENTS count=%s blocked_merges=%s",
@@ -376,55 +434,61 @@ def _order_component(
     return sorted(component, key=lambda photo_id: (positions.get(photo_id, 0), photo_id))
 
 
-def _incident_records(evidence: list[dict[str, Any]], photo_id: int) -> list[dict[str, Any]]:
-    return [
-        record
-        for record in evidence
-        if int(record["photo_a_id"]) == photo_id or int(record["photo_b_id"]) == photo_id
-    ]
-
-
-def _photo_stats(
-    photo_id: int,
+def _build_photo_indexes(
+    photo_ids: list[int],
     evidence: list[dict[str, Any]],
     relations: list[PhotoRelationResult],
-) -> dict[str, float | int]:
-    records = _incident_records(evidence, photo_id)
-    raw_confidence: list[float] = []
-    valid_fraction: list[float] = []
-    directional_overlap: list[float] = []
-    errors: list[float] = []
-    for record in records:
-        is_a = int(record["photo_a_id"]) == photo_id
-        raw_confidence.append(float(record["conf_frame_a"] if is_a else record["conf_frame_b"]))
-        valid_fraction.append(float(record["valid_fraction_a"] if is_a else record["valid_fraction_b"]))
-        direction = record["forward"] if is_a else record["backward"]
-        directional_overlap.append(float(direction["depth_ok"]))
-        error = direction.get("median_relative_depth_error")
-        if error is not None and math.isfinite(float(error)):
-            errors.append(float(error))
-    direct = [
-        relation
-        for relation in relations
-        if relation.is_connected and photo_id in (relation.photo_a_id, relation.photo_b_id)
-    ]
-    depth_confidence = float(np.median([_confidence_fit(value) for value in raw_confidence])) if raw_confidence else 0.0
-    direct_confidence = float(np.mean([relation.relation_confidence for relation in direct])) if direct else 0.0
-    return {
-        "pose_confidence": 0.60 * depth_confidence + 0.40 * direct_confidence,
-        "depth_confidence": depth_confidence,
-        "visibility_score": float(np.mean(directional_overlap)) if directional_overlap else 0.0,
-        "reprojection_error": float(np.median(errors)) if errors else 0.0,
-        "valid_fraction": float(np.mean(valid_fraction)) if valid_fraction else 1.0,
-        "incident_pair_count": len(records),
-        "direct_edge_count": len(direct),
-    }
+) -> tuple[dict[int, dict[str, float | int]], dict[int, list[dict[str, Any]]]]:
+    """Aggregate O(E) pair evidence once instead of rescanning it per photo."""
+    incident: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    direct_confidence: dict[int, list[float]] = defaultdict(list)
+    for record in evidence:
+        incident[int(record["photo_a_id"])].append(record)
+        incident[int(record["photo_b_id"])].append(record)
+    for relation in relations:
+        if not relation.is_connected:
+            continue
+        direct_confidence[int(relation.photo_a_id)].append(float(relation.relation_confidence))
+        direct_confidence[int(relation.photo_b_id)].append(float(relation.relation_confidence))
+
+    stats_by_photo: dict[int, dict[str, float | int]] = {}
+    for photo_id in photo_ids:
+        raw_confidence: list[float] = []
+        valid_fraction: list[float] = []
+        directional_overlap: list[float] = []
+        errors: list[float] = []
+        for record in incident.get(photo_id, []):
+            is_a = int(record["photo_a_id"]) == photo_id
+            raw_confidence.append(float(record["conf_frame_a"] if is_a else record["conf_frame_b"]))
+            valid_fraction.append(float(record["valid_fraction_a"] if is_a else record["valid_fraction_b"]))
+            direction = record["forward"] if is_a else record["backward"]
+            directional_overlap.append(float(direction["depth_ok"]))
+            error = direction.get("median_relative_depth_error")
+            if error is not None and math.isfinite(float(error)):
+                errors.append(float(error))
+        confidence_values = direct_confidence.get(photo_id, [])
+        depth_confidence = (
+            float(np.median([_confidence_fit(value) for value in raw_confidence]))
+            if raw_confidence
+            else 0.0
+        )
+        edge_confidence = float(np.mean(confidence_values)) if confidence_values else 0.0
+        stats_by_photo[photo_id] = {
+            "pose_confidence": 0.60 * depth_confidence + 0.40 * edge_confidence,
+            "depth_confidence": depth_confidence,
+            "visibility_score": float(np.mean(directional_overlap)) if directional_overlap else 0.0,
+            "reprojection_error": float(np.median(errors)) if errors else 0.0,
+            "valid_fraction": float(np.mean(valid_fraction)) if valid_fraction else 1.0,
+            "incident_pair_count": len(incident.get(photo_id, [])),
+            "direct_edge_count": len(confidence_values),
+        }
+    return stats_by_photo, dict(incident)
 
 
 def _hero_photo(
     component: list[int],
-    evidence: list[dict[str, Any]],
-    relations: list[PhotoRelationResult],
+    stats_by_photo: dict[int, dict[str, float | int]],
+    incident_by_photo: dict[int, list[dict[str, Any]]],
     quality_scores: dict[int, float],
     room_labels: dict[int, str],
     editorial_roles: dict[int, str],
@@ -434,8 +498,8 @@ def _hero_photo(
         return forced[0]
 
     def score(photo_id: int) -> tuple[float, int]:
-        stats = _photo_stats(photo_id, evidence, relations)
-        incident = _incident_records(evidence, photo_id)
+        stats = stats_by_photo[photo_id]
+        incident = incident_by_photo.get(photo_id, [])
         novelty = max(
             (min(abs(float(record["rot_deg"])) / 120.0, 1.0) for record in incident),
             default=0.0,
@@ -473,11 +537,8 @@ def _geometry_result(
     photo_id: int,
     component_key: str,
     pose: CameraPose,
-    evidence: list[dict[str, Any]],
-    relations: list[PhotoRelationResult],
-    runtime: dict[str, Any],
+    stats: dict[str, float | int],
 ) -> PhotoGeometryResult:
-    stats = _photo_stats(photo_id, evidence, relations)
     return PhotoGeometryResult(
         photo_id=photo_id,
         pose_confidence=float(stats["pose_confidence"]),
@@ -492,7 +553,6 @@ def _geometry_result(
             "geometry_source": "vggt_pairwise_pose_graph",
             "coordinate_frame": component_key,
             "coordinate_scope": "component_local",
-            "runtime": runtime,
         },
     )
 
@@ -527,6 +587,13 @@ def run_vggt_scene_pipeline(
     logger.info("VGGT_V2_PIPELINE_START job_id=%s photos=%s", job_id, len(images))
     started = time.monotonic()
     directory, filelist = _save_input_images(images, photo_ids)
+    # Full-resolution PIL buffers are no longer needed after the lossless input
+    # files exist. Close them before pair inference, which can run for minutes.
+    for image in images:
+        if isinstance(image, Image.Image):
+            image.close()
+    images.clear()
+    runtime: dict[str, Any] = {}
     try:
         runtime = vggt_model.runtime_metadata()
         file_by_photo = {int(photo_id): filelist[index] for index, photo_id in enumerate(photo_ids)}
@@ -544,28 +611,33 @@ def run_vggt_scene_pipeline(
             "runtime_seconds": time.monotonic() - started,
             "planner": "scene_graph_v2_pairwise_only",
         }
+        stats_by_photo, incident_by_photo = _build_photo_indexes(photo_ids, evidence, relations)
+        component_index = {
+            int(photo_id): index
+            for index, component in enumerate(components)
+            for photo_id in component
+        }
+        relations_by_component: dict[int, list[PhotoRelationResult]] = defaultdict(list)
+        for relation in relations:
+            if not relation.is_connected:
+                continue
+            left_index = component_index.get(int(relation.photo_a_id))
+            if left_index is not None and left_index == component_index.get(int(relation.photo_b_id)):
+                relations_by_component[left_index].append(relation)
 
         geometry_by_photo: dict[int, PhotoGeometryResult] = {}
         results: list[SceneComponentResult] = []
         for index, component in enumerate(components):
             component_key = f"component-{index + 1}"
-            ordered = _order_component(component, relations, position_map)
-            internal = [
-                relation
-                for relation in relations
-                if relation.is_connected
-                and relation.photo_a_id in component
-                and relation.photo_b_id in component
-            ]
-            poses, pose_stats = solve_component_poses(component, relations)
+            internal = relations_by_component.get(index, [])
+            ordered = _order_component(component, internal, position_map)
+            poses, pose_stats = solve_component_poses(component, internal)
             for photo_id in component:
                 geometry_by_photo[photo_id] = _geometry_result(
                     photo_id,
                     component_key,
                     poses[photo_id],
-                    evidence,
-                    relations,
-                    runtime,
+                    stats_by_photo[photo_id],
                 )
             component_geometries = [geometry_by_photo[photo_id] for photo_id in component]
             results.append(
@@ -589,15 +661,15 @@ def run_vggt_scene_pipeline(
                     ),
                     hero_photo_id=_hero_photo(
                         component,
-                        evidence,
-                        relations,
+                        stats_by_photo,
+                        incident_by_photo,
                         quality_scores,
                         labels,
                         editorial_roles,
                     ),
                     motion_affordance=_motion_affordance(component, relations),
                     debug_metrics={
-                        "runtime": runtime,
+                        **({"runtime": runtime} if index == 0 else {}),
                         "photo_ids": list(component),
                         "ordered_photo_ids": ordered,
                         "verified_edge_count": len(internal),
@@ -619,4 +691,4 @@ def run_vggt_scene_pipeline(
         return geometries, relations, results
     finally:
         _cleanup_files(directory, filelist)
-        _release_accelerator_cache()
+        _release_accelerator_cache(str(runtime.get("device") or ""), final=True)

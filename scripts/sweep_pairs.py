@@ -20,10 +20,11 @@ from sqlalchemy import text
 import torch
 
 from app.db.session import SessionLocal
-from app.models.vggt import vggt_model
+from app.models.vggt import PreparedImage, vggt_model
 from app.pipeline.phase1_analyze.candidate_pairs import nominate
 from app.pipeline.phase1_analyze.pairwise_verify import (
     canonical_order_with_ids,
+    file_sha256,
     verify_with_cache,
 )
 from app.core.config import settings
@@ -33,9 +34,6 @@ OUT = os.path.join(os.path.dirname(__file__), "..", "tmp_sweep")
 # Sustained MPS inference degrades badly without periodic release: the first run
 # went 0.85 -> 4.3 s/pair over ~350 calls on a cold machine with 12 GB free, so it
 # was allocator growth rather than thermal or system memory pressure.
-RELEASE_EVERY = 25
-
-
 def _release_accelerator() -> None:
     if torch.backends.mps.is_available():
         torch.mps.synchronize()
@@ -114,16 +112,46 @@ def sweep(project_id: str, limit: int | None = None) -> dict:
     print(f"\n=== {slug}: {len(photos)} photos, {len(candidates)} V2 pairs ===", flush=True)
     results = []
     started = time.monotonic()
+    digest_by_photo: dict[int, str] = {}
+    prepared_by_path: dict[str, PreparedImage] = {}
+
+    def digest(photo_id: int) -> str:
+        value = digest_by_photo.get(photo_id)
+        if value is None:
+            value = file_sha256(paths[photo_id])
+            digest_by_photo[photo_id] = value
+        return value
+
+    def prepared(path: str) -> PreparedImage:
+        value = prepared_by_path.get(path)
+        if value is None:
+            value = vggt_model.prepare_image(path)
+            prepared_by_path[path] = value
+        return value
+
+    release_every = (
+        max(0, int(settings.VGGT_MPS_CACHE_RELEASE_EVERY))
+        if str(runtime.get("device") or "") == "mps"
+        else 0
+    )
     computed = hits = 0
     for index, pair in enumerate(candidates, 1):
         a, b = pair.key
+        digest_a = digest(a)
+        digest_b = digest(b)
         (path_a, evidence_a), (path_b, evidence_b) = canonical_order_with_ids(
-            paths[a], a, paths[b], b
+            paths[a], a, paths[b], b, digest_a=digest_a, digest_b=digest_b
         )
-        record, cache_hit, _ = verify_with_cache(path_a, path_b, runtime=runtime)
+        record, cache_hit, _ = verify_with_cache(
+            path_a,
+            path_b,
+            runtime=runtime,
+            image_digests=(digest_by_photo[evidence_a], digest_by_photo[evidence_b]),
+            prepared_loader=prepared,
+        )
         computed += int(not cache_hit)
         hits += int(cache_hit)
-        if not cache_hit and computed % RELEASE_EVERY == 0:
+        if release_every and not cache_hit and computed % release_every == 0:
             _release_accelerator()
         record = dict(record)
         record.update({
@@ -145,6 +173,7 @@ def sweep(project_id: str, limit: int | None = None) -> dict:
                   f"eta {rate*remaining/60:.1f}m", flush=True)
     if computed:
         _release_accelerator()
+    prepared_by_path.clear()
 
     # A partial run must never overwrite a completed sweep of the same listing.
     suffix = f".partial-{len(results)}" if limit else ""
