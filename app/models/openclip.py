@@ -37,6 +37,26 @@ ROOM_TYPES = [
 ]
 
 ROOM_PROMPTS = {
+    # Every room type gets several descriptive prompts. Earlier only garage,
+    # bathroom, storage and laundry were tuned while the rest fell back to a bare
+    # "a photo of a {room}", so the tuned classes acted as attractors: measured
+    # against human ground truth, 21 of 174 photos were wrongly called garage,
+    # including living rooms, kitchens, front yards and patios.
+    "living room": [
+        "a photo of a living room",
+        "a real estate photo of a living room with a sofa, coffee table and television",
+        "an interior listing photo of a lounge or family room with seating",
+    ],
+    "bedroom": [
+        "a photo of a bed in a bedroom",
+        "a real estate photo of a bedroom with a made bed, pillows and a nightstand",
+        "an interior photo of a bedroom showing a bed with a headboard",
+    ],
+    "kitchen": [
+        "a photo of a kitchen",
+        "a real estate photo of a kitchen with cabinets, countertops, sink and appliances",
+        "an interior listing photo of a kitchen with a refrigerator and a stove",
+    ],
     "laundry room": [
         "a photo of a laundry room",
         "a photo of a utility room with washer and dryer",
@@ -48,16 +68,79 @@ ROOM_PROMPTS = {
         "an interior listing photo of a bathroom",
     ],
     "storage": [
-        "a photo of a storage room",
-        "a photo of a storage closet with shelves and boxes",
-        "an interior listing photo of a storage room",
+        "a photo of shelving stacked with boxes and stored items",
+        "a photo of a storage closet packed with belongings",
+    ],
+    "dining room": [
+        "a photo of a dining table surrounded by dining chairs",
+        "a real estate photo of a dining area with a table set for a meal",
+    ],
+    "office": [
+        "a photo of a home office",
+        "a real estate photo of a home office with a desk, office chair and monitor",
+        "an interior listing photo of a study or work room with a desk and bookshelf",
     ],
     "garage": [
-        "a photo of a garage",
-        "a photo of a garage with storage and tools",
-        "an interior listing photo of a garage",
+        "a photo of the inside of a garage",
+        "a photo of a garage interior with a concrete floor and a garage door",
+        "an interior photo of a garage with tools, shelving and parked vehicles",
+    ],
+    "basement": [
+        "a photo of a basement",
+        "a photo of an unfinished basement with concrete walls and exposed ceiling",
+        "an interior photo of a lower level rec room in a basement",
+    ],
+    "attic": [
+        "a photo of an attic",
+        "a photo of an attic loft with sloped ceilings and roof beams",
+    ],
+    "hallway": [
+        "a photo of a hallway",
+        "a real estate photo of an interior corridor with doors along it",
+        "an interior listing photo of a landing or hallway with stairs",
+    ],
+    "entrance": [
+        "a photo of an entryway with a closed front door",
+        "a real estate photo of a foyer showing the inside of the front door",
+    ],
+    "patio": [
+        "a photo of a patio",
+        "a photo of a covered outdoor patio with outdoor furniture",
+        "a real estate photo of a deck or terrace attached to a house",
+    ],
+    "backyard": [
+        "a photo of a fenced backyard behind a house",
+        "a real estate photo of a private rear garden enclosed by a fence",
+        "an outdoor photo of a back garden with a lawn, fence and no street",
+    ],
+    "front yard": [
+        "a photo of the front yard of a house seen from the street",
+        "a real estate photo of a driveway and front walkway leading to a front door",
+    ],
+    "pool": [
+        "a photo of a swimming pool",
+        "a real estate photo of a backyard swimming pool with decking",
+    ],
+    "exterior front": [
+        "a photo of the front exterior of a house",
+        "a real estate photo of the front facade and entrance of a home from the street",
+        "an exterior photo showing the front elevation of a house",
+    ],
+    "exterior back": [
+        "a photo of the rear exterior of a house",
+        "a real estate photo of the back facade of a home seen from the garden",
+    ],
+    "aerial view": [
+        "an aerial photo of a house and its lot",
+        "a drone photo looking down on a residential property and neighbourhood",
+        "a high angle aerial view of houses and streets",
+    ],
+    "drone shot": [
+        "a drone photograph of a property from above",
+        "an aerial drone view of a house, roof and surrounding land",
     ],
 }
+
 
 
 class OpenCLIPModel:
