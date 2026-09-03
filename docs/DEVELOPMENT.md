@@ -14,9 +14,12 @@ uvicorn app.main:app --reload --port 8000
 Worker:
 
 ```bash
-source venv/bin/activate
-python -m app.worker
+WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.worker
 ```
+
+On Apple Silicon, `WORKER_TYPE=gpu` selects the Phase 1-capable worker while
+`VGGT_DEVICE=auto` resolves inference to MPS. Use `WORKER_PHASES=1` until local video rendering
+is intentionally enabled. Do not run a CPU worker against the same queue.
 
 ## Apple Silicon VGGT validation
 

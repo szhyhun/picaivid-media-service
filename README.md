@@ -31,9 +31,11 @@ uvicorn app.main:app --reload --port 8000
 Worker:
 
 ```bash
-source venv/bin/activate
-python -m app.worker
+WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.worker
 ```
+
+The full current manual startup order is documented in the workspace
+[`LOCAL_RUN.md`](../LOCAL_RUN.md).
 
 For reproducible installs:
 
