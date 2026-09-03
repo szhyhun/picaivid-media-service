@@ -24,6 +24,26 @@ class Job(Base):
     enable_beat_sync = Column(Boolean, default=True)
     final_video_uri = Column(String(500), nullable=True)
     error_message = Column(String(1000), nullable=True)
+
+    # Progress reporting. The pipeline already knows how far along it is (it logs
+    # VGGT_V2_PAIR_PROGRESS every 25 pairs) but nothing persisted it, so the UI had
+    # no way to show anything but a spinner.
+    progress_current = Column(Integer, nullable=True)
+    progress_total = Column(Integer, nullable=True)
+    progress_label = Column(String(120), nullable=True)
+    phase_started_at = Column(DateTime, nullable=True)
+    # Refreshed on the same cadence as progress. A heartbeat older than
+    # STALE_AFTER_SECONDS means the worker died mid-job; without this a crashed
+    # run is indistinguishable from a slow one, which is how three separate
+    # outages showed up as an endless spinner.
+    heartbeat_at = Column(DateTime, nullable=True)
+
+    # Cooperative cancellation: the API sets the flag, the worker checks it at
+    # loop boundaries and unwinds cleanly. Never kill mid-write, or the partial
+    # scene graph is exactly what gets left behind.
+    cancel_requested = Column(Boolean, nullable=False, server_default="false")
+    canceled_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

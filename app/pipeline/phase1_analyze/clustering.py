@@ -25,6 +25,7 @@ from app.pipeline.phase1_analyze.vggt_pipeline import (
     PhotoRelationResult,
     run_vggt_scene_pipeline,
 )
+from app.pipeline.progress import JobProgress
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,12 @@ def cluster_photos_by_room(
                 cached_image.close()
         preloaded_images.clear()
 
+    # The reporter deliberately uses its own session rather than `db`: progress
+    # written through the pipeline's transaction stays invisible until commit,
+    # which is minutes away and defeats the point of reporting it.
+    progress = JobProgress(int(job.id))
+    progress.start_phase("Analyzing scene geometry")
+
     try:
         geometries, relations, components = run_vggt_scene_pipeline(
             images=images,
@@ -98,6 +105,7 @@ def cluster_photos_by_room(
             quality_scores=quality_scores,
             editorial_roles=editorial_roles,
             embeddings=embeddings,
+            progress=progress,
         )
     finally:
         for image in images:

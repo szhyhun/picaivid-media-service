@@ -51,6 +51,19 @@ def process_message(message: dict) -> None:
     else:
         allowed_phases = _configured_phases(CPU_PHASES)
 
+    # A worker that cannot run the requested phase must not consume the message.
+    # Returning here would let the consumer delete it as "successfully
+    # processed", stranding the job at `pending` forever with the work
+    # unrecoverable -- observed on jobs 47 and 48 when a stray WORKER_TYPE=cpu
+    # worker won phase-1 messages it could only skip. Raising instead lets the
+    # visibility timeout return the message to the queue for a capable worker.
+    requested_phase = int(job_message.start_phase or 1)
+    if requested_phase not in allowed_phases:
+        raise RuntimeError(
+            f"{settings.WORKER_TYPE} worker cannot run phase {requested_phase} "
+            f"(handles {allowed_phases}); returning message to the queue"
+        )
+
     with get_db_context() as db:
         orchestrator = PipelineOrchestrator(db)
 

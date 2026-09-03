@@ -25,6 +25,8 @@ from app.db.models.scene_truth import TRUTH_SPLITS, TRUTH_STATUSES, SceneTruthSe
 from app.db.session import get_db
 from app.models.warmup import warmup_core_models
 from app.pipeline.orchestrator import PipelineOrchestrator
+from app.pipeline.progress import STALE_AFTER_SECONDS
+from app.schemas.job_progress import CancelResponse, JobProgressResponse
 from app.schemas.clip import (
     AnalysisInfo,
     ClipListResponse,
@@ -424,6 +426,116 @@ async def get_project_clips(project_id: str, db: Session = Depends(get_db)):
         job_status=job.status,
         clips=responses,
         total_clips=len(responses),
+    )
+
+
+def _job_progress_payload(project_id: str, job) -> JobProgressResponse:
+    """Derive the UI-facing state for a job.
+
+    `stalled` is the important one: a job whose status still says it is working
+    but whose heartbeat has gone quiet means the worker died. Deriving it here
+    keeps every consumer honest about the difference between slow and dead.
+    """
+    if job is None:
+        return JobProgressResponse(project_id=project_id, state="idle")
+
+    now = datetime.utcnow()
+    status = str(job.status or "")
+    heartbeat_age = (
+        (now - job.heartbeat_at).total_seconds() if job.heartbeat_at else None
+    )
+    elapsed = (now - job.created_at).total_seconds() if job.created_at else None
+
+    if job.canceled_at is not None or status == "cancelled":
+        state = "cancelled"
+    elif status == "failed":
+        state = "failed"
+    elif status in {"pending", ""}:
+        state = "queued"
+    elif status.endswith("_complete") or status == "complete":
+        state = "complete"
+    elif heartbeat_age is not None and heartbeat_age > STALE_AFTER_SECONDS:
+        state = "stalled"
+    elif heartbeat_age is None and elapsed is not None and elapsed > STALE_AFTER_SECONDS:
+        # Claimed by a worker that never reported anything at all -- the exact
+        # signature of a worker that cannot run the requested phase.
+        state = "stalled"
+    else:
+        state = "running"
+
+    current, total = job.progress_current, job.progress_total
+    percent = None
+    if total:
+        percent = round(min(100.0, max(0.0, (current or 0) * 100.0 / total)), 1)
+    if state == "complete":
+        percent = 100.0
+
+    return JobProgressResponse(
+        project_id=project_id,
+        job_id=int(job.id),
+        state=state,
+        status=status or None,
+        phase=job.current_phase,
+        phase_label=job.progress_label,
+        current=current,
+        total=total,
+        percent=percent,
+        elapsed_seconds=round(elapsed, 1) if elapsed is not None else None,
+        seconds_since_heartbeat=(
+            round(heartbeat_age, 1) if heartbeat_age is not None else None
+        ),
+        stale_after_seconds=STALE_AFTER_SECONDS,
+        cancel_requested=bool(job.cancel_requested),
+        error_message=job.error_message,
+        started_at=job.created_at,
+    )
+
+
+@app.get("/api/projects/{project_id}/progress", response_model=JobProgressResponse)
+async def get_project_progress(project_id: str, db: Session = Depends(get_db)):
+    """Live progress for the newest job on a project. Safe to poll."""
+    job = (
+        db.query(Job)
+        .filter(Job.project_id == project_id)
+        .order_by(Job.id.desc())
+        .first()
+    )
+    return _job_progress_payload(project_id, job)
+
+
+@app.post("/api/projects/{project_id}/cancel", response_model=CancelResponse)
+async def cancel_project_job(project_id: str, db: Session = Depends(get_db)):
+    """Request cancellation of the newest job.
+
+    Cooperative: this only raises the flag. The worker notices it at a loop
+    boundary and unwinds cleanly, so a cancel never leaves a half-written scene
+    graph behind. A job that is already finished is left alone.
+    """
+    job = (
+        db.query(Job)
+        .filter(Job.project_id == project_id)
+        .order_by(Job.id.desc())
+        .first()
+    )
+    if job is None:
+        return CancelResponse(
+            project_id=project_id, job_id=None, cancelled=False,
+            detail="No job to cancel.",
+        )
+
+    status = str(job.status or "")
+    if status.endswith("_complete") or status in {"complete", "failed", "cancelled"}:
+        return CancelResponse(
+            project_id=project_id, job_id=int(job.id), cancelled=False,
+            detail=f"Job already finished ({status}).",
+        )
+
+    job.cancel_requested = True
+    db.commit()
+    logger.info("JOB_CANCEL_REQUESTED job_id=%s project_id=%s", job.id, project_id)
+    return CancelResponse(
+        project_id=project_id, job_id=int(job.id), cancelled=True,
+        detail="Cancellation requested; the worker will stop at the next checkpoint.",
     )
 
 

@@ -1,5 +1,6 @@
 """Pipeline orchestrator for phased execution."""
 import logging
+from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
@@ -9,6 +10,8 @@ from app.pipeline.phase1_analyze.analyzer import Phase1Analyzer
 from app.pipeline.phase2_render.renderer import Phase2Renderer
 from app.schemas.job import JobMessage
 from app.services.rails_webhook import notify_render_complete, notify_render_failed
+
+from app.pipeline.progress import JobCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +94,25 @@ class PipelineOrchestrator:
                     notify_render_complete(job.project_id)
                 break
 
-            success = self._run_phase(job, current)
+            try:
+                success = self._run_phase(job, current)
+            except JobCancelled:
+                # Cooperative cancel: the pipeline unwound at a loop boundary,
+                # so nothing is half-written in memory. Discard whatever partial
+                # scene graph reached the database so a re-run starts clean.
+                logger.info("Job %s cancelled during phase %s", job_id, current)
+                self.db.rollback()
+                self._discard_partial_analysis(job_id)
+                job = self.db.query(Job).filter(Job.id == job_id).first()
+                if job is not None:
+                    job.status = "cancelled"
+                    job.canceled_at = datetime.utcnow()
+                    job.cancel_requested = False
+                    job.progress_label = "Cancelled"
+                    self.db.commit()
+                    notify_render_failed(job.project_id, "Cancelled by request")
+                return
+
             if not success:
                 logger.error(f"Phase {current} failed for job {job_id}")
                 notify_render_failed(job.project_id, job.error_message or "Unknown error")
@@ -106,6 +127,40 @@ class PipelineOrchestrator:
                 self.db.commit()
                 notify_render_complete(job.project_id)
                 break
+
+    def _discard_partial_analysis(self, job_id: int) -> None:
+        """Delete the partial scene graph left by a cancelled run.
+
+        Keeps job_photos (and therefore the uploaded photos and their
+        embeddings) so re-running does not re-download or re-encode anything.
+        """
+        from app.db.models import (
+            AnalysisResult,
+            PhotoRelation,
+            PhotoSceneGeometry,
+            RoomCluster,
+            SceneComponent,
+            SceneComponentMembership,
+        )
+
+        for model in (
+            SceneComponentMembership,
+            PhotoSceneGeometry,
+            PhotoRelation,
+            AnalysisResult,
+            RoomCluster,
+            SceneComponent,
+        ):
+            try:
+                self.db.query(model).filter(model.job_id == job_id).delete(
+                    synchronize_session=False
+                )
+            except Exception as error:
+                logger.warning(
+                    "Could not clear %s for cancelled job %s: %s",
+                    model.__name__, job_id, error,
+                )
+        self.db.commit()
 
     def _run_phase(self, job: Job, phase: int) -> bool:
         """Run a single phase.

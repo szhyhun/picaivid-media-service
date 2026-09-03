@@ -15,7 +15,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -24,6 +24,9 @@ from PIL import Image
 from app.core.config import settings
 from app.models.vggt import vggt_model
 from app.pipeline.phase1_analyze.pose_graph import CameraPose, solve_component_poses
+if TYPE_CHECKING:  # avoids a runtime import cycle with app.db
+    from app.pipeline.progress import ProgressReporter
+
 logger = logging.getLogger(__name__)
 
 # Calibrated on 813 verified pairs across three human-labeled listings. These are
@@ -191,6 +194,7 @@ def _v2_scene_graph(
     must_not_group: set[tuple[int, int]] | None = None,
     *,
     runtime: dict[str, Any] | None = None,
+    progress: "ProgressReporter | None" = None,
 ) -> tuple[list[PhotoRelationResult], list[list[int]], list[dict[str, Any]], dict[str, Any]]:
     """Verify nominated pairs and build constrained physical-room components."""
     from app.pipeline.phase1_analyze import pairing, transitions
@@ -285,6 +289,11 @@ def _v2_scene_graph(
                 cache_hits,
                 failed,
             )
+            if progress is not None:
+                progress.update(index, len(candidates), "Analyzing scene geometry")
+                # Checked here rather than every iteration: this is a loop
+                # boundary with no partial write in flight, so unwinding is clean.
+                progress.raise_if_cancelled()
     prepared_image_count = len(prepared_by_path)
     prepared_by_path.clear()
     merge_edges = [
@@ -567,6 +576,7 @@ def run_vggt_scene_pipeline(
     quality_scores: dict[int, float] | None = None,
     editorial_roles: dict[int, str] | None = None,
     embeddings: dict[int, list] | None = None,
+    progress: "ProgressReporter | None" = None,
 ) -> tuple[list[PhotoGeometryResult], list[PhotoRelationResult], list[SceneComponentResult]]:
     """Run the V2-only scene graph without whole-listing Omega inference."""
     if not images:
@@ -603,6 +613,7 @@ def run_vggt_scene_pipeline(
             position_map,
             embeddings or {},
             runtime=runtime,
+            progress=progress,
         )
         runtime = {
             **runtime,
