@@ -172,3 +172,61 @@ class SelectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CloseUpTests(unittest.TestCase):
+    """Measured from the three reference films: about one shot in four is a
+    close-up, recurring every two to three shots, thinning at both ends."""
+
+    def setUp(self):
+        self.line = build_shot_line(a_property(), target_seconds=60, bpm=100)
+        self.shots = self.line.shots
+
+    def test_close_ups_are_about_a_quarter_of_the_film(self):
+        share = sum(s.is_close_up for s in self.shots) / len(self.shots)
+        self.assertGreater(share, 0.15)
+        self.assertLess(share, 0.35)
+
+    def test_a_close_up_is_cropped_from_the_shot_it_follows(self):
+        """Cutting into the frame just seen reads as one continuous look; a
+        detail from another room reads as an unrelated picture."""
+        for prev, shot in zip(self.shots, self.shots[1:]):
+            if shot.is_close_up:
+                self.assertEqual(shot.room_id, prev.room_id)
+                self.assertEqual(shot.photo_ids[0], prev.photo_ids[0])
+
+    def test_close_ups_never_run_back_to_back(self):
+        for a, b in zip(self.shots, self.shots[1:]):
+            self.assertFalse(a.is_close_up and b.is_close_up)
+
+    def test_the_approach_and_the_close_stay_wide(self):
+        """The reference films open and end on wides."""
+        self.assertFalse(self.shots[0].is_close_up)
+        self.assertFalse(self.shots[1].is_close_up)
+        self.assertFalse(self.shots[-1].is_close_up)
+
+    def test_a_close_up_has_one_source_frame(self):
+        for s in self.shots:
+            if s.is_close_up:
+                self.assertEqual(len(s.photo_ids), 1)
+                self.assertEqual(s.kind, "single_image")
+
+    def test_shots_stay_contiguous_after_insertion(self):
+        for a, b in zip(self.shots, self.shots[1:]):
+            self.assertAlmostEqual(a.start_seconds + a.duration_seconds,
+                                   b.start_seconds, places=2)
+
+    def test_indices_are_renumbered_after_insertion(self):
+        self.assertEqual([s.index for s in self.shots],
+                         list(range(len(self.shots))))
+
+    def test_the_rate_holds_even_on_the_shortest_film(self):
+        """A short film keeps the same quarter-of-shots rate rather than
+        dropping close-ups entirely -- they are part of the grammar, not a
+        luxury added when there is spare runtime."""
+        tiny = build_shot_line(a_property(), target_seconds=4, bpm=100)
+        share = sum(s.is_close_up for s in tiny.shots) / len(tiny.shots)
+        self.assertGreater(share, 0.1)
+        self.assertLess(share, 0.4)
+        self.assertFalse(tiny.shots[0].is_close_up)
+        self.assertFalse(tiny.shots[-1].is_close_up)

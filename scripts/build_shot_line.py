@@ -113,14 +113,20 @@ def main() -> None:
     print(f"\n  rooms from {source}: {len(rooms)}   target {args.seconds:.0f}s @ {args.bpm:.0f} BPM")
     print(f"  {len(line.shots)} shots x {line.shots[0].duration_seconds:.3f}s = "
           f"{line.duration:.1f}s")
+    closeups = sum(1 for s in line.shots if s.is_close_up)
     print(f"  hero: {line.hero_room_id}    "
-          f"keyframe pairs: {100*line.keyframe_fraction():.0f}% of shots")
+          f"keyframe pairs: {100*line.keyframe_fraction():.0f}%    "
+          f"close-ups: {closeups} ({100*closeups/max(len(line.shots),1):.0f}%)")
     if line.dropped_rooms:
         print(f"  dropped: {', '.join(line.dropped_rooms)}")
     print(f"\n  {'#':>3} {'t':>6} {'act':>4}  {'room':<22}{'source':<16}move")
     for s in line.shots:
-        src = "PAIR " + "+".join(str(p) for p in s.photo_ids) if s.uses_keyframes \
-              else f"photo {s.photo_ids[0]}"
+        if s.is_close_up:
+            src = f"CLOSE-UP of {s.photo_ids[0]}"
+        elif s.uses_keyframes:
+            src = "PAIR " + "+".join(str(p) for p in s.photo_ids)
+        else:
+            src = f"photo {s.photo_ids[0]}"
         star = " *" if s.is_hero else "  "
         print(f"  {s.index:>3} {s.start_seconds:>6.2f} {s.act:>4}{star}{s.room_id[:20]:<22}"
               f"{src:<16}{s.move.label}")

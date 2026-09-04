@@ -35,10 +35,11 @@ as a detail rather than a room view. See VIDEO_PRODUCTION_PLAN.md.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app.pipeline.phase1_analyze.camera_move import CameraMove, choose_move
 from app.pipeline.phase1_analyze.editorial import (
+    MIN_SHOTS,
     Tier,
     is_eligible,
     shot_budget,
@@ -94,6 +95,22 @@ MAX_ROOMS_PER_TYPE: dict[str, int] = {
     "entrance": 1,
 }
 DEFAULT_MAX_ROOMS_PER_TYPE = 2
+
+# Close-ups, measured by scoring every shot in the three reference films against
+# the wide-room centroid and taking each film's top quartile:
+#
+#   Wallace Dr    10 of 40 shots (25%)   median gap 3
+#   Whitehead Pl  13 of 53 (25%)         median gap 2
+#   Anthony Pl    12 of 49 (24%)         median gap 2
+#
+# About one shot in four, recurring every two to three shots. They thin out at
+# the very start and end -- the opening approach and the closing run are wides --
+# so they are inserted through the body of the film only.
+CLOSE_UP_SHARE = 0.25
+CLOSE_UP_EVERY = 3          # insert after every Nth eligible wide shot
+# A close-up must belong to the room it follows: cutting from a wide living room
+# to that same living room's fireplace reads as one continuous look, whereas a
+# detail from elsewhere reads as an unrelated picture.
 
 # Where each kind of room sits in the film, measured from all three reference
 # films by classifying the middle frame of every shot on the fitted cut grid and
@@ -236,6 +253,10 @@ class Shot:
     duration_seconds: float
     move: CameraMove
     is_hero: bool = False
+    # A close-up cropped from the shot it follows. `crop_box` is in source-pixel
+    # coordinates on `photo_ids[0]`; None means the whole frame is used.
+    is_close_up: bool = False
+    crop_box: tuple[int, int, int, int] | None = None
 
     @property
     def uses_keyframes(self) -> bool:
@@ -377,7 +398,11 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
 
     # Service rooms are kept but minimised, matching the reference film's 1.5s
     # garage. They are dropped only if the film is too short to afford them.
-    budget = shot_budget(target_seconds, bpm)
+    # About a quarter of the finished film is close-ups, and those are generated
+    # from the wide shots rather than from extra rooms. Allocating rooms against
+    # the full budget would overshoot the runtime once close-ups are inserted.
+    total_budget = shot_budget(target_seconds, bpm)
+    budget = max(MIN_SHOTS, round(total_budget * (1.0 - CLOSE_UP_SHARE)))
     if not allow_service and budget < 12:
         service = [r for r in eligible if r.tier is Tier.SERVICE]
         eligible = [r for r in eligible if r.tier is not Tier.SERVICE]
@@ -519,4 +544,53 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         ))
         cursor += per_shot
 
+    shots = _insert_close_ups(shots, per_shot)
     return ShotLine(shots=shots, bpm=bpm, hero_room_id=hero_id, dropped_rooms=dropped)
+
+
+def _insert_close_ups(shots: list[Shot], per_shot: float) -> list[Shot]:
+    """Add a close-up after roughly every third shot, sourced from that shot.
+
+    The close-up is a crop of the frame immediately before it, which is what
+    makes the pair read as one continuous look rather than two pictures. The
+    crop box itself is filled in later by `detail_crop.details_for_rooms`, which
+    needs the image; a shot marked `is_close_up` with `crop_box` still None is a
+    request that the crop finder has not yet answered.
+
+    The opening approach and the closing run stay wide: the reference films thin
+    their close-ups out at both ends.
+    """
+    if len(shots) < 4:
+        return shots
+
+    head = 2                      # leave the approach alone
+    tail = max(1, len(shots) // 8)  # and the close
+    out: list[Shot] = []
+    since = 0
+    for i, shot in enumerate(shots):
+        out.append(shot)
+        in_body = head <= i < len(shots) - tail
+        since += 1
+        if in_body and since >= CLOSE_UP_EVERY and not shot.is_close_up:
+            out.append(Shot(
+                index=-1,                     # renumbered below
+                room_id=shot.room_id,
+                room_type=shot.room_type,
+                photo_ids=[shot.photo_ids[0]],
+                kind="single_image",          # a crop has one source frame
+                act=shot.act,
+                start_seconds=0.0,
+                duration_seconds=per_shot,
+                move=choose_move(f"{shot.room_id}:closeup:{i}"),
+                is_hero=shot.is_hero,
+                is_close_up=True,
+            ))
+            since = 0
+
+    cursor = 0.0
+    renumbered: list[Shot] = []
+    for index, shot in enumerate(out):
+        renumbered.append(replace(shot, index=index,
+                                  start_seconds=round(cursor, 3)))
+        cursor += shot.duration_seconds
+    return renumbered
