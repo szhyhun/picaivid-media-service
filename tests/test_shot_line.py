@@ -457,6 +457,38 @@ class SelectionTests(unittest.TestCase):
         self.assertLess(indices["main-kitchen"], indices["bedroom"])
         self.assertGreater(indices["suite-kitchen"], indices["bedroom"])
 
+    def test_later_living_room_capture_run_moves_after_main_private_rooms(self):
+        rooms = [
+            room("front", "exterior front", 1, start=1),
+            room("main-living", "living room", 2, quality=0.4, start=10),
+            room("bedroom", "bedroom", 2, quality=0.8, start=30),
+            room("suite-living", "living room", 3, quality=1.0, start=50),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        indices = {
+            room_id: min(shot.index for shot in line.shots if shot.room_id == room_id)
+            for room_id in {"main-living", "bedroom", "suite-living"}
+        }
+        self.assertLess(indices["main-living"], indices["bedroom"])
+        self.assertGreater(indices["suite-living"], indices["bedroom"])
+
+    def test_late_photo_in_main_living_room_cannot_hide_later_suite_living(self):
+        main_living = room("main-living", "living room", 2, quality=0.4, start=10)
+        main_living.photo_positions[main_living.photo_ids[1]] = 70
+        rooms = [
+            room("front", "exterior front", 1, start=1),
+            main_living,
+            room("bedroom", "bedroom", 2, quality=0.8, start=30),
+            room("suite-living", "living room", 3, quality=1.0, start=50),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        indices = {
+            room_id: min(shot.index for shot in line.shots if shot.room_id == room_id)
+            for room_id in {"main-living", "bedroom", "suite-living"}
+        }
+        self.assertLess(indices["main-living"], indices["bedroom"])
+        self.assertGreater(indices["suite-living"], indices["bedroom"])
+
 
 if __name__ == "__main__":
     unittest.main()

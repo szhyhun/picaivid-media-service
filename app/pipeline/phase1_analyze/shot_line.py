@@ -114,12 +114,14 @@ DEFAULT_MAX_ROOMS_PER_TYPE = 2
 # use a bathroom singleton merely to consume budget.
 PAIR_ONLY_ROOM_TYPES = frozenset({"bathroom"})
 
-# A later kitchen is editorially a separate unit only after a meaningful gap in
-# the uploaded capture sequence. This keeps a main kitchen split across two VGGT
-# components together while moving a later in-law/suite kitchen behind the main
-# home. It is a story heuristic, never geometry or membership evidence.
-SECONDARY_KITCHEN_GAP = 8
-SECONDARY_KITCHEN_POSITION = 0.68
+# A later kitchen or living room is editorially a separate unit only after a
+# meaningful gap in the uploaded capture sequence. This keeps a main social
+# room split across adjacent VGGT components together while moving an in-law or
+# suite social room behind the main home. It is a story heuristic, never
+# geometry or membership evidence.
+SECONDARY_SOCIAL_GAP = 8
+SECONDARY_UNIT_POSITION = 0.68
+PRIMARY_SOCIAL_ROOM_TYPES = ("kitchen", "living room")
 
 # Selection and story order are separate decisions. These are the main-house
 # social spaces that earn one protected beat when present; additional coverage
@@ -436,7 +438,7 @@ def is_secondary(room: RoomCandidate) -> bool:
 def story_position(room: RoomCandidate) -> float:
     """Where this room belongs in the film, from the measured medians."""
     if room.secondary:
-        return SECONDARY_KITCHEN_POSITION
+        return SECONDARY_UNIT_POSITION
     return STORY_POSITION.get(room.room_type, DEFAULT_POSITION)
 
 
@@ -464,38 +466,31 @@ def _room_start(room: RoomCandidate) -> int:
     return min(positions) if positions else 0
 
 
-def _mark_secondary_kitchens(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
-    """Move a clearly later kitchen run behind the main-home story.
+def _mark_secondary_social_rooms(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
+    """Move later kitchen and living-room capture runs behind the main home.
 
-    Two adjacent kitchen components often represent one open-plan main kitchen,
-    so the first contiguous capture run stays primary. A kitchen that starts only
-    after a gap is a separate unit for ordering purposes. No CLIP similarity or
-    component merge can override this editorial distinction.
+    The first kitchen and first living room in capture order are the main-home
+    social spaces. Adjacent components can still be one room, but a later run is
+    a suite/secondary unit for editorial ordering. Compare candidate starts to
+    the first run's start, not its final photo: a primary room may contain a
+    late return photo, which must not hide an earlier secondary social room.
     """
     copies = [replace(room, secondary=is_secondary(room)) for room in rooms]
-    kitchens = sorted(
-        (room for room in copies if room.room_type == "kitchen" and room.photo_ids),
-        key=lambda room: (_room_start(room), room.room_id),
-    )
-    if kitchens:
-        primary = kitchens[0]
-        primary_end = max(
-            primary.photo_positions.get(photo_id, photo_id)
-            for photo_id in primary.photo_ids
+    for room_type in PRIMARY_SOCIAL_ROOM_TYPES:
+        candidates = sorted(
+            (room for room in copies
+             if room.room_type == room_type and room.photo_ids and not room.secondary),
+            key=lambda room: (_room_start(room), room.room_id),
         )
-        for kitchen in kitchens[1:]:
-            start = _room_start(kitchen)
-            if start <= primary_end + SECONDARY_KITCHEN_GAP:
-                primary_end = max(
-                    primary_end,
-                    max(kitchen.photo_positions.get(photo_id, photo_id)
-                        for photo_id in kitchen.photo_ids),
-                )
-            else:
-                kitchen.secondary = True
+        if not candidates:
+            continue
+        primary_start = _room_start(candidates[0])
+        for room in candidates[1:]:
+            if _room_start(room) > primary_start + SECONDARY_SOCIAL_GAP:
+                room.secondary = True
 
-    # Semantic zones are editorial views of one VGGT component. A late kitchen
-    # identifies a secondary unit, not merely an isolated kitchen: its sibling
+    # Semantic zones are editorial views of one VGGT component. A late social
+    # room identifies a secondary unit, not merely an isolated room: its sibling
     # living/hall/bedroom zones must follow that unit rather than jumping back
     # into the early main-house tour.
     secondary_components = {
@@ -699,7 +694,7 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
                     bpm: float, allow_service: bool = False,
                     include_close_ups: bool = True) -> ShotLine:
     """Produce the ordered shot line for a listing."""
-    rooms = _mark_secondary_kitchens(rooms)
+    rooms = _mark_secondary_social_rooms(rooms)
     eligible = [
         room for room in rooms
         if room.photo_ids
