@@ -1,114 +1,73 @@
-"""Manufacturing detail shots by cropping.
-
-Real-estate shoots do not contain close-ups: 2 of 295 photos across the six
-labelled listings read as a detail rather than a room. Details are made by
-cropping into room photographs, so the crop decision has to be sound.
-"""
+"""Tests for object-aware cinematic detail selection."""
 from __future__ import annotations
 
 import unittest
 
-import numpy as np
-
 from app.pipeline.phase1_analyze.detail_crop import (
-    CROP_WIDTH_FRACTION,
-    MIN_DETAIL_SCORE,
+    DETAIL_SUBJECTS_BY_ROOM,
     OUTPUT_ASPECT,
-    best_crop,
-    candidate_boxes,
-    close_up_rate,
-    score_crops,
+    _subject_for_label,
+    crop_for_subject,
+    detail_subjects,
+    is_detail_eligible,
 )
 
 
 class EditorialEligibilityTests(unittest.TestCase):
-    def test_only_rooms_with_reliably_scorable_details_are_eligible(self):
-        self.assertGreater(close_up_rate("kitchen"), 0.0)
-        self.assertGreater(close_up_rate("patio"), 0.0)
+    def test_only_rooms_with_named_subjects_are_eligible(self):
+        self.assertTrue(is_detail_eligible("kitchen"))
+        self.assertTrue(is_detail_eligible("patio"))
         for room_type in ("bedroom", "bathroom", "hallway", "office",
                           "garage", "storage", "laundry room"):
-            self.assertEqual(close_up_rate(room_type), 0.0)
+            self.assertFalse(is_detail_eligible(room_type))
 
-    def test_unknown_room_types_do_not_get_generic_details(self):
-        self.assertEqual(close_up_rate("unclassified space"), 0.0)
+    def test_grill_is_an_allowed_patio_subject(self):
+        subjects = detail_subjects("patio")
+        self.assertIn("grill", {subject.key for subject in subjects})
 
-
-class CandidateBoxTests(unittest.TestCase):
-    def test_crops_are_a_real_close_up_not_the_whole_frame(self):
-        boxes = candidate_boxes(2048, 1365)
-        widths = {w for _, _, w, _ in boxes}
-        self.assertEqual(len(widths), 1)
-        self.assertAlmostEqual(widths.pop() / 2048, CROP_WIDTH_FRACTION, places=2)
-
-    def test_crops_match_the_output_aspect(self):
-        for x, y, w, h in candidate_boxes(2048, 1365):
-            self.assertAlmostEqual(w / h, OUTPUT_ASPECT, places=1)
-
-    def test_every_box_lies_inside_the_frame(self):
-        W, H = 2048, 1365
-        for x, y, w, h in candidate_boxes(W, H):
-            self.assertGreaterEqual(x, 0)
-            self.assertGreaterEqual(y, 0)
-            self.assertLessEqual(x + w, W)
-            self.assertLessEqual(y + h, H)
-
-    def test_boxes_cover_the_frame_not_just_the_centre(self):
-        """A detail is as often at the edge of a frame as in the middle."""
-        boxes = candidate_boxes(2048, 1365)
-        xs = {x for x, _, _, _ in boxes}
-        ys = {y for _, y, _, _ in boxes}
-        self.assertGreater(len(xs), 3)
-        self.assertGreater(len(ys), 2)
-
-    def test_a_very_wide_frame_does_not_produce_a_crop_taller_than_it_is(self):
-        boxes = candidate_boxes(2000, 200)
-        for _, y, _, h in boxes:
-            self.assertLessEqual(y + h, 200)
+    def test_room_type_scopes_subjects_but_does_not_create_a_detail(self):
+        self.assertEqual(detail_subjects("unclassified space"), ())
+        self.assertNotIn("bedroom", DETAIL_SUBJECTS_BY_ROOM)
 
 
-class ScoringTests(unittest.TestCase):
-    def setUp(self):
-        self.detail = np.array([1.0, 0.0, 0.0])
-        self.blank = np.array([0.0, 1.0, 0.0])
-
-    def test_a_detail_like_crop_scores_above_a_blank_one(self):
-        crops = np.stack([self.detail, self.blank])
-        scores = score_crops(crops, self.detail, self.blank)
-        self.assertGreater(scores[0], scores[1])
-
-    def test_score_is_a_difference_not_a_similarity(self):
-        """A crop must be positively appealing, not merely not-blank."""
-        neutral = np.array([0.0, 0.0, 1.0])
-        scores = score_crops(neutral[None, :], self.detail, self.blank)
-        self.assertAlmostEqual(float(scores[0]), 0.0, places=6)
+class SubjectMappingTests(unittest.TestCase):
+    def test_detector_label_maps_to_the_product_subject(self):
+        kitchen = detail_subjects("kitchen")
+        self.assertEqual(_subject_for_label("oven", kitchen).key, "cooking")
+        self.assertEqual(_subject_for_label("cook range hood", kitchen).key, "range_hood")
 
 
-class BestCropTests(unittest.TestCase):
-    def setUp(self):
-        self.boxes = [(0, 0, 100, 56), (100, 0, 100, 56), (200, 0, 100, 56)]
-
-    def test_picks_the_highest_scoring_window(self):
-        crop = best_crop(self.boxes, np.array([0.01, 0.05, 0.02]))
+class CropGeometryTests(unittest.TestCase):
+    def test_crop_keeps_a_complete_subject_with_output_aspect(self):
+        crop = crop_for_subject(
+            (400, 350, 1000, 800), (2048, 1365), score=0.8,
+        )
         self.assertIsNotNone(crop)
-        self.assertEqual(crop.x, 100)
-        self.assertAlmostEqual(crop.score, 0.05)
+        self.assertAlmostEqual(crop.width / crop.height, OUTPUT_ASPECT, places=2)
+        self.assertLessEqual(crop.x, 400)
+        self.assertLessEqual(crop.y, 350)
+        self.assertGreaterEqual(crop.x + crop.width, 1000)
+        self.assertGreaterEqual(crop.y + crop.height, 800)
 
-    def test_a_frame_with_no_detail_yields_nothing(self):
-        """Better to skip the beat than cut to a close-up of a blank wall."""
-        self.assertIsNone(best_crop(self.boxes, np.array([-0.05, -0.02, -0.09])))
+    def test_partial_subject_touching_an_image_edge_is_rejected(self):
+        self.assertIsNone(crop_for_subject(
+            (1, 400, 600, 1000), (2048, 1365), score=0.8,
+        ))
 
-    def test_the_threshold_is_what_rejects_a_weak_frame(self):
-        weak = np.array([MIN_DETAIL_SCORE - 0.001] * 3)
-        strong = np.array([MIN_DETAIL_SCORE + 0.001] * 3)
-        self.assertIsNone(best_crop(self.boxes, weak))
-        self.assertIsNotNone(best_crop(self.boxes, strong))
+    def test_tiny_detection_cannot_create_a_postage_stamp_detail(self):
+        self.assertIsNone(crop_for_subject(
+            (500, 500, 600, 560), (2048, 1365), score=0.8,
+        ))
 
-    def test_empty_input_is_handled(self):
-        self.assertIsNone(best_crop([], np.array([])))
-
-    def test_box_is_pil_ready(self):
-        crop = best_crop(self.boxes, np.array([0.9, 0.0, 0.0]))
-        self.assertEqual(crop.box, (0, 0, 100, 56))
+    def test_crop_is_clamped_inside_its_source_image(self):
+        crop = crop_for_subject(
+            (1500, 800, 1900, 1200), (2048, 1365), score=0.8,
+        )
+        self.assertIsNotNone(crop)
+        self.assertGreaterEqual(crop.x, 0)
+        self.assertGreaterEqual(crop.y, 0)
+        self.assertLessEqual(crop.x + crop.width, 2048)
+        self.assertLessEqual(crop.y + crop.height, 1365)
 
 
 if __name__ == "__main__":

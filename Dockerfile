@@ -8,7 +8,8 @@ RUN pip install --no-cache-dir \
     torch==2.13.0 \
     torchvision==0.28.0 \
     open-clip-torch>=2.24.0 \
-    huggingface_hub
+    huggingface_hub \
+    transformers==5.2.0
 
 # Copy download script
 COPY scripts/download_models.py scripts/

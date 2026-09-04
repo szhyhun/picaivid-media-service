@@ -76,6 +76,17 @@ def download_ltx2_models(cache_dir: Path) -> None:
     del pipe  # Free memory
 
 
+def download_detail_detector(cache_dir: Path) -> None:
+    """Download Grounding DINO Tiny for object-aware detail selection."""
+    from huggingface_hub import snapshot_download
+
+    hf_cache = cache_dir / "huggingface"
+    hf_cache.mkdir(parents=True, exist_ok=True)
+    model_id = "IDEA-Research/grounding-dino-tiny"
+    logger.info("Downloading %s for cinematic detail detection...", model_id)
+    snapshot_download(model_id, cache_dir=str(hf_cache))
+
+
 def verify_models(cache_dir: Path) -> bool:
     """Verify all models are properly cached."""
     openclip_cache = cache_dir / "openclip"
@@ -87,6 +98,10 @@ def verify_models(cache_dir: Path) -> bool:
         logger.error("OpenCLIP model cache is empty")
         return False
     logger.info("Found %s OpenCLIP cache files", len(model_files))
+    detail_cache = cache_dir / "huggingface" / "models--IDEA-Research--grounding-dino-tiny"
+    if not detail_cache.exists():
+        logger.error("Grounding DINO detail-detector cache directory not found")
+        return False
     logger.info("Model verification passed")
     return True
 
@@ -103,6 +118,11 @@ def main():
         "--skip-openclip",
         action="store_true",
         help="Skip OpenCLIP model download"
+    )
+    parser.add_argument(
+        "--skip-detail-detector",
+        action="store_true",
+        help="Skip Grounding DINO detail-detector download"
     )
     parser.add_argument(
         "--verify-only",
@@ -135,6 +155,13 @@ def main():
             download_openclip_models(cache_dir)
         except Exception as e:
             logger.error(f"Failed to download OpenCLIP models: {e}")
+            sys.exit(1)
+
+    if not args.skip_detail_detector:
+        try:
+            download_detail_detector(cache_dir)
+        except Exception as e:
+            logger.error(f"Failed to download Grounding DINO detail detector: {e}")
             sys.exit(1)
 
     if args.include_ltx2:

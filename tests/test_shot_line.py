@@ -12,11 +12,17 @@ from app.pipeline.phase1_analyze.shot_line import (
     MAX_HERO_SHOTS,
     MAX_SERVICE_SHOTS,
     RoomCandidate,
+    Shot,
     build_shot_line,
     pick_hero,
     schedule_resolved_close_ups,
 )
-from app.pipeline.phase1_analyze.detail_crop import DetailCrop, ResolvedDetail
+from app.pipeline.phase1_analyze.camera_move import choose_move
+from app.pipeline.phase1_analyze.detail_crop import (
+    DetailCrop,
+    ResolvedDetail,
+    is_detail_eligible,
+)
 from app.pipeline.phase1_analyze.editorial import shot_budget
 
 
@@ -46,15 +52,22 @@ def a_property():
 
 
 def resolved_details(shots):
-    """Deterministic stand-in for crop validation; no model is needed here."""
-    return {
-        shot.index: ResolvedDetail(
+    """Deterministic stand-in for grounded object detection; no model is needed."""
+    details = {}
+    for shot in shots:
+        if shot.room_id in details or not is_detail_eligible(shot.room_type):
+            continue
+        details[shot.room_id] = [ResolvedDetail(
+            source_photo_id=shot.photo_ids[-1],
+            subject_key=f"{shot.room_id}-object",
+            subject_label="Verified object",
+            subject_box=(300, 200, 900, 700),
+            detector_score=0.8,
             crop=DetailCrop(x=100, y=200, width=900, height=506,
                             score=0.1 + shot.index / 1000),
             source_size=(2048, 1365),
-        )
-        for shot in shots
-    }
+        )]
+    return details
 
 
 class HeroTests(unittest.TestCase):
@@ -274,13 +287,11 @@ class CloseUpTests(unittest.TestCase):
         share = sum(s.is_close_up for s in self.shots) / len(self.shots)
         self.assertLessEqual(share, 0.25)
 
-    def test_a_close_up_is_cropped_from_the_shot_it_follows(self):
-        """Cutting into the frame just seen reads as one continuous look; a
-        detail from another room reads as an unrelated picture."""
+    def test_a_close_up_stays_in_the_room_it_follows(self):
+        """Its source can differ, but a detail never jumps to another room."""
         for prev, shot in zip(self.shots, self.shots[1:]):
             if shot.is_close_up:
                 self.assertEqual(shot.room_id, prev.room_id)
-                self.assertEqual(shot.photo_ids[0], prev.photo_ids[0])
 
     def test_close_ups_never_run_back_to_back(self):
         for a, b in zip(self.shots, self.shots[1:]):
@@ -299,6 +310,8 @@ class CloseUpTests(unittest.TestCase):
                 self.assertEqual(s.kind, "single_image")
                 self.assertIsNotNone(s.crop_box)
                 self.assertIsNotNone(s.crop_score)
+                self.assertIsNotNone(s.detail_subject)
+                self.assertIsNotNone(s.subject_box)
 
     def test_unvalidated_sources_never_become_close_ups(self):
         wides = build_shot_line(
@@ -308,15 +321,55 @@ class CloseUpTests(unittest.TestCase):
         self.assertFalse(any(s.is_close_up for s in scheduled))
 
     def test_bedrooms_and_bathrooms_are_not_detail_eligible(self):
-        """A valid generic crop is still not enough for these room types."""
+        """No unsupported room gets a generic detail because it has a photo."""
         details = [s for s in self.shots if s.is_close_up]
         self.assertTrue(details)
         self.assertFalse(any(s.room_type in {"bedroom", "bathroom"}
                              for s in details))
 
-    def test_only_one_detail_is_selected_per_room(self):
-        detail_rooms = [s.room_id for s in self.shots if s.is_close_up]
-        self.assertEqual(len(detail_rooms), len(set(detail_rooms)))
+    def test_details_never_repeat_the_same_detected_subject(self):
+        subjects = [
+            (s.room_id, s.detail_subject)
+            for s in self.shots if s.is_close_up
+        ]
+        self.assertEqual(len(subjects), len(set(subjects)))
+
+    def test_room_can_earn_two_distinct_object_details_when_paced(self):
+        wides = [Shot(
+            index=index,
+            room_id="living",
+            room_type="living room",
+            photo_ids=[100 + index],
+            kind="single_image",
+            act=2,
+            start_seconds=float(index),
+            duration_seconds=1.2,
+            move=choose_move(f"living:{index}"),
+        ) for index in range(7)]
+        details = {"living": [
+            ResolvedDetail(
+                source_photo_id=501,
+                subject_key="fireplace",
+                subject_label="Fireplace",
+                subject_box=(300, 200, 900, 700),
+                detector_score=0.9,
+                crop=DetailCrop(100, 200, 900, 506, 0.9),
+                source_size=(2048, 1365),
+            ),
+            ResolvedDetail(
+                source_photo_id=502,
+                subject_key="wall_art",
+                subject_label="Wall art",
+                subject_box=(300, 200, 900, 700),
+                detector_score=0.8,
+                crop=DetailCrop(100, 200, 900, 506, 0.8),
+                source_size=(2048, 1365),
+            ),
+        ]}
+
+        scheduled = schedule_resolved_close_ups(wides, details)
+        close_ups = [shot for shot in scheduled if shot.is_close_up]
+        self.assertEqual([shot.detail_subject for shot in close_ups], ["Fireplace", "Wall art"])
 
     def test_shots_stay_contiguous_after_insertion(self):
         for a, b in zip(self.shots, self.shots[1:]):

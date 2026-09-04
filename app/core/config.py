@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     OPENCLIP_MODEL: str = "ViT-B-32"
     OPENCLIP_PRETRAINED: str = "openai"
     OPENCLIP_BATCH_SIZE: int = 16
+    # Object boxes for cinematic close-ups. This model is loaded only by the
+    # review/detail path, not by the VGGT scene-graph worker.
+    DETAIL_DETECTOR_MODEL: str = "IDEA-Research/grounding-dino-tiny"
+    DETAIL_DETECTOR_MIN_SCORE: float = 0.35
+    DETAIL_DETECTOR_BATCH_SIZE: int = 4
 
     # Logging
     LOG_LEVEL: str = "INFO"

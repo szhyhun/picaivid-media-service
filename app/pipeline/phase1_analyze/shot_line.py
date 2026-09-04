@@ -28,16 +28,16 @@ about 1.5s, but the owner's instruction is explicit and repeated, and
 `allow_service=True` remains for the studio-apartment case where excluding them
 would leave nothing to cut.
 
-Close-ups are manufactured from selected wide frames after this line is built.
-They remain tied to the room and frame immediately before them, so the detail
-reads as a continuation rather than an unrelated image.
+Close-ups are discovered from named objects across every photo in a selected
+room after this line is built. They remain tied to the room immediately before
+them, so the detail reads as a continuation rather than an unrelated image.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
 from app.pipeline.phase1_analyze.camera_move import CameraMove, choose_move
-from app.pipeline.phase1_analyze.detail_crop import ResolvedDetail, close_up_rate
+from app.pipeline.phase1_analyze.detail_crop import ResolvedDetail, is_detail_eligible
 from app.pipeline.phase1_analyze.editorial import (
     MIN_SHOTS,
     Tier,
@@ -260,6 +260,9 @@ class Shot:
     crop_box: tuple[int, int, int, int] | None = None
     crop_score: float | None = None
     source_size: tuple[int, int] | None = None
+    detail_subject: str | None = None
+    detector_score: float | None = None
+    subject_box: tuple[int, int, int, int] | None = None
 
     @property
     def uses_keyframes(self) -> bool:
@@ -575,101 +578,78 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         ))
         cursor += per_shot
 
-    if include_close_ups:
-        shots = _insert_close_ups(shots, per_shot)
+    # Object-aware details need source images and are resolved by the API after
+    # the wide line is built. A planner-only invocation never makes a generic
+    # crop just to fill this optional flag.
     return ShotLine(shots=shots, bpm=bpm, hero_room_id=hero_id, dropped_rooms=dropped)
-
-
-def _unit_for(seed: str) -> float:
-    """Deterministic value in [0,1) so a listing always produces the same film."""
-    import hashlib
-
-    digest = hashlib.sha256(seed.encode()).digest()
-    return int.from_bytes(digest[:4], "big") / 2**32
 
 
 def schedule_resolved_close_ups(
     shots: list[Shot],
-    resolved: dict[int, ResolvedDetail],
+    resolved: dict[str, list[ResolvedDetail]],
 ) -> list[Shot]:
-    """Insert only crop-validated close-ups into a selected wide line."""
-    if not shots:
-        return []
-    return _insert_close_ups(shots, shots[0].duration_seconds, resolved)
+    """Insert detected, complete object details into their room's wide run."""
+    return _insert_close_ups(shots, resolved)
 
 
 def _insert_close_ups(
     shots: list[Shot],
-    per_shot: float,
-    resolved: dict[int, ResolvedDetail] | None = None,
+    resolved: dict[str, list[ResolvedDetail]],
 ) -> list[Shot]:
-    """Add crop-validated close-ups on an approximate four-shot cadence.
-
-    The close-up is a crop of the frame immediately before it, which is what
-    makes the pair read as one continuous look rather than two pictures. In the
-    API path `resolved` contains crop-validated candidates and every emitted
-    detail therefore has a concrete crop box. The no-argument path is retained
-    only for inexpensive planner-only tests and CLI previews.
-
-    The opening approach and the closing run stay wide: the reference films thin
-    their close-ups out at both ends.
-    """
+    """Add complete object details on the measured approximate four-shot cadence."""
     if len(shots) < 4:
         return shots
 
     head = 2                      # leave the approach alone
-    tail = max(1, len(shots) // 8)  # and the close
+    # Only the literal final bookend is protected. A late patio/outdoor payoff
+    # may contain the listing's best detected object and must remain available
+    # for a detail before the final exterior or aerial frame.
+    tail = 1
 
     # A quarter of the finished cut means C / (W + C) = 0.25, or C = W / 3.
-    # This is a ceiling, never a quota that forces generic material on screen.
-    # The API passes `resolved` after testing every selected wide shot. The
-    # no-argument path supports dry-run scripts and unit tests only.
+    # This is a ceiling, never a quota that forces a weak object on screen.
     eligible = [
         (idx, shot)
         for idx, shot in enumerate(shots)
         if head <= idx < len(shots) - tail
-        and close_up_rate(shot.room_type) > 0
-        and (resolved is None or shot.index in resolved)
+        and is_detail_eligible(shot.room_type)
+        and resolved.get(shot.room_id)
     ]
     wanted = min(round(len(shots) * CLOSE_UP_SHARE / (1.0 - CLOSE_UP_SHARE)),
                  len(eligible))
     if wanted == 0:
         return shots
 
-    # Work in four-wide-shot windows. This produces the intended rhythm without
-    # allowing a high-scoring patio or kitchen to create a burst of consecutive
-    # details. One detail per room is enough for a first cut; the full room wide
-    # shots already carry the coverage.
-    chosen: dict[int, ResolvedDetail | None] = {}
-    used_rooms: set[str] = set()
-    last_index = -4
-    body_end = len(shots) - tail
-    for window_start in range(head, body_end, 4):
+    # At least one wide separates details. A room can earn two distinct objects
+    # when the story has enough space, but no object is repeated and the 25%
+    # ceiling still controls the full film.
+    chosen: dict[int, ResolvedDetail] = {}
+    used_subjects: set[tuple[str, str]] = set()
+    room_counts: dict[str, int] = {}
+    last_index = -2
+    for index, shot in eligible:
+        if len(chosen) >= wanted or index - last_index < 2:
+            continue
+        if room_counts.get(shot.room_id, 0) >= 2:
+            continue
         options = [
-            (idx, shot)
-            for idx, shot in eligible
-            if window_start <= idx < min(window_start + 4, body_end)
-            and idx - last_index >= 4
-            and shot.room_id not in used_rooms
+            detail for detail in resolved.get(shot.room_id, [])
+            if (shot.room_id, detail.subject_key) not in used_subjects
         ]
         if not options:
             continue
-        # A validated crop's score decides the visual choice. Dry runs do not
-        # have that score, so use deterministic room-type weighting instead.
-        index, shot = max(
+        detail = max(
             options,
             key=lambda candidate: (
-                resolved[candidate[1].index].crop.score
-                if resolved is not None else close_up_rate(candidate[1].room_type),
-                close_up_rate(candidate[1].room_type),
-                _unit_for(f"{candidate[1].room_id}:{candidate[0]}:closeup"),
+                candidate.crop.score,
+                candidate.detector_score,
+                -candidate.source_photo_id,
             ),
         )
-        chosen[index] = resolved[shot.index] if resolved is not None else None
-        used_rooms.add(shot.room_id)
+        chosen[index] = detail
+        used_subjects.add((shot.room_id, detail.subject_key))
+        room_counts[shot.room_id] = room_counts.get(shot.room_id, 0) + 1
         last_index = index
-        if len(chosen) >= wanted:
-            break
 
     out: list[Shot] = []
     for i, shot in enumerate(shots):
@@ -683,17 +663,21 @@ def _insert_close_ups(
             index=-1,
             room_id=shot.room_id,
             room_type=shot.room_type,
-            photo_ids=[shot.photo_ids[0]],
+            photo_ids=[detail.source_photo_id],
             kind="single_image",
             act=shot.act,
             start_seconds=0.0,
-            duration_seconds=per_shot,
+            duration_seconds=shot.duration_seconds,
+            generation_duration_seconds=shot.generation_duration_seconds,
             move=choose_move(f"{shot.room_id}:closeup:{i}"),
             is_hero=shot.is_hero,
             is_close_up=True,
-            crop_box=detail.crop.box if detail else None,
-            crop_score=detail.crop.score if detail else None,
-            source_size=detail.source_size if detail else None,
+            crop_box=detail.crop.box,
+            crop_score=detail.crop.score,
+            source_size=detail.source_size,
+            detail_subject=detail.subject_label,
+            detector_score=detail.detector_score,
+            subject_box=detail.subject_box,
         ))
 
     cursor = 0.0

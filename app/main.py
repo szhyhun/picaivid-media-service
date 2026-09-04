@@ -509,7 +509,7 @@ async def get_project_shot_line(
         schedule_resolved_close_ups,
     )
     from app.pipeline.phase1_analyze.detail_crop import (
-        close_up_rate,
+        is_detail_eligible,
         resolve_detail_candidates,
     )
 
@@ -519,25 +519,34 @@ async def get_project_shot_line(
         return {"project_id": project_id, "shots": [], "rooms": 0,
                 "source": "no analysis yet"}
 
-    # Build the actual selected wides first. Details are optional: crop-validate
-    # every eligible source before choosing the four-shot positions. The former
-    # order chose positions first, then removed failed crops, which created
-    # uneven detail rhythm and occasionally retained the least-bad generic crop.
+    # Build the actual selected wides first. Details are optional and object
+    # specific: Grounding DINO inspects every source photo in each selected room
+    # before scheduling any detail into that room's story run.
     line = build_shot_line(
         rooms, target_seconds=seconds, bpm=bpm, include_close_ups=False)
     if line.shots:
-        candidate_photo_ids = [
-            s.photo_ids[0]
-            for s in line.shots
-            if close_up_rate(s.room_type) > 0
-        ]
+        room_photo_ids = {
+            room.room_id: room.photo_ids
+            for room in rooms
+            if is_detail_eligible(room.room_type)
+        }
+        selected_room_ids = {shot.room_id for shot in line.shots}
+        candidate_photo_ids = {
+            photo_id
+            for room_id, photo_ids in room_photo_ids.items()
+            if room_id in selected_room_ids
+            for photo_id in photo_ids
+        }
         uri_rows = db.query(JobPhoto).filter(
             JobPhoto.id.in_(candidate_photo_ids)
         ).all()
         if uri_rows:
             try:
                 resolved = resolve_detail_candidates(
-                    line.shots, {int(p.id): p.s3_uri for p in uri_rows})
+                    line.shots,
+                    room_photo_ids,
+                    {int(p.id): p.s3_uri for p in uri_rows},
+                )
                 line.shots = schedule_resolved_close_ups(line.shots, resolved)
             except Exception:
                 # The planning view is still useful without optional detail
@@ -587,6 +596,9 @@ async def get_project_shot_line(
             "crop_box": list(s.crop_box) if s.crop_box else None,
             "crop_score": round(s.crop_score, 4) if s.crop_score is not None else None,
             "source_size": list(s.source_size) if s.source_size else None,
+            "detail_subject": s.detail_subject,
+            "detector_score": round(s.detector_score, 4) if s.detector_score is not None else None,
+            "subject_box": list(s.subject_box) if s.subject_box else None,
             # Fractions per second, so the UI can draw the motion rather than
             # only name it.
             "move": s.move.label,

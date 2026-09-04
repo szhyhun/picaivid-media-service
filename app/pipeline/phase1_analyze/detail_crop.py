@@ -1,117 +1,104 @@
-"""Manufacture detail shots by cropping into room photographs.
+"""Grounded selection of cinematic property details.
 
-A detail must belong to the room it follows. The reference films cut from a wide
-living room to a close-up of *that* living room's fireplace -- the close-up is
-the same space seen tighter, which is what makes the pair read as one continuous
-look rather than two unrelated pictures. So a detail is always sourced from a
-photograph of the room whose beat it accompanies, ideally the very frame that
-preceded it.
-
-That also bounds the work. Scoring twenty candidate windows per photograph
-across a whole listing is ~5,900 CLIP image encodes, nearly all of them spent on
-photographs that never reach the film. Only shots already selected into the shot
-line, and their room-mates, are worth searching.
-
-The reference films open on a garden detail and punctuate rooms with close-ups
-of flowers and fixtures. Real-estate shoots do not contain such photographs:
-scored across all six labelled listings, **2 of 295 photos (0.7%)** read as a
-detail rather than a room. Detail shots therefore have to be made, not found.
-
-A crop is scored by how much more it looks like an appealing close-up than like
-a blank wall or an out-of-focus area, using the same CLIP embedding the pipeline
-already computes. The best window in a frame consistently beats that frame's
-average, and visual inspection of the winners returns flowering shrubs,
-hydrangeas beside a front door, and foliage -- the exact subjects the reference
-films use.
-
-Resolution: source photographs are typically 2048x1365 and output is 1080p.
-A 35% crop is roughly 716px wide: tight enough to read as a different visual
-beat, while retaining meaningful visual context for a later video model. The
-renderer must validate that conditioning resolution when it is selected; this
-planner does not assume an untested model-specific lower limit.
+VGGT decides which photographs belong to the same room and how the story moves
+through the property. This module answers a separate question: which actual
+object inside that room deserves a close-up. It deliberately does not ask a
+generic image-text model to guess whether a grid crop "looks detailed".
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
+import logging
+from typing import Mapping, Sequence
 
-import numpy as np
+from app.core.config import settings
 
-# What a good detail shot looks like, and what it must not look like. The
-# difference of the two is the score, so a crop has to be positively appealing
-# rather than merely not-blank.
-DETAIL_PROMPTS = (
-    "a beautiful close-up detail of a decorative object",
-    "a close-up of flowers or a plant",
-    "an appealing close-up of a design feature or texture",
-    "a close-up of a fireplace, faucet, tap or light fixture",
-)
-NON_DETAIL_PROMPTS = (
-    "a blank empty wall",
-    "an out of focus blurry area",
-    "a plain ceiling",
-    "a plain floor",
-    "an ordinary wide room photograph",
-    "an exposed mechanical fixture, pipe or hardware",
-    "an exterior awning, roof or canopy mechanism",
-    "an unstyled utility area",
-)
+logger = logging.getLogger(__name__)
 
-# Fraction of the source width one crop spans. See the resolution note above.
-CROP_WIDTH_FRACTION = 0.35
 OUTPUT_ASPECT = 16 / 9
+MIN_SUBJECT_COVERAGE = 0.12
+MIN_CROP_WIDTH_FRACTION = 0.18
+# Generated video needs a little surrounding context, but the subject remains
+# the composition. Ten percent padding left the fireplace test dominated by a
+# blank wall; three percent retains the full object without diluting the shot.
+SUBJECT_PADDING = 0.03
+EDGE_MARGIN_FRACTION = 0.015
 
-# Where to look. A coarse grid is enough -- detail subjects are large relative to
-# the crop, and a finer search mostly returns near-duplicates of the same window.
-_X_POSITIONS = (0.12, 0.32, 0.52, 0.72, 0.88)
-_Y_POSITIONS = (0.15, 0.35, 0.55, 0.75)
 
-# A frame with nothing worth cropping into should yield no detail at all rather
-# than the least-bad blank wall. Calibrated against the six labelled listings:
-# exteriors with planting score +0.01..+0.04, plain interiors score negative.
-MIN_DETAIL_SCORE = 0.005
+@dataclass(frozen=True)
+class DetailSubject:
+    """An allowed object class and the phrases Grounding DINO may detect."""
 
-# A room type is a conservative eligibility gate, not proof that a close-up is
-# worthwhile. The reference films include bathrooms and bedrooms, but this
-# product cannot yet identify a genuinely premium bathroom fixture or bedroom
-# object reliably. A generic crop there is usually a wall, bedspread, shower
-# panel, or towel. Keep them out until a grounded object scorer earns an
-# exception. The rate only breaks ties between *validated* candidates.
-CLOSE_UP_RATE_BY_ROOM: dict[str, float] = {
-    "entrance": 0.20,
-    "kitchen": 0.40,
-    "living room": 0.25,
-    "dining room": 0.20,
-    "patio": 0.35,
-    "pool": 0.35,
-    "backyard": 0.35,
-    "exterior back": 0.30,
-    "amenities": 0.25,
-    # Not eligible without a future object-specific exception.
-    "bedroom": 0.0,
-    "bathroom": 0.0,
-    "hallway": 0.0,
-    "shared space": 0.0,
-    "office": 0.0,
-    "garage": 0.0,
-    "storage": 0.0,
-    "laundry room": 0.0,
-    "aerial view": 0.0,
-    "exterior front": 0.0,
-    "front yard": 0.0,
-    "building exterior": 0.0,
+    key: str
+    label: str
+    prompts: tuple[str, ...]
+    priority: float = 1.0
+
+
+# This is the product's editable detail catalogue. Room type is only scope for
+# valid objects; it never makes a photo or crop desirable by itself. Additions
+# from editorial review belong here with a real subject label and prompt.
+DETAIL_SUBJECTS_BY_ROOM: dict[str, tuple[DetailSubject, ...]] = {
+    "entrance": (
+        DetailSubject("entry_art", "Wall art", ("wall art",), 0.75),
+        DetailSubject("entry_light", "Light fixture", ("light fixture",), 0.80),
+    ),
+    "kitchen": (
+        DetailSubject("cooking", "Stove or oven", ("stove", "oven", "cooktop"), 1.00),
+        DetailSubject("faucet", "Kitchen faucet", ("faucet",), 0.85),
+        DetailSubject("range_hood", "Range hood", ("range hood",), 0.75),
+        DetailSubject("microwave", "Microwave", ("microwave",), 0.60),
+    ),
+    "living room": (
+        DetailSubject("fireplace", "Fireplace", ("fireplace", "mantle"), 1.00),
+        DetailSubject("living_art", "Wall art", ("wall art",), 0.70),
+        DetailSubject("living_light", "Light fixture", ("light fixture",), 0.80),
+    ),
+    "dining room": (
+        DetailSubject("dining_light", "Light fixture", ("chandelier", "light fixture"), 0.90),
+        DetailSubject("dining_art", "Wall art", ("wall art",), 0.70),
+    ),
+    "patio": (
+        DetailSubject("grill", "Barbecue grill", ("barbecue grill",), 1.00),
+        DetailSubject("fire_pit", "Fire pit", ("fire pit",), 0.90),
+        DetailSubject("pool", "Pool", ("pool",), 0.85),
+    ),
+    "pool": (
+        DetailSubject("pool", "Pool", ("pool",), 1.00),
+        DetailSubject("fire_pit", "Fire pit", ("fire pit",), 0.90),
+    ),
+    "backyard": (
+        DetailSubject("fire_pit", "Fire pit", ("fire pit",), 0.90),
+        DetailSubject("pool", "Pool", ("pool",), 0.90),
+        DetailSubject("grill", "Barbecue grill", ("barbecue grill",), 0.85),
+    ),
+    "exterior back": (
+        DetailSubject("grill", "Barbecue grill", ("barbecue grill",), 0.95),
+        DetailSubject("pool", "Pool", ("pool",), 0.90),
+        DetailSubject("fire_pit", "Fire pit", ("fire pit",), 0.90),
+    ),
+    "amenities": (
+        DetailSubject("fireplace", "Fireplace", ("fireplace", "mantle"), 1.00),
+        DetailSubject("pool", "Pool", ("pool",), 0.90),
+        DetailSubject("light", "Light fixture", ("light fixture",), 0.75),
+    ),
 }
-DEFAULT_CLOSE_UP_RATE = 0.0
 
 
-def close_up_rate(room_type: str | None) -> float:
-    """How often this kind of room earns a close-up, from the reference films."""
-    return CLOSE_UP_RATE_BY_ROOM.get(
-        (room_type or "").strip().lower(), DEFAULT_CLOSE_UP_RATE)
+def detail_subjects(room_type: str | None) -> tuple[DetailSubject, ...]:
+    """Return the whitelist of subjects that can earn a detail in this room."""
+    return DETAIL_SUBJECTS_BY_ROOM.get((room_type or "").strip().lower(), ())
+
+
+def is_detail_eligible(room_type: str | None) -> bool:
+    """A room is eligible only when it has named, worthwhile object classes."""
+    return bool(detail_subjects(room_type))
 
 
 @dataclass(frozen=True)
 class DetailCrop:
-    """A crop box in source-pixel coordinates, with the score that chose it."""
+    """A 16:9 crop around a verified subject, in source-image pixels."""
 
     x: int
     y: int
@@ -121,155 +108,288 @@ class DetailCrop:
 
     @property
     def box(self) -> tuple[int, int, int, int]:
-        """(left, upper, right, lower), ready for PIL's crop()."""
         return (self.x, self.y, self.x + self.width, self.y + self.height)
 
 
 @dataclass(frozen=True)
 class ResolvedDetail:
-    """A crop that passed visual scoring for one selected wide shot."""
+    """One complete, detected object ready to insert after its room wide."""
 
+    source_photo_id: int
+    subject_key: str
+    subject_label: str
+    subject_box: tuple[int, int, int, int]
+    detector_score: float
     crop: DetailCrop
     source_size: tuple[int, int]
 
 
-def candidate_boxes(width: int, height: int) -> list[tuple[int, int, int, int]]:
-    """Grid of candidate crop windows for a frame of this size."""
-    crop_w = int(width * CROP_WIDTH_FRACTION)
-    crop_h = int(crop_w / OUTPUT_ASPECT)
-    if crop_h > height:
-        crop_h = height
-        crop_w = int(crop_h * OUTPUT_ASPECT)
-    boxes = []
-    for fy in _Y_POSITIONS:
-        for fx in _X_POSITIONS:
-            x = max(0, min(width - crop_w, int((width - crop_w) * fx)))
-            y = max(0, min(height - crop_h, int((height - crop_h) * fy)))
-            boxes.append((x, y, crop_w, crop_h))
-    return boxes
+@dataclass(frozen=True)
+class _Detection:
+    subject: DetailSubject
+    score: float
+    box: tuple[float, float, float, float]
 
 
-def score_crops(
-    crop_embeddings: np.ndarray,
-    detail_centroid: np.ndarray,
-    non_detail_centroid: np.ndarray,
-) -> np.ndarray:
-    """How much more each crop reads as an appealing detail than as a blank area.
-
-    Embeddings are assumed L2-normalised, as the pipeline stores them.
-    """
-    return crop_embeddings @ detail_centroid - crop_embeddings @ non_detail_centroid
+def _subject_for_label(label: str, subjects: Sequence[DetailSubject]) -> DetailSubject | None:
+    normalized = label.strip().lower()
+    for subject in subjects:
+        for prompt in subject.prompts:
+            if prompt in normalized or normalized in prompt:
+                return subject
+    return None
 
 
-def best_crop(
-    boxes: list[tuple[int, int, int, int]],
-    scores: np.ndarray,
+def _box_is_complete(box: Sequence[float], source_size: tuple[int, int]) -> bool:
+    """Reject a detector box that touches an image boundary and is likely cut off."""
+    left, top, right, bottom = box
+    width, height = source_size
+    margin_x = width * EDGE_MARGIN_FRACTION
+    margin_y = height * EDGE_MARGIN_FRACTION
+    return (
+        left >= margin_x
+        and top >= margin_y
+        and right <= width - margin_x
+        and bottom <= height - margin_y
+    )
+
+
+def crop_for_subject(
+    box: Sequence[float],
+    source_size: tuple[int, int],
     *,
-    min_score: float = MIN_DETAIL_SCORE,
+    score: float,
 ) -> DetailCrop | None:
-    """Pick the strongest crop, or nothing if the frame has no detail worth using.
-
-    Returning None matters: a film should skip a detail beat rather than cut to
-    a close-up of a blank wall.
-    """
-    if not boxes or scores.size == 0:
+    """Build a centered 16:9 crop that keeps a complete subject meaningfully large."""
+    if not _box_is_complete(box, source_size):
         return None
-    index = int(np.argmax(scores))
-    if float(scores[index]) < min_score:
+
+    left, top, right, bottom = box
+    source_width, source_height = source_size
+    subject_width = right - left
+    subject_height = bottom - top
+    if subject_width <= 0 or subject_height <= 0:
         return None
-    x, y, w, h = boxes[index]
-    return DetailCrop(x=x, y=y, width=w, height=h, score=float(scores[index]))
+
+    padded_width = subject_width * (1 + 2 * SUBJECT_PADDING)
+    padded_height = subject_height * (1 + 2 * SUBJECT_PADDING)
+    crop_width = max(padded_width, padded_height * OUTPUT_ASPECT)
+    crop_height = crop_width / OUTPUT_ASPECT
+    if crop_width > source_width:
+        crop_width = float(source_width)
+        crop_height = crop_width / OUTPUT_ASPECT
+    if crop_height > source_height:
+        crop_height = float(source_height)
+        crop_width = crop_height * OUTPUT_ASPECT
+    if crop_width < subject_width or crop_height < subject_height:
+        return None
+    if crop_width < source_width * MIN_CROP_WIDTH_FRACTION:
+        # A tiny detected box can be technically complete yet still produce a
+        # postage-stamp crop of a false positive. Premium detail shots need
+        # enough visual context to be a usable generated-video keyframe.
+        return None
+
+    center_x = (left + right) / 2
+    center_y = (top + bottom) / 2
+    crop_left = max(0.0, min(source_width - crop_width, center_x - crop_width / 2))
+    crop_top = max(0.0, min(source_height - crop_height, center_y - crop_height / 2))
+    crop_area = crop_width * crop_height
+    coverage = (subject_width * subject_height) / crop_area if crop_area else 0.0
+    if coverage < MIN_SUBJECT_COVERAGE:
+        return None
+
+    return DetailCrop(
+        x=round(crop_left),
+        y=round(crop_top),
+        width=round(crop_width),
+        height=round(crop_height),
+        score=float(score),
+    )
 
 
-def find_detail(image, model, preprocess, detail_centroid, non_detail_centroid,
-                *, min_score: float = MIN_DETAIL_SCORE) -> DetailCrop | None:
-    """Locate the best detail crop in a PIL image, if it has one.
+class _GroundingDinoDetector:
+    """Lazy, one-copy Grounding DINO runtime for object-box detection."""
 
-    Kept separate from the scoring maths above so the decision logic stays
-    testable without a model or an image.
+    def __init__(self) -> None:
+        self._model = None
+        self._processor = None
+        self._device = None
+
+    def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
+
+        import torch
+        from huggingface_hub import snapshot_download
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        from transformers.utils import logging as transformers_logging
+
+        try:
+            snapshot = snapshot_download(
+                settings.DETAIL_DETECTOR_MODEL,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Grounding DINO is not cached. Run `hf download "
+                f"{settings.DETAIL_DETECTOR_MODEL}` while preparing this worker."
+            ) from exc
+
+        if torch.cuda.is_available():
+            self._device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self._device = torch.device("mps")
+        else:
+            self._device = torch.device("cpu")
+
+        transformers_logging.disable_progress_bar()
+        self._processor = AutoProcessor.from_pretrained(snapshot, local_files_only=True)
+        self._model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            snapshot, local_files_only=True,
+        ).to(self._device).eval()
+        logger.info("Loaded %s detail detector on %s", settings.DETAIL_DETECTOR_MODEL, self._device)
+
+    def detect(
+        self,
+        images,
+        subjects: Sequence[DetailSubject],
+    ) -> list[list[_Detection]]:
+        """Return prompt-matched detections for an image batch."""
+        import torch
+
+        self._ensure_loaded()
+        prompts = tuple(dict.fromkeys(
+            prompt for subject in subjects for prompt in subject.prompts
+        ))
+        text = ". ".join(prompts) + "."
+        inputs = self._processor(
+            images=images,
+            text=[text] * len(images),
+            padding=True,
+            return_tensors="pt",
+        ).to(self._device)
+        with torch.inference_mode():
+            outputs = self._model(**inputs)
+        raw_results = self._processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=settings.DETAIL_DETECTOR_MIN_SCORE,
+            text_threshold=settings.DETAIL_DETECTOR_MIN_SCORE,
+            target_sizes=[(image.height, image.width) for image in images],
+        )
+
+        detections: list[list[_Detection]] = []
+        for result in raw_results:
+            image_detections = []
+            for score, label, box in zip(
+                result["scores"], result["text_labels"], result["boxes"],
+            ):
+                subject = _subject_for_label(str(label), subjects)
+                if subject is not None:
+                    image_detections.append(_Detection(
+                        subject=subject,
+                        score=float(score),
+                        box=tuple(float(value) for value in box.tolist()),
+                    ))
+            detections.append(image_detections)
+        return detections
+
+
+detail_detector = _GroundingDinoDetector()
+
+
+def resolve_detail_candidates(
+    shots,
+    room_photo_ids: Mapping[str, Sequence[int]],
+    photo_uri: Mapping[int, str],
+) -> dict[str, list[ResolvedDetail]]:
+    """Detect the best allowed subjects across every photo in each selected room.
+
+    A detail's source does not have to be one of the story shot's keyframes.
+    That separation prevents a wide with bar stools from displacing another
+    kitchen image that contains the actual stove.
     """
-    import torch
-
-    boxes = candidate_boxes(*image.size)
-    crops = [image.crop((x, y, x + w, y + h)) for x, y, w, h in boxes]
-    try:
-        batch = torch.stack([preprocess(c) for c in crops])
-    finally:
-        for crop in crops:
-            crop.close()
-    device = getattr(model, "device", None) or next(model.parameters()).device
-    with torch.no_grad():
-        features = model.encode_image(batch.to(device))
-        features = features / features.norm(dim=-1, keepdim=True)
-    scores = score_crops(features.cpu().numpy(), detail_centroid, non_detail_centroid)
-    return best_crop(boxes, scores, min_score=min_score)
-
-
-def resolve_detail_candidates(shots, photo_uri, *, min_score: float = MIN_DETAIL_SCORE):
-    """Score every eligible wide shot before any close-up is scheduled.
-
-    `shots` must be the selected wide line, not every uploaded photo. The return
-    value maps a wide shot index to the validated crop that can follow it. This
-    order matters: selecting positions first and testing crops afterwards left
-    holes in the edit whenever a chosen source had no real detail.
-    """
-    import torch
-
-    from app.models.openclip import openclip_model
     from app.services.storage.s3_client import s3_client
 
-    candidates = [s for s in shots
-                  if not getattr(s, "is_close_up", False)
-                  and close_up_rate(getattr(s, "room_type", "")) > 0]
-    if not candidates:
-        return {}
+    selected_rooms: dict[str, str] = {}
+    for shot in shots:
+        if not getattr(shot, "is_close_up", False):
+            selected_rooms.setdefault(shot.room_id, shot.room_type)
 
-    openclip_model._ensure_loaded()
-    model = openclip_model._model
-    preprocess = openclip_model._preprocess
-    tokenizer = openclip_model._tokenizer
-    # The singleton keeps the model on MPS where available, so inputs have to be
-    # moved to match or torch raises "Placeholder storage has not been allocated".
-    device = openclip_model._device
-
-    def centroid(prompts):
-        with torch.no_grad():
-            e = model.encode_text(tokenizer(list(prompts)).to(device))
-            e = e / e.norm(dim=-1, keepdim=True)
-            f = e.mean(0, keepdim=True)
-            return (f / f.norm(dim=-1, keepdim=True)).cpu().numpy()[0]
-
-    detail_c = centroid(DETAIL_PROMPTS)
-    plain_c = centroid(NON_DETAIL_PROMPTS)
-
-    # Retain crop decisions, never decoded full-resolution images. A 50-photo
-    # listing can otherwise leave hundreds of MB of PIL buffers live while the
-    # review request is running.
-    cache: dict[int, ResolvedDetail | None] = {}
-    resolved: dict[int, ResolvedDetail] = {}
-    for shot in candidates:
-        photo_id = shot.photo_ids[0]
-        if photo_id not in cache:
-            uri = photo_uri.get(photo_id)
+    candidates: dict[str, list[ResolvedDetail]] = defaultdict(list)
+    batch_size = max(1, settings.DETAIL_DETECTOR_BATCH_SIZE)
+    for room_id, room_type in selected_rooms.items():
+        subjects = detail_subjects(room_type)
+        if not subjects:
+            continue
+        photo_ids = list(dict.fromkeys(room_photo_ids.get(room_id, ())))
+        for start in range(0, len(photo_ids), batch_size):
+            batch_ids = photo_ids[start:start + batch_size]
+            decoded: list[tuple[int, object]] = []
             try:
-                image = s3_client.download_image(uri) if uri else None
-                if image is None:
-                    cache[photo_id] = None
-                else:
+                for photo_id in batch_ids:
+                    uri = photo_uri.get(photo_id)
+                    if uri is None:
+                        continue
                     try:
-                        crop = find_detail(
-                            image, model, preprocess, detail_c, plain_c,
-                            min_score=min_score,
+                        image = s3_client.download_image(uri)
+                    except Exception:
+                        logger.warning("Could not download detail candidate %s", photo_id, exc_info=True)
+                        continue
+                    if image is not None:
+                        decoded.append((photo_id, image))
+                if not decoded:
+                    continue
+                detected = detail_detector.detect(
+                    [image for _, image in decoded], subjects,
+                )
+                for (photo_id, image), detections in zip(decoded, detected):
+                    for detection in detections:
+                        ranking_score = detection.score * detection.subject.priority
+                        crop = crop_for_subject(
+                            detection.box,
+                            image.size,
+                            score=ranking_score,
                         )
-                        cache[photo_id] = (
-                            ResolvedDetail(crop=crop, source_size=image.size)
-                            if crop is not None else None
-                        )
-                    finally:
-                        image.close()
-            except Exception:
-                cache[photo_id] = None
-        detail = cache[photo_id]
-        if detail is not None:
-            resolved[int(shot.index)] = detail
+                        if crop is None:
+                            continue
+                        candidates[room_id].append(ResolvedDetail(
+                            source_photo_id=photo_id,
+                            subject_key=detection.subject.key,
+                            subject_label=detection.subject.label,
+                            subject_box=tuple(round(value) for value in detection.box),
+                            detector_score=detection.score,
+                            crop=crop,
+                            source_size=image.size,
+                        ))
+            finally:
+                for _, image in decoded:
+                    image.close()
+
+    # One strongest, complete source per object type. "Stove" and "oven" are
+    # intentionally one `cooking` subject, so overlapping boxes cannot create
+    # duplicate shots of the same appliance.
+    resolved: dict[str, list[ResolvedDetail]] = {}
+    for room_id, room_candidates in candidates.items():
+        best_by_subject: dict[str, ResolvedDetail] = {}
+        for candidate in room_candidates:
+            current = best_by_subject.get(candidate.subject_key)
+            if current is None or (
+                candidate.crop.score,
+                candidate.detector_score,
+                -candidate.source_photo_id,
+            ) > (
+                current.crop.score,
+                current.detector_score,
+                -current.source_photo_id,
+            ):
+                best_by_subject[candidate.subject_key] = candidate
+        resolved[room_id] = sorted(
+            best_by_subject.values(),
+            key=lambda candidate: (
+                -candidate.crop.score,
+                -candidate.detector_score,
+                candidate.source_photo_id,
+            ),
+        )
     return resolved
