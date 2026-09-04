@@ -120,6 +120,7 @@ def cluster_photos_by_room(
         components=components,
         photo_map=photo_map,
     )
+    _mark_vggt_duplicates(photo_map, relations)
     clusters = _materialize_room_clusters(
         db=db,
         job=job,
@@ -130,6 +131,57 @@ def cluster_photos_by_room(
     )
     logger.info("Created %s room clusters from %s VGGT scene components", len(clusters), len(components))
     return clusters
+
+
+def _mark_vggt_duplicates(
+    photo_map: dict[int, JobPhoto],
+    relations: list[PhotoRelationResult],
+) -> None:
+    """Persist one canonical image for each VGGT near-zero-pose duplicate set.
+
+    The geometry rows and scene-map memberships stay intact for review. Downstream
+    render-group and shot-line loading exclude the duplicate image, which avoids
+    losing provenance while preventing the same view from reaching a film twice.
+    """
+    parents = {photo_id: photo_id for photo_id in photo_map}
+
+    def root(photo_id: int) -> int:
+        while parents[photo_id] != photo_id:
+            parents[photo_id] = parents[parents[photo_id]]
+            photo_id = parents[photo_id]
+        return photo_id
+
+    def canonical_key(photo_id: int) -> tuple[int, int]:
+        photo = photo_map[photo_id]
+        return (int(photo.position or 0), photo_id)
+
+    duplicate_edges = [
+        relation for relation in relations
+        if bool((relation.debug_metrics or {}).get("is_duplicate"))
+        and relation.photo_a_id in parents
+        and relation.photo_b_id in parents
+    ]
+    for relation in sorted(
+        duplicate_edges,
+        key=lambda item: (
+            -float((item.debug_metrics or {}).get("depth_ok_forward", 0.0)),
+            float((item.debug_metrics or {}).get("bl_over_depth", float("inf"))),
+            float((item.debug_metrics or {}).get("rotation_degrees", float("inf"))),
+            min(int(item.photo_a_id), int(item.photo_b_id)),
+        ),
+    ):
+        left, right = root(int(relation.photo_a_id)), root(int(relation.photo_b_id))
+        if left == right:
+            continue
+        keep, remove = sorted((left, right), key=canonical_key)
+        parents[remove] = keep
+
+    for photo_id, photo in photo_map.items():
+        canonical = root(photo_id)
+        if canonical == photo_id:
+            continue
+        photo.is_duplicate = True
+        photo.duplicate_of_photo_id = canonical
 
 
 def _replace_scene_state(
@@ -289,7 +341,11 @@ def _materialize_room_clusters(
     sequence_order = 0
     for component in components:
         scene_row = scene_row_by_key[component.component_key]
-        ordered_photos = [photo_map[int(photo_id)] for photo_id in component.ordered_photo_ids if int(photo_id) in photo_map]
+        ordered_photos = [
+            photo_map[int(photo_id)]
+            for photo_id in component.ordered_photo_ids
+            if int(photo_id) in photo_map and not photo_map[int(photo_id)].is_duplicate
+        ]
         component_room = _majority_room_label(ordered_photos) if ordered_photos else None
         for cluster_photos in _derive_render_groups(
             ordered_photos,
@@ -365,6 +421,7 @@ def _derive_render_groups(
         (pinned if role in {"opening", "hero", "closing"} else candidates).append(photo)
 
     evidence: list[dict] = []
+    has_v2_evidence = False
     # Historical jobs (and unit fixtures) carry no ids; those take the fallback path.
     photo_by_id = {int(photo.id): photo for photo in ordered_photos if getattr(photo, "id", None) is not None}
     if relation_by_pair and photo_by_id:
@@ -375,6 +432,10 @@ def _derive_render_groups(
             metrics = relation.debug_metrics or {}
             if "pair_score" not in metrics:
                 continue        # historical V1 relation; no pairing evidence
+            is_v2 = metrics.get("verification_source") == "vggt_pairwise_v2"
+            has_v2_evidence = has_v2_evidence or is_v2
+            if is_v2 and not metrics.get("is_transition"):
+                continue        # broad component membership never authorizes a renderer pair
             evidence.append({
                 "photo_a_id": left,
                 "photo_b_id": right,
@@ -387,14 +448,22 @@ def _derive_render_groups(
 
     if evidence:
         chosen, unpaired = pairing.select_for_room(evidence, room_type)
+        selected_ids: set[int] = set()
         for pair in chosen:
             left, right = photo_by_id.get(pair.photo_a), photo_by_id.get(pair.photo_b)
             if left is not None and right is not None:
                 groups.append([left, right])
-        for photo_id in unpaired:
+                selected_ids.update((pair.photo_a, pair.photo_b))
+        for photo_id in sorted(set(unpaired) | (set(candidate_ids) - selected_ids)):
             photo = photo_by_id.get(photo_id)
             if photo is not None:
                 groups.append([photo])
+        groups.extend([photo] for photo in pinned)
+    elif has_v2_evidence:
+        # The listing was analysed by V2, but it has no safe transition. A
+        # fabricated adjacent pair would create exactly the unsafe movement the
+        # transition gate rejected, so retain each image as an independent shot.
+        groups.extend([photo] for photo in candidates)
         groups.extend([photo] for photo in pinned)
     else:
         # No pair evidence (historical job or fixture): reproduce the previous

@@ -1,18 +1,12 @@
-"""Choose which shots of a room go in the film.
+"""Choose renderable two-keyframe shots using VGGT evidence.
 
-Membership answers "same room?"; this answers "which two views tell it best?".
-Those are opposite geometric preferences and must not share thresholds:
+Membership answers "is this part of the same broad scene?". A pair shot answers
+"can the renderer safely use these two images as endpoints?". Only the latter
+can create video motion, so a VGGT transition gate is a hard prerequisite.
 
-* a good two-shot wants a **wide** angle between views -- a narrow one is a
-  near-duplicate and adds nothing;
-* smooth interpolation wants a **narrow** angle.
-
-Calibrated against the owner's labeled `preferred_cinematic_pairs`. Measured on 48
-chosen pairs vs 223 same-room pairs they did not choose:
-
-    median depth_ok   0.44  vs 0.25
-    median conf_pair 11.24  vs 2.82
-    in 30-120 deg     81%   vs 51%
+The older `preferred_cinematic_pairs` labels selected complementary story views;
+they are not ground truth for interpolability. They can influence how safe pairs
+are ranked, but cannot make a non-overlapping or high-rotation pair renderable.
 
 Per-room caps come from the owner: living room 3 pairs, any other room 2,
 exterior+aerial 3-4 combined. Caps are ceilings, never quotas -- a room with one
@@ -24,9 +18,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-ANGLE_LOW, ANGLE_HIGH = 30.0, 120.0
-DUPLICATE_DEPTH_OK = 0.85
-DUPLICATE_BL_OVER_DEPTH = 0.10
+from app.pipeline.phase1_analyze.transitions import is_duplicate, is_transition_safe
+
+MOTION_SWEET_SPOT_DEG = 35.0
+MOTION_MAX_DEG = 60.0
 
 DEFAULT_CAPS = {"living": 3, "exterior": 4, "default": 2}
 
@@ -43,16 +38,13 @@ class ShotPair:
 
 
 def _angle_fit(rot_deg: float) -> float:
-    """1.0 inside the complementary band, tapering outside it.
-
-    Below ANGLE_LOW the two views are near-duplicates; far above ANGLE_HIGH they
-    share too little of the room to read as one space.
-    """
-    if ANGLE_LOW <= rot_deg <= ANGLE_HIGH:
-        return 1.0
-    if rot_deg < ANGLE_LOW:
-        return max(0.0, rot_deg / ANGLE_LOW)
-    return max(0.0, math.exp(-(rot_deg - ANGLE_HIGH) / 45.0))
+    """Reward visible but still smooth camera movement inside the safe band."""
+    if rot_deg < 0.0 or rot_deg > MOTION_MAX_DEG:
+        return 0.0
+    if rot_deg <= MOTION_SWEET_SPOT_DEG:
+        return rot_deg / MOTION_SWEET_SPOT_DEG
+    return max(0.0, 1.0 - (rot_deg - MOTION_SWEET_SPOT_DEG) /
+               (MOTION_MAX_DEG - MOTION_SWEET_SPOT_DEG))
 
 
 def _confidence_fit(conf_pair: float) -> float:
@@ -61,21 +53,14 @@ def _confidence_fit(conf_pair: float) -> float:
 
 
 def score_pair(evidence: dict) -> float:
-    """Editorial quality of a two-shot, 0..1. Higher is a better pair for the film."""
+    """Quality of a safe VGGT pair, 0..1. Unsafe pairs always score zero."""
+    if not is_transition_safe(evidence):
+        return 0.0
     depth_ok = evidence["depth_ok_min"]
-    if depth_ok >= DUPLICATE_DEPTH_OK and evidence["bl_over_depth"] <= DUPLICATE_BL_OVER_DEPTH:
-        return 0.0  # same view twice
     return (
-        0.45 * min(depth_ok / 0.45, 1.0)          # shared geometry, saturating at the chosen median
-        + 0.35 * _angle_fit(evidence["rot_deg"])  # complementary viewpoint
+        0.50 * min(depth_ok / 0.45, 1.0)
+        + 0.30 * _angle_fit(evidence["rot_deg"])
         + 0.20 * _confidence_fit(evidence["conf_pair"])
-    )
-
-
-def is_duplicate(evidence: dict) -> bool:
-    return (
-        evidence["depth_ok_min"] >= DUPLICATE_DEPTH_OK
-        and evidence["bl_over_depth"] <= DUPLICATE_BL_OVER_DEPTH
     )
 
 

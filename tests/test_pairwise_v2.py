@@ -400,18 +400,24 @@ class TransitionCandidateTests(unittest.TestCase):
 
 
 class PairingTests(unittest.TestCase):
-    """Editorial pairing: wide angles are wanted, near-duplicates are not."""
+    """Renderer pairs require conservative VGGT transition evidence."""
 
     def _ev(self, a, b, depth_ok, rot, conf, bl=1.0):
         return {"photo_a_id": a, "photo_b_id": b, "depth_ok_min": depth_ok,
                 "rot_deg": rot, "conf_pair": conf, "bl_over_depth": bl}
 
-    def test_prefers_complementary_angle_over_near_duplicate(self):
+    def test_prefers_smooth_visible_motion_over_tiny_non_duplicate_motion(self):
         from app.pipeline.phase1_analyze.pairing import score_pair
 
-        wide = self._ev(1, 2, 0.45, 85, 11.0)     # the owner's median profile
-        narrow = self._ev(1, 3, 0.45, 5, 11.0)    # nearly the same view twice
-        self.assertGreater(score_pair(wide), score_pair(narrow))
+        smooth = self._ev(1, 2, 0.45, 35, 11.0)
+        tiny = self._ev(1, 3, 0.45, 5, 11.0)
+        self.assertGreater(score_pair(smooth), score_pair(tiny))
+
+    def test_unsafe_geometry_cannot_become_a_renderer_pair(self):
+        from app.pipeline.phase1_analyze.pairing import score_pair
+
+        self.assertEqual(score_pair(self._ev(1, 2, 0.80, 85, 20.0)), 0.0)
+        self.assertEqual(score_pair(self._ev(1, 3, 0.20, 30, 20.0)), 0.0)
 
     def test_duplicate_scores_zero(self):
         from app.pipeline.phase1_analyze.pairing import is_duplicate, score_pair
@@ -420,10 +426,15 @@ class PairingTests(unittest.TestCase):
         self.assertTrue(is_duplicate(dup))
         self.assertEqual(score_pair(dup), 0.0)
 
+    def test_near_zero_vggt_pose_suppresses_a_non_exact_duplicate(self):
+        from app.pipeline.phase1_analyze.pairing import is_duplicate
+
+        self.assertTrue(is_duplicate(self._ev(1, 2, 0.824, 0.03, 12.0, bl=0.0004)))
+
     def test_respects_per_room_caps(self):
         from app.pipeline.phase1_analyze.pairing import select_for_room
 
-        evidence = [self._ev(i, i + 100, 0.45, 85, 11.0) for i in range(1, 6)]
+        evidence = [self._ev(i, i + 100, 0.45, 35, 11.0) for i in range(1, 6)]
         living, _ = select_for_room(evidence, "living-room")
         other, _ = select_for_room(evidence, "bedroom-a")
         self.assertEqual(len(living), 3)   # owner: living room gets 3
@@ -432,7 +443,7 @@ class PairingTests(unittest.TestCase):
     def test_a_photo_is_never_used_twice(self):
         from app.pipeline.phase1_analyze.pairing import select_for_room
 
-        evidence = [self._ev(1, 2, 0.50, 85, 12.0), self._ev(1, 3, 0.48, 80, 11.0)]
+        evidence = [self._ev(1, 2, 0.50, 35, 12.0), self._ev(1, 3, 0.48, 40, 11.0)]
         chosen, unpaired = select_for_room(evidence, "bedroom-a")
         used = [p for c in chosen for p in (c.photo_a, c.photo_b)]
         self.assertEqual(len(used), len(set(used)))
@@ -441,7 +452,7 @@ class PairingTests(unittest.TestCase):
     def test_caps_are_ceilings_not_quotas(self):
         from app.pipeline.phase1_analyze.pairing import select_for_room
 
-        chosen, unpaired = select_for_room([self._ev(1, 2, 0.45, 85, 11.0)], "living-room")
+        chosen, unpaired = select_for_room([self._ev(1, 2, 0.45, 35, 11.0)], "living-room")
         self.assertEqual(len(chosen), 1)   # cap is 3, but only one good pair exists
         self.assertEqual(unpaired, [])
 
@@ -518,11 +529,11 @@ class MotionAuthorizationTests(unittest.TestCase):
                 (expected[0][1], expected[1][1]),
             )
 
-    def test_transitions_module_is_marked_provisional(self):
+    def test_transitions_module_distinguishes_keyframe_authorization_from_renderer_quality(self):
         from app.pipeline.phase1_analyze import transitions
 
         doc = (transitions.__doc__ or "").lower()
         self.assertTrue(
-            "report-only" in doc or "provisional" in doc,
-            "transitions must not claim to authorize motion",
+            "not proof" in doc and "renderer" in doc,
+            "transition docs must not overclaim final interpolation quality",
         )

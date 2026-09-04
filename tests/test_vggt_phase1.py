@@ -11,7 +11,7 @@ from PIL import Image
 
 from app.models import vggt as vggt_runtime
 from app.pipeline.phase1_analyze import shot_planner, vggt_pipeline
-from app.pipeline.phase1_analyze.clustering import _derive_render_groups
+from app.pipeline.phase1_analyze.clustering import _derive_render_groups, _mark_vggt_duplicates
 from app.pipeline.phase1_analyze.motion_planner import _requested_motion
 from app.pipeline.phase1_analyze.pose_graph import solve_component_poses
 from app.pipeline.phase1_analyze.vggt_pipeline import (
@@ -148,6 +148,41 @@ class VGGTPhase1Tests(unittest.TestCase):
             [len(group) for group in _derive_render_groups(photos, "interior")],
             [2, 2, 1],
         )
+
+    def test_v2_rejected_transition_becomes_independent_single_shots(self) -> None:
+        photos = [
+            SimpleNamespace(id=1, room_override=None, room_label="laundry room", manual_metadata={}),
+            SimpleNamespace(id=2, room_override=None, room_label="laundry room", manual_metadata={}),
+        ]
+        relation = _relation(1, 2)
+        relation.debug_metrics = {
+            "verification_source": "vggt_pairwise_v2",
+            "pair_score": 0.8,
+            "is_transition": False,
+        }
+        self.assertEqual(
+            [len(group) for group in _derive_render_groups(
+                photos, "interior", {(1, 2): relation}, "laundry room",
+            )],
+            [1, 1],
+        )
+
+    def test_vggt_duplicate_marks_later_photo_and_keeps_earlier_canonical(self) -> None:
+        photos = {
+            10: SimpleNamespace(id=10, position=5, is_duplicate=False, duplicate_of_photo_id=None),
+            20: SimpleNamespace(id=20, position=6, is_duplicate=False, duplicate_of_photo_id=None),
+        }
+        duplicate = _relation(10, 20)
+        duplicate.debug_metrics = {
+            "is_duplicate": True,
+            "depth_ok_forward": 0.824,
+            "bl_over_depth": 0.0004,
+            "rotation_degrees": 0.03,
+        }
+        _mark_vggt_duplicates(photos, [duplicate])
+        self.assertFalse(photos[10].is_duplicate)
+        self.assertTrue(photos[20].is_duplicate)
+        self.assertEqual(photos[20].duplicate_of_photo_id, 10)
 
     def test_explicit_hero_remains_a_single_photo_group(self) -> None:
         photos = [
