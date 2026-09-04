@@ -17,6 +17,7 @@ from app.pipeline.phase1_analyze.shot_line import (
     _core_social_coverage,
     allocate_shots,
     build_shot_line,
+    is_persisted_vggt_duplicate,
     pick_hero,
     schedule_resolved_close_ups,
 )
@@ -113,18 +114,18 @@ class StructureTests(unittest.TestCase):
         }]
         self.assertLessEqual(len(establishing), MAX_ACT1_SHOTS)
 
-    def test_opening_uses_two_aerials_two_front_views_and_an_entry_when_earned(self):
+    def test_opening_uses_two_aerials_two_facade_views_and_an_entry_when_earned(self):
         rooms = [
             room("aerial-a", "aerial view", 2, quality=0.95, start=100),
             room("aerial-b", "aerial view", 2, quality=0.99, start=110),
             room("front-facade", "exterior front", 2, quality=0.20, start=130),
-            room("front-yard", "front yard", 2, quality=1.0, start=120),
+            room("building-facade", "building exterior", 2, quality=1.0, start=120),
             room("entry", "entrance", 1, quality=0.30, start=140),
             room("living", "living room", 3, quality=0.9, start=150),
         ]
         line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
         opening = [shot.room_id for shot in line.shots if shot.act == 1]
-        self.assertEqual(opening, ["aerial-b", "aerial-a", "front-yard", "front-facade", "entry"])
+        self.assertEqual(opening, ["aerial-b", "aerial-a", "building-facade", "front-facade", "entry"])
 
     def test_one_component_can_supply_two_distinct_aerial_views(self):
         rooms = [
@@ -139,7 +140,7 @@ class StructureTests(unittest.TestCase):
         aerial_photos = [shot.photo_ids for shot in line.shots[:2]]
         self.assertFalse(set(aerial_photos[0]) & set(aerial_photos[1]))
 
-    def test_opening_prefers_a_yard_and_facade_over_two_yard_labels(self):
+    def test_opening_never_uses_a_front_yard_label_when_a_facade_exists(self):
         rooms = [
             room("front-yard-a", "front yard", 2, quality=0.95, start=10),
             room("front-yard-b", "front yard", 2, quality=0.90, start=11),
@@ -149,11 +150,10 @@ class StructureTests(unittest.TestCase):
         ]
         line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
         opening = [shot.room_id for shot in line.shots if shot.act == 1]
-        self.assertEqual(opening, ["front-yard-a", "facade", "entry"])
+        self.assertEqual(opening, ["facade", "entry"])
 
-    def test_early_exterior_mislabel_can_complete_the_approach_but_not_repeat_late(self):
+    def test_early_exterior_mislabel_can_complete_the_approach_only_without_a_facade(self):
         rooms = [
-            room("facade", "exterior front", 2, quality=0.8, start=10, scene_type="exterior"),
             room("uncertain-exterior", "backyard", 2, quality=0.7, start=15, scene_type="exterior"),
             room("late-backyard", "backyard", 2, quality=1.0, start=50, scene_type="exterior"),
             room("entry", "entrance", 1, quality=0.7, start=20),
@@ -161,13 +161,12 @@ class StructureTests(unittest.TestCase):
         ]
         line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
         opening = [shot.room_id for shot in line.shots if shot.act == 1]
-        self.assertEqual(opening, ["facade", "uncertain-exterior", "entry"])
+        self.assertEqual(opening, ["uncertain-exterior", "entry"])
         self.assertEqual(sum(shot.room_id == "uncertain-exterior" for shot in line.shots), 1)
         self.assertNotIn("late-backyard", opening)
 
     def test_opening_fallback_survives_the_generic_backyard_type_cap(self):
         rooms = [
-            room("facade", "exterior front", 2, quality=0.8, start=10, scene_type="exterior"),
             room("early-backyard-a", "backyard", 2, quality=0.95, start=12, scene_type="exterior"),
             room("early-backyard-b", "backyard", 2, quality=0.90, start=14, scene_type="exterior"),
             room("early-backyard-c", "backyard", 2, quality=0.85, start=16, scene_type="exterior"),
@@ -176,7 +175,17 @@ class StructureTests(unittest.TestCase):
         ]
         line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
         opening = [shot.room_id for shot in line.shots if shot.act == 1]
-        self.assertEqual(opening, ["facade", "early-backyard-a", "entry"])
+        self.assertEqual(opening, ["early-backyard-a", "entry"])
+
+    def test_current_duplicate_gate_rejects_stale_near_zero_vggt_metadata(self):
+        self.assertTrue(is_persisted_vggt_duplicate({
+            "verification_source": "vggt_pairwise_v2",
+            "is_duplicate": False,
+            "depth_ok_forward": 0.823974609375,
+            "depth_ok_backward": 0.82421875,
+            "bl_over_depth": 0.0003314741547445567,
+            "rotation_degrees": 0.02558581625208167,
+        }))
 
     def test_acts_do_not_interleave(self):
         """Act 1 establishes, act 2 tours, act 3 closes -- in that order."""

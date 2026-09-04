@@ -48,6 +48,7 @@ from app.pipeline.phase1_analyze.editorial import (
     shot_seconds,
     tier_for,
 )
+from app.pipeline.phase1_analyze.transitions import is_duplicate as is_vggt_duplicate
 
 # Share of runtime each room type earned in the reference film. Used to
 # distribute shots when a property has more rooms than the budget allows.
@@ -508,8 +509,35 @@ def _core_social_coverage(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
     return selected
 
 
-_PRIMARY_APPROACH_TYPES = ("front yard", "building exterior", "exterior front")
+_FACADE_APPROACH_TYPES = ("building exterior", "exterior front")
 _TOUR_INTERIOR_TYPES = ("entrance", "hallway", "living room", "dining room", "kitchen")
+
+
+def is_persisted_vggt_duplicate(metrics: dict | None) -> bool:
+    """Apply the current duplicate rule to pre-rule-change relation metadata.
+
+    Old completed jobs retain their original JSON decision. Re-reading the
+    measured depth/pose fields is cheap and prevents a known duplicate from
+    reaching a new shot line just because the job predates the current gate.
+    """
+    metrics = metrics or {}
+    if bool(metrics.get("is_duplicate")):
+        return True
+    if metrics.get("verification_source") != "vggt_pairwise_v2":
+        return False
+    def number(key: str, default: float) -> float:
+        try:
+            return float(metrics.get(key, default))
+        except (TypeError, ValueError):
+            return default
+    return is_vggt_duplicate({
+        "depth_ok_min": min(
+            number("depth_ok_forward", 0.0),
+            number("depth_ok_backward", 0.0),
+        ),
+        "bl_over_depth": number("bl_over_depth", float("inf")),
+        "rot_deg": number("rotation_degrees", float("inf")),
+    })
 
 
 def _opening_source_key(room: RoomCandidate) -> tuple[str, int | str]:
@@ -592,20 +620,26 @@ def _opening_sequence(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
         )
 
     first_interior = _first_tour_interior_start(rooms)
-    approach: list[RoomCandidate] = []
-    for room in rooms:
-        if room.room_type in _PRIMARY_APPROACH_TYPES:
-            approach.append(room)
-            continue
-        # `backyard` is the only semantic fallback because it is frequently an
-        # exterior classifier's uncertain bucket. A genuine late backyard stays
-        # Act 3; position before the first house interior is required here.
-        if (room.room_type == "backyard" and room.scene_type == "exterior"
-                and (first_interior is None or _room_start(room) < first_interior)):
-            approach.append(room)
-    approach_priority = {room_type: index for index, room_type in enumerate(_PRIMARY_APPROACH_TYPES)}
+    facades = [room for room in rooms if room.room_type in _FACADE_APPROACH_TYPES]
+    # A real facade/door candidate is materially stronger than a room classifier
+    # calling a side of the house "front yard". If one exists, use only facade
+    # views in the automatic approach. A front-yard detail can still be an
+    # explicit editor choice later, but it is not safe to invent that role.
+    approach: list[RoomCandidate] = facades or [
+        room for room in rooms
+        if room.room_type == "front yard" or (
+            room.room_type == "backyard" and room.scene_type == "exterior"
+            and (first_interior is None or _room_start(room) < first_interior)
+        )
+    ]
+    approach_priority = {
+        room_type: index
+        for index, room_type in enumerate(
+            _FACADE_APPROACH_TYPES if facades else ("front yard", "backyard")
+        )
+    }
     approach.sort(key=lambda room: (
-        approach_priority.get(room.room_type, len(_PRIMARY_APPROACH_TYPES)),
+        approach_priority.get(room.room_type, len(approach_priority)),
         _room_start(room),
         -room.quality,
         room.room_id,
@@ -614,7 +648,11 @@ def _opening_sequence(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
         MAX_ACT1_APPROACH_SHOTS,
         max(0, MAX_ACT1_SHOTS - len(aerials) - int(entry is not None)),
     )
-    approach = _opening_slots(approach, approach_limit, diversify_types=True)
+    approach = _opening_slots(
+        approach,
+        approach_limit,
+        diversify_types=not bool(facades),
+    )
     return [*aerials, *approach, *([entry] if entry is not None else [])]
 
 

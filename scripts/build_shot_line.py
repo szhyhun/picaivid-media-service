@@ -19,6 +19,7 @@ from app.db.session import SessionLocal
 from app.pipeline.phase1_analyze.shot_line import (
     RoomCandidate,
     build_shot_line,
+    is_persisted_vggt_duplicate,
     room_type_from_name,
 )
 
@@ -33,22 +34,39 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
         "SELECT id, rails_photo_id, COALESCE(room_override, room_label), COALESCE(final_score,0), position, "
         "COALESCE(is_duplicate, false) "
         "FROM job_photos WHERE job_id = :j"), {"j": job_id}).fetchall()
-    # A VGGT duplicate remains in the scene-map evidence, but it cannot enter the
-    # film. Filter it before either truth or predicted semantic zones are built.
-    photos = [row for row in photo_rows if not row[5]]
-    by_key = {r[1]: r for r in photos}
-    by_id = {r[0]: r for r in photos}
-
     # Best verified pair per room, by the planner's own pair score.
     pairs = db.execute(text(
         "SELECT photo_a_id, photo_b_id, debug_metrics FROM photo_relations "
         "WHERE job_id = :j"), {"j": job_id}).fetchall()
+    # Older jobs predate the near-zero VGGT duplicate gate. Re-evaluate their
+    # persisted numeric evidence without re-running the model, retaining the
+    # earliest uploaded frame as the canonical source for the new shot line.
+    row_by_id = {row[0]: row for row in photo_rows}
+    stale_duplicate_ids: set[int] = set()
+    for a, b, dm in pairs:
+        if (not is_persisted_vggt_duplicate(dm)
+                or int(a) not in row_by_id or int(b) not in row_by_id):
+            continue
+        left, right = sorted(
+            (int(a), int(b)),
+            key=lambda photo_id: (int(row_by_id[photo_id][4] or 0), photo_id),
+        )
+        stale_duplicate_ids.add(right)
+
+    # A VGGT duplicate remains in the scene-map evidence, but it cannot enter
+    # the film. Filter both persisted flags and compatibility duplicates before
+    # truth or predicted semantic zones are built.
+    photos = [row for row in photo_rows
+              if not row[5] and row[0] not in stale_duplicate_ids]
+    by_key = {r[1]: r for r in photos}
+    by_id = {r[0]: r for r in photos}
+
     pair_score: dict[tuple[int, int], float] = {}
     for a, b, dm in pairs:
         dm = dm or {}
         if dm.get("verification_source") != "vggt_pairwise_v2":
             continue
-        if dm.get("is_transition") and not dm.get("is_duplicate"):
+        if dm.get("is_transition") and not is_persisted_vggt_duplicate(dm):
             pair_score[(a, b)] = float(dm.get("pair_score") or 0.0)
 
     truth = db.execute(text(
