@@ -401,6 +401,47 @@ class CloseUpTests(unittest.TestCase):
         close_ups = [shot for shot in scheduled if shot.is_close_up]
         self.assertEqual([shot.detail_subject for shot in close_ups], ["Fireplace", "Wall art"])
 
+    def test_source_frame_detail_stays_a_single_full_frame_shot(self):
+        wide = Shot(
+            index=2,
+            room_id="living",
+            room_type="living room",
+            photo_ids=[100],
+            kind="single_image",
+            act=2,
+            start_seconds=2.4,
+            duration_seconds=1.2,
+            move=choose_move("living"),
+        )
+        opener = [
+            Shot(index=i, room_id=f"room-{i}", room_type="bedroom", photo_ids=[i],
+                 kind="single_image", act=2, start_seconds=float(i), duration_seconds=1.2,
+                 move=choose_move(f"room-{i}"))
+            for i in range(2)
+        ]
+        filler = [
+            Shot(index=i, room_id=f"room-{i}", room_type="bedroom", photo_ids=[i],
+                 kind="single_image", act=2, start_seconds=float(i), duration_seconds=1.2,
+                 move=choose_move(f"room-{i}"))
+            for i in range(3, 6)
+        ]
+        detail = ResolvedDetail(
+            source_photo_id=501,
+            subject_key="fireplace",
+            subject_label="Fireplace",
+            subject_box=(300, 100, 700, 1200),
+            detector_score=0.9,
+            crop=None,
+            source_size=(1000, 1500),
+            framing="source_frame",
+            selection_score=0.9,
+        )
+        scheduled = schedule_resolved_close_ups([*opener, wide, *filler], {"living": [detail]})
+        detail_shot = next(shot for shot in scheduled if shot.is_close_up)
+        self.assertEqual(detail_shot.photo_ids, [501])
+        self.assertIsNone(detail_shot.crop_box)
+        self.assertEqual(detail_shot.detail_framing, "source_frame")
+
     def test_shots_stay_contiguous_after_insertion(self):
         for a, b in zip(self.shots, self.shots[1:]):
             self.assertAlmostEqual(a.start_seconds + a.duration_seconds,

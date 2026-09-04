@@ -15,6 +15,7 @@ from app.models.openclip import openclip_model
 from app.services.storage.s3_client import s3_client
 from app.services.rails.photo_reader import rails_photo_reader, RailsPhoto
 from app.pipeline.phase1_analyze.clustering import cluster_photos_by_room
+from app.pipeline.phase1_analyze.detail_crop import detect_and_persist_photo_details
 from app.pipeline.phase1_analyze.scoring import compute_photo_scores
 from app.pipeline.phase1_analyze.motion_planner import plan_motion_for_cluster
 from app.pipeline.phase1_analyze.shot_planner import build_and_persist_shot_plan
@@ -133,6 +134,14 @@ class Phase1Analyzer:
             # (e.g., living vs dining confusion in adjacent shots).
             self._postprocess_interior_geometry_labels(job_photos, job_id=job.id)
             self.db.commit()
+
+            # Object evidence is generated once per uploaded photo and stored on
+            # its geometry row. The review endpoint must stay inference-free.
+            detail_count = detect_and_persist_photo_details(
+                self.db, int(job.id), job_photos, s3_client,
+            )
+            self.db.commit()
+            logger.info("Saved %s grounded detail candidates for job %s", detail_count, job.id)
 
             # Step 8: Plan motion for each cluster
             photos_by_cluster: Dict[int, List[JobPhoto]] = {}

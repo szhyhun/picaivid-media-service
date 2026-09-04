@@ -275,6 +275,7 @@ class Shot:
     detail_subject: str | None = None
     detector_score: float | None = None
     subject_box: tuple[int, int, int, int] | None = None
+    detail_framing: str | None = None
 
     @property
     def uses_keyframes(self) -> bool:
@@ -680,9 +681,9 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         ))
         cursor += per_shot
 
-    # Object-aware details need source images and are resolved by the API after
-    # the wide line is built. A planner-only invocation never makes a generic
-    # crop just to fill this optional flag.
+    # Object-aware details are saved during Phase 1 and selected by the API after
+    # the wide line is built. Planner-only invocation never makes a generic crop
+    # simply to fill this optional slot.
     return ShotLine(shots=shots, bpm=bpm, hero_room_id=hero_id, dropped_rooms=dropped)
 
 
@@ -743,7 +744,7 @@ def _insert_close_ups(
         detail = max(
             options,
             key=lambda candidate: (
-                candidate.crop.score,
+                candidate.score,
                 candidate.detector_score,
                 -candidate.source_photo_id,
             ),
@@ -774,12 +775,13 @@ def _insert_close_ups(
             move=choose_move(f"{shot.room_id}:closeup:{i}"),
             is_hero=shot.is_hero,
             is_close_up=True,
-            crop_box=detail.crop.box,
-            crop_score=detail.crop.score,
+            crop_box=detail.crop.box if detail.crop else None,
+            crop_score=detail.crop.score if detail.crop else detail.score,
             source_size=detail.source_size,
             detail_subject=detail.subject_label,
             detector_score=detail.detector_score,
             subject_box=detail.subject_box,
+            detail_framing=detail.framing,
         ))
 
     cursor = 0.0

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 import logging
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.core.config import settings
 
@@ -24,6 +24,8 @@ MIN_CROP_WIDTH_FRACTION = 0.18
 # blank wall; three percent retains the full object without diluting the shot.
 SUBJECT_PADDING = 0.03
 EDGE_MARGIN_FRACTION = 0.015
+DETAIL_METRICS_KEY = "detail_objects_v1"
+DETAIL_ANALYSIS_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -120,8 +122,16 @@ class ResolvedDetail:
     subject_label: str
     subject_box: tuple[int, int, int, int]
     detector_score: float
-    crop: DetailCrop
+    crop: DetailCrop | None
     source_size: tuple[int, int]
+    # A dedicated object photograph is already a stronger composition than a
+    # synthetic landscape crop. `source_frame` tells the renderer to preserve it.
+    framing: str = "object_crop"
+    selection_score: float = 0.0
+
+    @property
+    def score(self) -> float:
+        return self.selection_score or (self.crop.score if self.crop else self.detector_score)
 
 
 @dataclass(frozen=True)
@@ -204,6 +214,67 @@ def crop_for_subject(
         width=round(crop_width),
         height=round(crop_height),
         score=float(score),
+    )
+
+
+def _uses_source_frame(box: Sequence[float], source_size: tuple[int, int]) -> bool:
+    """Recognise a photo deliberately composed as a vertical object detail.
+
+    This is intentionally strict: a broad kitchen photo containing a stove still
+    earns a crop, while a portrait image dominated by a fixture or artwork keeps
+    its authored composition intact.
+    """
+    left, top, right, bottom = box
+    width, height = source_size
+    if height <= width * 1.12:
+        return False
+    subject_width_fraction = (right - left) / width
+    subject_height_fraction = (bottom - top) / height
+    subject_center_x = ((left + right) / 2) / width
+    return (
+        subject_width_fraction >= 0.12
+        and subject_height_fraction >= 0.35
+        and 0.18 <= subject_center_x <= 0.82
+    )
+
+
+def _resolved_detection(
+    photo_id: int,
+    source_size: tuple[int, int],
+    detection: _Detection,
+) -> ResolvedDetail | None:
+    ranking_score = detection.score * detection.subject.priority
+    framing = "source_frame" if _uses_source_frame(detection.box, source_size) else "object_crop"
+    if framing == "source_frame":
+        # A tall, intentionally composed detail cannot fit a 16:9 crop without
+        # cutting off its subject. Validate the same complete detector box, then
+        # preserve the original frame instead of rejecting a good photograph.
+        if not _box_is_complete(detection.box, source_size):
+            return None
+        return ResolvedDetail(
+            source_photo_id=photo_id,
+            subject_key=detection.subject.key,
+            subject_label=detection.subject.label,
+            subject_box=tuple(round(value) for value in detection.box),
+            detector_score=detection.score,
+            crop=None,
+            source_size=source_size,
+            framing=framing,
+            selection_score=ranking_score,
+        )
+    crop = crop_for_subject(detection.box, source_size, score=ranking_score)
+    if crop is None:
+        return None
+    return ResolvedDetail(
+        source_photo_id=photo_id,
+        subject_key=detection.subject.key,
+        subject_label=detection.subject.label,
+        subject_box=tuple(round(value) for value in detection.box),
+        detector_score=detection.score,
+        crop=crop,
+        source_size=source_size,
+        framing=framing,
+        selection_score=ranking_score,
     )
 
 
@@ -294,102 +365,187 @@ class _GroundingDinoDetector:
             detections.append(image_detections)
         return detections
 
+    def release(self) -> None:
+        """Drop optional detector weights after a job; VGGT stays the warm model."""
+        if self._model is None:
+            return
+        import gc
+        import torch
+
+        self._model = None
+        self._processor = None
+        device = self._device
+        self._device = None
+        gc.collect()
+        if device is not None and getattr(device, "type", "") == "cuda":
+            torch.cuda.empty_cache()
+        elif device is not None and getattr(device, "type", "") == "mps":
+            torch.mps.empty_cache()
+
 
 detail_detector = _GroundingDinoDetector()
 
 
-def resolve_detail_candidates(
-    shots,
-    room_photo_ids: Mapping[str, Sequence[int]],
-    photo_uri: Mapping[int, str],
-) -> dict[str, list[ResolvedDetail]]:
-    """Detect the best allowed subjects across every photo in each selected room.
+def _stored_detail(detail: ResolvedDetail) -> dict[str, Any]:
+    return {
+        "subject_key": detail.subject_key,
+        "subject_label": detail.subject_label,
+        "subject_box": list(detail.subject_box),
+        "detector_score": detail.detector_score,
+        "crop_box": list(detail.crop.box) if detail.crop else None,
+        "selection_score": detail.score,
+        "source_size": list(detail.source_size),
+        "framing": detail.framing,
+    }
 
-    A detail's source does not have to be one of the story shot's keyframes.
-    That separation prevents a wide with bar stools from displacing another
-    kitchen image that contains the actual stove.
-    """
-    from app.services.storage.s3_client import s3_client
 
-    selected_rooms: dict[str, str] = {}
-    for shot in shots:
-        if not getattr(shot, "is_close_up", False):
-            selected_rooms.setdefault(shot.room_id, shot.room_type)
+def _detail_from_stored(photo_id: int, payload: Mapping[str, Any]) -> ResolvedDetail | None:
+    try:
+        source_size = tuple(int(value) for value in payload["source_size"])
+        subject_box = tuple(int(value) for value in payload["subject_box"])
+        crop_box = payload.get("crop_box")
+        crop = None
+        if crop_box is not None:
+            left, top, right, bottom = (int(value) for value in crop_box)
+            crop = DetailCrop(
+                x=left,
+                y=top,
+                width=right - left,
+                height=bottom - top,
+                score=float(payload.get("selection_score") or 0.0),
+            )
+        return ResolvedDetail(
+            source_photo_id=photo_id,
+            subject_key=str(payload["subject_key"]),
+            subject_label=str(payload["subject_label"]),
+            subject_box=subject_box,
+            detector_score=float(payload["detector_score"]),
+            crop=crop,
+            source_size=source_size,
+            framing=str(payload.get("framing") or "object_crop"),
+            selection_score=float(payload.get("selection_score") or 0.0),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Ignoring malformed persisted detail for photo %s", photo_id)
+        return None
 
-    candidates: dict[str, list[ResolvedDetail]] = defaultdict(list)
-    batch_size = max(1, settings.DETAIL_DETECTOR_BATCH_SIZE)
-    for room_id, room_type in selected_rooms.items():
-        subjects = detail_subjects(room_type)
-        if not subjects:
-            continue
-        photo_ids = list(dict.fromkeys(room_photo_ids.get(room_id, ())))
-        for start in range(0, len(photo_ids), batch_size):
-            batch_ids = photo_ids[start:start + batch_size]
-            decoded: list[tuple[int, object]] = []
-            try:
-                for photo_id in batch_ids:
-                    uri = photo_uri.get(photo_id)
-                    if uri is None:
-                        continue
-                    try:
-                        image = s3_client.download_image(uri)
-                    except Exception:
-                        logger.warning("Could not download detail candidate %s", photo_id, exc_info=True)
-                        continue
-                    if image is not None:
-                        decoded.append((photo_id, image))
-                if not decoded:
-                    continue
-                detected = detail_detector.detect(
-                    [image for _, image in decoded], subjects,
-                )
-                for (photo_id, image), detections in zip(decoded, detected):
-                    for detection in detections:
-                        ranking_score = detection.score * detection.subject.priority
-                        crop = crop_for_subject(
-                            detection.box,
-                            image.size,
-                            score=ranking_score,
-                        )
-                        if crop is None:
-                            continue
-                        candidates[room_id].append(ResolvedDetail(
-                            source_photo_id=photo_id,
-                            subject_key=detection.subject.key,
-                            subject_label=detection.subject.label,
-                            subject_box=tuple(round(value) for value in detection.box),
-                            detector_score=detection.score,
-                            crop=crop,
-                            source_size=image.size,
-                        ))
-            finally:
-                for _, image in decoded:
-                    image.close()
 
-    # One strongest, complete source per object type. "Stove" and "oven" are
-    # intentionally one `cooking` subject, so overlapping boxes cannot create
-    # duplicate shots of the same appliance.
+def _resolve_candidates(candidates: Mapping[str, Sequence[ResolvedDetail]]) -> dict[str, list[ResolvedDetail]]:
+    """Keep one strongest complete source per room/object combination."""
     resolved: dict[str, list[ResolvedDetail]] = {}
     for room_id, room_candidates in candidates.items():
         best_by_subject: dict[str, ResolvedDetail] = {}
         for candidate in room_candidates:
             current = best_by_subject.get(candidate.subject_key)
             if current is None or (
-                candidate.crop.score,
+                candidate.score,
                 candidate.detector_score,
                 -candidate.source_photo_id,
             ) > (
-                current.crop.score,
+                current.score,
                 current.detector_score,
                 -current.source_photo_id,
             ):
                 best_by_subject[candidate.subject_key] = candidate
         resolved[room_id] = sorted(
             best_by_subject.values(),
-            key=lambda candidate: (
-                -candidate.crop.score,
-                -candidate.detector_score,
-                candidate.source_photo_id,
-            ),
+            key=lambda candidate: (-candidate.score, -candidate.detector_score, candidate.source_photo_id),
         )
     return resolved
+
+
+def resolve_persisted_detail_candidates(
+    shots,
+    room_photo_ids: Mapping[str, Sequence[int]],
+    metric_by_photo: Mapping[int, Mapping[str, Any]],
+) -> dict[str, list[ResolvedDetail]]:
+    """Select saved Phase-1 detections for the rooms that survived editing.
+
+    This does no network I/O and does not load Grounding DINO. A page refresh is
+    therefore a cheap review operation, not hidden inference.
+    """
+    selected_rooms = {
+        shot.room_id: shot.room_type
+        for shot in shots
+        if not getattr(shot, "is_close_up", False)
+    }
+    candidates: dict[str, list[ResolvedDetail]] = defaultdict(list)
+    for room_id, room_type in selected_rooms.items():
+        if not is_detail_eligible(room_type):
+            continue
+        for photo_id in dict.fromkeys(room_photo_ids.get(room_id, ())):
+            stored = (metric_by_photo.get(photo_id, {}).get(DETAIL_METRICS_KEY) or {})
+            if stored.get("version") != DETAIL_ANALYSIS_VERSION:
+                continue
+            for payload in stored.get("objects") or ():
+                detail = _detail_from_stored(int(photo_id), payload)
+                if detail is not None:
+                    candidates[room_id].append(detail)
+    return _resolve_candidates(candidates)
+
+
+def detect_and_persist_photo_details(db, job_id: int, photos, s3_client) -> int:
+    """Run optional object detection once during Phase 1 and persist its evidence.
+
+    Details are editorial metadata only: failures must not fail VGGT analysis or
+    turn the API endpoint into a second inference worker. The detector is released
+    once saved so repeated listings do not retain a second large model in memory.
+    """
+    from app.db.models import PhotoSceneGeometry
+
+    geometry_rows = {
+        int(row.photo_id): row
+        for row in db.query(PhotoSceneGeometry).filter(PhotoSceneGeometry.job_id == job_id).all()
+    }
+    eligible_by_type: dict[str, list[Any]] = defaultdict(list)
+    for photo in photos:
+        if photo.id not in geometry_rows or photo.exclude or photo.is_duplicate:
+            continue
+        room_type = (photo.room_override or photo.room_label or "").strip().lower()
+        if detail_subjects(room_type):
+            eligible_by_type[room_type].append(photo)
+
+    by_photo: dict[int, list[ResolvedDetail]] = defaultdict(list)
+    failures = False
+    batch_size = max(1, settings.DETAIL_DETECTOR_BATCH_SIZE)
+    try:
+        for room_type, candidates in eligible_by_type.items():
+            subjects = detail_subjects(room_type)
+            for start in range(0, len(candidates), batch_size):
+                batch = candidates[start:start + batch_size]
+                decoded: list[tuple[Any, Any]] = []
+                try:
+                    for photo in batch:
+                        try:
+                            decoded.append((photo, s3_client.download_image(photo.s3_uri)))
+                        except Exception:
+                            logger.warning("Could not download detail candidate %s", photo.id, exc_info=True)
+                            failures = True
+                    decoded = [(photo, image) for photo, image in decoded if image is not None]
+                    if not decoded:
+                        continue
+                    detections = detail_detector.detect([image for _, image in decoded], subjects)
+                    for (photo, image), photo_detections in zip(decoded, detections):
+                        for detection in photo_detections:
+                            detail = _resolved_detection(int(photo.id), image.size, detection)
+                            if detail is not None:
+                                by_photo[int(photo.id)].append(detail)
+                finally:
+                    for _, image in decoded:
+                        image.close()
+    except Exception:
+        failures = True
+        logger.exception("Detail detection unavailable for Phase-1 job %s", job_id)
+    finally:
+        detail_detector.release()
+
+    for photo_id, row in geometry_rows.items():
+        metrics = dict(row.local_metrics or {})
+        details = _resolve_candidates({"photo": by_photo.get(photo_id, [])}).get("photo", [])
+        metrics[DETAIL_METRICS_KEY] = {
+            "version": DETAIL_ANALYSIS_VERSION,
+            "status": "partial" if failures else "complete",
+            "objects": [_stored_detail(detail) for detail in details],
+        }
+        row.local_metrics = metrics
+    return sum(len(details) for details in by_photo.values())

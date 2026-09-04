@@ -5,11 +5,16 @@ import unittest
 
 from app.pipeline.phase1_analyze.detail_crop import (
     DETAIL_SUBJECTS_BY_ROOM,
+    DETAIL_ANALYSIS_VERSION,
+    DETAIL_METRICS_KEY,
     OUTPUT_ASPECT,
+    _Detection,
+    _resolved_detection,
     _subject_for_label,
     crop_for_subject,
     detail_subjects,
     is_detail_eligible,
+    resolve_persisted_detail_candidates,
 )
 
 
@@ -68,6 +73,44 @@ class CropGeometryTests(unittest.TestCase):
         self.assertGreaterEqual(crop.y, 0)
         self.assertLessEqual(crop.x + crop.width, 2048)
         self.assertLessEqual(crop.y + crop.height, 1365)
+
+    def test_dedicated_portrait_detail_keeps_its_original_frame(self):
+        subject = next(item for item in detail_subjects("entrance") if item.key == "entry_light")
+        detail = _resolved_detection(
+            42,
+            (1000, 1500),
+            _Detection(subject=subject, score=0.8, box=(350, 100, 650, 1300)),
+        )
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail.framing, "source_frame")
+        self.assertIsNone(detail.crop)
+
+
+class PersistedDetailTests(unittest.TestCase):
+    def test_saved_detail_is_selected_without_live_model_inference(self):
+        shot = type("Shot", (), {"room_id": "kitchen", "room_type": "kitchen", "is_close_up": False})()
+        resolved = resolve_persisted_detail_candidates(
+            [shot],
+            {"kitchen": [7]},
+            {7: {
+                DETAIL_METRICS_KEY: {
+                    "version": DETAIL_ANALYSIS_VERSION,
+                    "status": "complete",
+                    "objects": [{
+                        "subject_key": "cooking",
+                        "subject_label": "Stove or oven",
+                        "subject_box": [400, 300, 1100, 900],
+                        "detector_score": 0.9,
+                        "crop_box": [300, 250, 1200, 756],
+                        "selection_score": 0.9,
+                        "source_size": [2048, 1365],
+                        "framing": "object_crop",
+                    }],
+                },
+            }},
+        )
+        self.assertEqual(len(resolved["kitchen"]), 1)
+        self.assertEqual(resolved["kitchen"][0].subject_key, "cooking")
 
 
 if __name__ == "__main__":

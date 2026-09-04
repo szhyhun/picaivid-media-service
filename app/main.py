@@ -510,7 +510,7 @@ async def get_project_shot_line(
     )
     from app.pipeline.phase1_analyze.detail_crop import (
         is_detail_eligible,
-        resolve_detail_candidates,
+        resolve_persisted_detail_candidates,
     )
 
     try:
@@ -519,9 +519,9 @@ async def get_project_shot_line(
         return {"project_id": project_id, "shots": [], "rooms": 0,
                 "source": "no analysis yet"}
 
-    # Build the actual selected wides first. Details are optional and object
-    # specific: Grounding DINO inspects every source photo in each selected room
-    # before scheduling any detail into that room's story run.
+    # Build selected wides first. Detail detections were saved during Phase 1;
+    # the review endpoint only selects that persisted evidence and never loads a
+    # second model or downloads original source images.
     line = build_shot_line(
         rooms, target_seconds=seconds, bpm=bpm, include_close_ups=False)
     if line.shots:
@@ -537,21 +537,15 @@ async def get_project_shot_line(
             if room_id in selected_room_ids
             for photo_id in photo_ids
         }
-        uri_rows = db.query(JobPhoto).filter(
-            JobPhoto.id.in_(candidate_photo_ids)
+        geometry_rows = db.query(PhotoSceneGeometry).filter(
+            PhotoSceneGeometry.photo_id.in_(candidate_photo_ids)
         ).all()
-        if uri_rows:
-            try:
-                resolved = resolve_detail_candidates(
-                    line.shots,
-                    room_photo_ids,
-                    {int(p.id): p.s3_uri for p in uri_rows},
-                )
-                line.shots = schedule_resolved_close_ups(line.shots, resolved)
-            except Exception:
-                # The planning view is still useful without optional detail
-                # crops. Never turn a model/download failure into a 500 here.
-                logger.exception("Could not resolve detail candidates for %s", project_id)
+        resolved = resolve_persisted_detail_candidates(
+            line.shots,
+            room_photo_ids,
+            {int(row.photo_id): row.local_metrics or {} for row in geometry_rows},
+        )
+        line.shots = schedule_resolved_close_ups(line.shots, resolved)
 
     photo_rows = db.query(JobPhoto).filter(
         JobPhoto.id.in_([p for shot in line.shots for p in shot.photo_ids])
@@ -599,6 +593,7 @@ async def get_project_shot_line(
             "detail_subject": s.detail_subject,
             "detector_score": round(s.detector_score, 4) if s.detector_score is not None else None,
             "subject_box": list(s.subject_box) if s.subject_box else None,
+            "detail_framing": s.detail_framing,
             # Fractions per second, so the UI can draw the motion rather than
             # only name it.
             "move": s.move.label,
