@@ -303,6 +303,37 @@ class KeyframeTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_main_dining_is_reserved_ahead_of_optional_bathroom_coverage(self):
+        rooms = [
+            room("front", "exterior front", 1, quality=0.9, start=1),
+            room("entry", "entrance", 1, quality=0.8, start=2),
+            room("living", "living room", 1, quality=0.3, start=10),
+            room("dining", "dining room", 2, quality=0.3, pairs=1, start=20),
+            room("kitchen", "kitchen", 1, quality=0.3, start=30),
+            room("bath-a", "bathroom", 4, quality=1.0, pairs=2, start=40),
+            room("bath-b", "bathroom", 4, quality=1.0, pairs=2, start=50),
+            room("patio", "patio", 4, quality=1.0, pairs=2, start=60),
+        ]
+        line = build_shot_line(rooms, target_seconds=15, bpm=100, include_close_ups=False)
+        indices = {
+            room_id: min(shot.index for shot in line.shots if shot.room_id == room_id)
+            for room_id in {"living", "dining", "kitchen"}
+        }
+        self.assertLess(indices["living"], indices["dining"])
+        self.assertLess(indices["dining"], indices["kitchen"])
+
+    def test_secondary_kitchen_cannot_satisfy_main_social_coverage(self):
+        rooms = [
+            room("front", "exterior front", 1, quality=0.9, start=1),
+            room("living", "living room", 1, quality=0.3, start=10),
+            room("dining", "dining room", 2, quality=0.3, pairs=1, start=20),
+            room("main-kitchen", "kitchen", 1, quality=0.3, start=30),
+            room("suite-kitchen", "kitchen", 4, quality=1.0, pairs=2, start=60),
+            room("bath", "bathroom", 4, quality=1.0, pairs=2, start=70),
+        ]
+        line = build_shot_line(rooms, target_seconds=15, bpm=100, include_close_ups=False)
+        self.assertIn("main-kitchen", {shot.room_id for shot in line.shots})
+
     def test_a_short_film_drops_rooms_rather_than_compressing_shots(self):
         """Shot length is set by the music, so a 15s film shows fewer rooms --
         it does not show every room faster."""

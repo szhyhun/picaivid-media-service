@@ -61,7 +61,9 @@ DWELL_WEIGHT: dict[str, float] = {
     "kitchen": 1.4,
     "bathroom": 1.3,
     "bedroom": 1.2,
-    "dining room": 0.9,
+    # Dining is a core social selling space. Its smaller reference-film share
+    # does not justify allowing bathrooms to erase it from the property tour.
+    "dining room": 1.4,
     "exterior front": 0.8,
     "front yard": 0.8,
     "building exterior": 0.8,
@@ -109,6 +111,11 @@ DEFAULT_MAX_ROOMS_PER_TYPE = 2
 # home. It is a story heuristic, never geometry or membership evidence.
 SECONDARY_KITCHEN_GAP = 8
 SECONDARY_KITCHEN_POSITION = 0.68
+
+# Selection and story order are separate decisions. These are the main-house
+# social spaces that earn one protected beat when present; additional coverage
+# still comes from the ordinary evidence and dwell-weight allocation below.
+CORE_SOCIAL_TYPES = ("living room", "dining room", "kitchen")
 
 # Close-ups, measured by scoring every shot in the three reference films against
 # the wide-room centroid and taking each film's top quartile:
@@ -463,6 +470,30 @@ def _mark_secondary_kitchens(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
     return copies
 
 
+def _core_social_coverage(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
+    """Return the strongest main-house living, dining and kitchen candidates."""
+    selected: list[RoomCandidate] = []
+    for room_type in CORE_SOCIAL_TYPES:
+        candidate = max(
+            (room for room in rooms
+             if room.room_type == room_type and not is_secondary(room)),
+            # A verified two-photo shot is more useful than an equally pretty
+            # singleton because it constrains both ends of video generation.
+            key=lambda room: (
+                bool(room.pairs),
+                len(room.pairs),
+                room.quality,
+                len(room.photo_ids),
+                -_room_start(room),
+                room.room_id,
+            ),
+            default=None,
+        )
+        if candidate is not None:
+            selected.append(candidate)
+    return selected
+
+
 _PRIMARY_APPROACH_TYPES = ("front yard", "building exterior", "exterior front")
 _TOUR_INTERIOR_TYPES = ("entrance", "hallway", "living room", "dining room", "kitchen")
 
@@ -667,13 +698,25 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         elif _act_of(room) == 1:
             alloc[room.room_id] = 0
 
+    # A property film must establish its principal social spaces before it
+    # spends coverage on optional bathrooms or a later secondary unit. Reserve
+    # the best main-house instance of each; this does not grant extra repeats.
+    # A very short cut can reserve only what fits after the approach and close.
+    close_reserve = int(_closing_room(eligible) is not None)
+    core_capacity = max(0, budget - sum(opening_counts.values()) - close_reserve)
+    core_social = _core_social_coverage(eligible)[:core_capacity]
+    core_social_ids = {room.room_id for room in core_social}
+    for room in core_social:
+        alloc[room.room_id] = max(alloc.get(room.room_id, 0), 1)
+
     # Reserving an absent facade or entry can add shots that generic weighted
     # allocation had already dropped in a short edit. Make room in the body now
     # and keep one beat available for the deliberate exterior closing return.
     if sum(alloc.values()) > budget:
         body_budget = max(0, budget - (1 if _closing_room(eligible) else 0))
         removable = sorted(
-            (room for room in eligible if room.room_id not in opening_ids),
+            (room for room in eligible
+             if room.room_id not in opening_ids | core_social_ids),
             key=lambda room: (_weight(room, hero_id), room.quality, len(room.photo_ids), room.room_id),
         )
         for room in removable:
