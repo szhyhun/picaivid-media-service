@@ -303,10 +303,26 @@ class KeyframeTests(unittest.TestCase):
                 self.assertNotIn(key, seen)
                 seen.add(key)
 
-    def test_rooms_without_pairs_fall_back_to_single_images(self):
+    def test_bathrooms_without_verified_pairs_are_dropped(self):
         line = build_shot_line([room("bath", "bathroom", 2, start=100)],
                                target_seconds=20, bpm=100)
-        self.assertTrue(all(s.kind == "single_image" for s in line.shots))
+        self.assertEqual(line.shots, [])
+        self.assertIn("bath", line.dropped_rooms)
+
+    def test_bathroom_with_a_verified_pair_never_falls_back_to_single_image(self):
+        bathroom = room("bath", "bathroom", 4, pairs=1, start=100)
+        line = build_shot_line([bathroom], target_seconds=20, bpm=100)
+        bathroom_shots = [shot for shot in line.shots if shot.room_id == "bath"]
+        self.assertEqual(len(bathroom_shots), 1)
+        self.assertTrue(all(shot.kind == "pair_keyframes" for shot in bathroom_shots))
+
+    def test_bathroom_pair_capacity_uses_disjoint_pairs_only(self):
+        bathroom = room("bath", "bathroom", 4, pairs=0, start=100)
+        bathroom.pairs = [(100, 101, 0.9), (100, 102, 0.8), (102, 103, 0.7)]
+        line = build_shot_line([bathroom], target_seconds=30, bpm=100)
+        bathroom_shots = [shot for shot in line.shots if shot.room_id == "bath"]
+        self.assertEqual([shot.photo_ids for shot in bathroom_shots], [[100, 101], [102, 103]])
+        self.assertTrue(all(shot.kind == "pair_keyframes" for shot in bathroom_shots))
 
     def test_keyframe_fraction_is_reported(self):
         line = build_shot_line(a_property(), target_seconds=45, bpm=100)

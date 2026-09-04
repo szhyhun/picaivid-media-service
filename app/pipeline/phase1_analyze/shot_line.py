@@ -108,6 +108,12 @@ MAX_ROOMS_PER_TYPE: dict[str, int] = {
 }
 DEFAULT_MAX_ROOMS_PER_TYPE = 2
 
+# Bathrooms are optional supporting coverage. Unlike a strong single image of a
+# living room or bedroom, a lone bathroom frame rarely advances the property
+# story. Show one only when VGGT verified a real two-photo camera move; never
+# use a bathroom singleton merely to consume budget.
+PAIR_ONLY_ROOM_TYPES = frozenset({"bathroom"})
+
 # A later kitchen is editorially a separate unit only after a meaningful gap in
 # the uploaded capture sequence. This keeps a main kitchen split across two VGGT
 # components together while moving a later in-law/suite kitchen behind the main
@@ -353,6 +359,26 @@ def _weight(room: RoomCandidate, hero_id: str | None) -> float:
     return base
 
 
+def _disjoint_pair_capacity(room: RoomCandidate) -> int:
+    """Count the distinct verified pairs a pair-only room can actually show."""
+    used: set[int] = set()
+    count = 0
+    for left, right, score in room.pairs:
+        if score <= 0.0 or left in used or right in used:
+            continue
+        used.update((left, right))
+        count += 1
+    return count
+
+
+def _room_shot_capacity(room: RoomCandidate, hero_id: str | None) -> int:
+    """Maximum distinct cinematic beats this room can supply."""
+    cap = MAX_HERO_SHOTS if room.room_id == hero_id else MAX_SHOTS_PER_ROOM
+    if room.room_type in PAIR_ONLY_ROOM_TYPES:
+        return min(cap, _disjoint_pair_capacity(room))
+    return min(cap, len(room.photo_ids))
+
+
 def allocate_shots(rooms: list[RoomCandidate], budget: int,
                    hero_id: str | None) -> dict[str, int]:
     """Distribute the shot budget across rooms by dwell weight.
@@ -371,12 +397,11 @@ def allocate_shots(rooms: list[RoomCandidate], budget: int,
     for room in rooms:
         alloc[room.room_id] = max(0, int(budget * weights[room.room_id] / total))
 
-    # A room cannot show more shots than it has material for: a pair is one shot
-    # and a single photo is one shot, so the cap is the photo count.
+    # A room cannot show more shots than it has material for. Bathrooms are the
+    # deliberate exception: they earn only verified, disjoint pair beats.
     for room in rooms:
-        cap = MAX_HERO_SHOTS if room.room_id == hero_id else MAX_SHOTS_PER_ROOM
         alloc[room.room_id] = min(alloc[room.room_id],
-                                  max(1, len(room.photo_ids)), cap)
+                                  _room_shot_capacity(room, hero_id))
 
     # Hand out any remainder to the strongest rooms, then trim any overshoot
     # from the weakest, so the total lands exactly on the budget.
@@ -384,7 +409,7 @@ def allocate_shots(rooms: list[RoomCandidate], budget: int,
     i = 0
     while sum(alloc.values()) < budget and i < len(order) * 4:
         room = order[i % len(order)]
-        if alloc[room.room_id] < min(len(room.photo_ids), MAX_SHOTS_PER_ROOM):
+        if alloc[room.room_id] < _room_shot_capacity(room, hero_id):
             alloc[room.room_id] += 1
         i += 1
     for room in reversed(order):
@@ -675,8 +700,15 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
                     include_close_ups: bool = True) -> ShotLine:
     """Produce the ordered shot line for a listing."""
     rooms = _mark_secondary_kitchens(rooms)
-    eligible = [r for r in rooms
-                if r.photo_ids and is_eligible(r.room_type, allow_service=allow_service)]
+    eligible = [
+        room for room in rooms
+        if room.photo_ids
+        and is_eligible(room.room_type, allow_service=allow_service)
+        and (
+            room.room_type not in PAIR_ONLY_ROOM_TYPES
+            or _disjoint_pair_capacity(room) > 0
+        )
+    ]
     dropped = [r.room_id for r in rooms if r not in eligible]
     # Select the protected approach before generic semantic caps. The caps are
     # for the body of the tour; applying them first can discard a real front
@@ -790,9 +822,7 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         i = 0
         while shortfall > 0 and takers and i < len(takers) * 6:
             room = takers[i % len(takers)]
-            cap = min(len(room.photo_ids),
-                      MAX_HERO_SHOTS if room.room_id == hero_id
-                      else MAX_SHOTS_PER_ROOM)
+            cap = _room_shot_capacity(room, hero_id)
             if alloc.get(room.room_id, 0) < cap:
                 alloc[room.room_id] = alloc.get(room.room_id, 0) + 1
                 shortfall -= 1
@@ -867,6 +897,10 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
             kind = "pair_keyframes"
             taken.add((a, b))
         else:
+            if room.room_type in PAIR_ONLY_ROOM_TYPES:
+                # Allocation is pair-capped, but preserve the editorial rule
+                # if pair selection changes in the future.
+                continue
             unseen = [pid for pid in room.photo_ids if pid not in shown]
             is_closing = i == len(ordered) - 1
             if not unseen and not is_closing:
