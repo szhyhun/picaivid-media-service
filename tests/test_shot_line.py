@@ -15,6 +15,7 @@ from app.pipeline.phase1_analyze.shot_line import (
     build_shot_line,
     pick_hero,
 )
+from app.pipeline.phase1_analyze.editorial import shot_budget
 
 
 def room(room_id, room_type, n_photos, *, quality=0.5, pairs=0, start=100):
@@ -43,9 +44,15 @@ def a_property():
 
 
 class HeroTests(unittest.TestCase):
-    def test_hero_is_the_most_photographed_feature(self):
-        """A photographer taking six photos of one view is telling us something."""
-        self.assertEqual(pick_hero(a_property()).room_id, "aerial")
+    def test_hero_is_the_most_photographed_non_establishing_feature(self):
+        """Aerials and facades establish the property; they are not its hero."""
+        self.assertEqual(pick_hero(a_property()).room_id, "living")
+
+    def test_establishing_feature_is_a_fallback_when_it_is_all_we_have(self):
+        self.assertEqual(
+            pick_hero([room("aerial", "aerial view", 3, start=100)]).room_id,
+            "aerial",
+        )
 
     def test_service_rooms_can_never_be_hero(self):
         rooms = [room("garage", "garage", 20, quality=1.0, start=100),
@@ -60,25 +67,52 @@ class StructureTests(unittest.TestCase):
     def setUp(self):
         self.line = build_shot_line(a_property(), target_seconds=45, bpm=100)
 
-    def test_the_film_opens_in_act_one_and_closes_on_the_hero(self):
+    def test_the_film_opens_in_act_one_and_closes_on_an_exterior(self):
         self.assertEqual(self.line.shots[0].act, 1)
-        self.assertTrue(self.line.shots[-1].is_hero)
+        self.assertIn(self.line.shots[-1].room_type, {
+            "aerial view", "exterior front", "front yard", "building exterior",
+        })
+
+    def test_establishing_material_is_not_repeated_before_the_tour(self):
+        """Aerial/facade images establish the property once, then bookend it."""
+        body = self.line.shots[:-1]
+        establishing = [s for s in body if s.room_type in {
+            "aerial view", "exterior front", "front yard", "building exterior",
+        }]
+        self.assertLessEqual(len(establishing), 2)
 
     def test_acts_do_not_interleave(self):
         """Act 1 establishes, act 2 tours, act 3 closes -- in that order."""
         acts = [s.act for s in self.line.shots if not s.is_hero]
         self.assertEqual(acts, sorted(acts))
 
-    def test_the_hero_is_a_motif_not_a_block(self):
-        """Wallace Dr returned to its view at 4s, 18s and the close. Clustering
-        the hero's shots would read as a slideshow of one room."""
-        idx = [s.index for s in self.line.shots if s.is_hero]
-        self.assertGreater(len(idx), 1)
-        gaps = [b - a for a, b in zip(idx, idx[1:])]
-        self.assertTrue(all(g > 1 for g in gaps), f"hero shots adjacent: {idx}")
+    def test_every_room_is_shown_in_one_continuous_run(self):
+        """You look at a room, then you move on. Cutting away to a bedroom in
+        the middle of the living room and back reads as a shuffle, not a tour.
+
+        This replaces an earlier "hero is a motif" assumption: measuring the
+        reference films showed no mid-film motif, and the owner confirmed a
+        room's shots run consecutively.
+        """
+        # The final shot is a deliberate bookend -- all three reference films
+        # close on an exterior or aerial they have already shown -- so it is
+        # excluded from the continuity rule.
+        body = self.line.shots[:-1]
+        seen_runs = {}
+        for i, shot in enumerate(body):
+            if shot.is_close_up:
+                continue          # a close-up belongs to the run it follows
+            seen_runs.setdefault(shot.room_id, []).append(i)
+        for room_id, positions in seen_runs.items():
+            span = positions[-1] - positions[0] + 1
+            self.assertLessEqual(
+                span - len(positions), 2,
+                f"{room_id} is split across the film: {positions}")
 
     def test_hero_does_not_take_over_the_film(self):
-        hero_shots = sum(s.is_hero for s in self.line.shots)
+        """Allowing the closing bookend and its close-up on top of the cap."""
+        hero_shots = sum(s.is_hero and not s.is_close_up
+                         for s in self.line.shots[:-1])
         self.assertLessEqual(hero_shots, MAX_HERO_SHOTS)
 
     def test_service_rooms_get_one_brief_mention_between_them(self):
@@ -111,6 +145,25 @@ class RhythmTests(unittest.TestCase):
         for a, b in zip(line.shots, line.shots[1:]):
             self.assertAlmostEqual(a.start_seconds + a.duration_seconds,
                                    b.start_seconds, places=2)
+
+    def test_close_up_quota_is_calculated_from_the_finished_cut(self):
+        """C / (W + C), not C / W, is the measured close-up share."""
+        line = build_shot_line(a_property(), target_seconds=45, bpm=100)
+        close_ups = sum(s.is_close_up for s in line.shots)
+        wides = len(line.shots) - close_ups
+        self.assertEqual(close_ups, round(wides * 0.25 / 0.75))
+
+    def test_full_footage_fill_uses_the_requested_grid(self):
+        """When there is enough distinct material, a 45s cut fills its grid."""
+        rooms = [room(f"room-{i}", f"type-{i}", 1, start=1000 + i)
+                 for i in range(25)]
+        line = build_shot_line(rooms, target_seconds=45, bpm=100)
+        self.assertEqual(len(line.shots), shot_budget(45, 100))
+        self.assertAlmostEqual(
+            line.duration,
+            shot_budget(45, 100) * line.shots[0].duration_seconds,
+            places=2,
+        )
 
 
 class KeyframeTests(unittest.TestCase):

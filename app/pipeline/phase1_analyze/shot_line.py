@@ -28,16 +28,16 @@ about 1.5s, but the owner's instruction is explicit and repeated, and
 `allow_service=True` remains for the studio-apartment case where excluding them
 would leave nothing to cut.
 
-Known gap: the films contain **detail shots** -- a garden close-up opening the
-film, details within the living room, flowers in the backyard. Those are a shot
-type this module has no concept of, because nothing upstream identifies a photo
-as a detail rather than a room view. See VIDEO_PRODUCTION_PLAN.md.
+Close-ups are manufactured from selected wide frames after this line is built.
+They remain tied to the room and frame immediately before them, so the detail
+reads as a continuation rather than an unrelated image.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
 from app.pipeline.phase1_analyze.camera_move import CameraMove, choose_move
+from app.pipeline.phase1_analyze.detail_crop import close_up_rate
 from app.pipeline.phase1_analyze.editorial import (
     MIN_SHOTS,
     Tier,
@@ -51,7 +51,7 @@ from app.pipeline.phase1_analyze.editorial import (
 # distribute shots when a property has more rooms than the budget allows.
 # Anything not listed falls to DEFAULT_WEIGHT.
 DWELL_WEIGHT: dict[str, float] = {
-    "aerial view": 2.1,        # the hero motif in the reference film
+    "aerial view": 0.8,        # an establishing/bookend image, not a motif
     "patio": 2.1,
     "pool": 2.1,
     "backyard": 1.6,
@@ -73,8 +73,8 @@ DWELL_WEIGHT: dict[str, float] = {
 DEFAULT_WEIGHT = 0.6
 SERVICE_WEIGHT = 0.25          # garage got 3% of runtime: present, minimal
 
-# The hero is revisited, not dwelt on: Wallace Dr showed its view four times
-# across 35 shots. More than that and the film stops being a property tour.
+# No individual selling feature should take over the film. The strongest room
+# may receive up to four consecutive looks, but never a mid-film return.
 MAX_HERO_SHOTS = 4
 # One short service beat for the whole film, as observed.
 MAX_SERVICE_SHOTS = 1
@@ -107,7 +107,6 @@ DEFAULT_MAX_ROOMS_PER_TYPE = 2
 # the very start and end -- the opening approach and the closing run are wides --
 # so they are inserted through the body of the film only.
 CLOSE_UP_SHARE = 0.25
-CLOSE_UP_EVERY = 3          # insert after every Nth eligible wide shot
 # A close-up must belong to the room it follows: cutting from a wide living room
 # to that same living room's fireplace reads as one continuous look, whereas a
 # detail from elsewhere reads as an unrelated picture.
@@ -132,7 +131,7 @@ CLOSE_UP_EVERY = 3          # insert after every Nth eligible wide shot
 #    and where it appears it either opens the film or closes it. Treating it as
 #    a mid-film motif was wrong.
 STORY_POSITION: dict[str, float] = {
-    "aerial view": 0.02,        # opens the film where present; see AERIAL_CLOSES
+    "aerial view": 0.02,        # opens the film where present
     # The measurement merged front yard, exterior front and building exterior
     # into one EXT-FRONT bucket at 0.05, so it says nothing about their internal
     # order. Spatial logic settles it: you arrive from the street, reach the
@@ -164,8 +163,6 @@ DEFAULT_POSITION = 0.5
 
 # All three films close outdoors or on an exterior; two end on the front
 # exterior as the literal last shot. Where a property has aerials, they bookend.
-AERIAL_CLOSES = True
-
 # A human-labelled room instance ("bedroom-a", "exterior-front", "patio-back")
 # names its own type far more reliably than the classifier does. The classifier
 # runs ~82% accurate, so ordering by its guess put roughly one room in five into
@@ -257,6 +254,8 @@ class Shot:
     # coordinates on `photo_ids[0]`; None means the whole frame is used.
     is_close_up: bool = False
     crop_box: tuple[int, int, int, int] | None = None
+    crop_score: float | None = None
+    source_size: tuple[int, int] | None = None
 
     @property
     def uses_keyframes(self) -> bool:
@@ -287,18 +286,22 @@ class ShotLine:
 
 
 def pick_hero(rooms: list[RoomCandidate]) -> RoomCandidate | None:
-    """Identify the property's selling point.
+    """Identify the property's strongest feature for dwell allocation.
 
-    In the reference film the ocean view is revisited three times and takes 21%
-    of runtime. Which room deserves that is property-specific, so it is inferred
-    rather than hard-coded: the feature room the photographer shot most, broken
-    by quality. A photographer taking six photos of one view is telling us
-    something.
+    This is not a recurring motif. It is the feature room allowed the most
+    consecutive coverage when the listing has enough distinct material.
+    Photographer coverage remains useful evidence, but an aerial or front
+    facade belongs at the bookends even when the photographer supplied many of
+    them. Prefer the strongest non-establishing selling space whenever one
+    exists; fall back to an establishing feature only for an exterior-only set.
     """
     features = [r for r in rooms if r.tier is Tier.FEATURE]
     if not features:
         return None
-    return max(features, key=lambda r: (len(r.photo_ids), r.quality))
+    establishing = {"aerial view", "exterior front", "front yard",
+                    "building exterior"}
+    story_features = [r for r in features if r.room_type not in establishing]
+    return max(story_features or features, key=lambda r: (len(r.photo_ids), r.quality))
 
 
 def _weight(room: RoomCandidate, hero_id: str | None) -> float:
@@ -306,7 +309,7 @@ def _weight(room: RoomCandidate, hero_id: str | None) -> float:
         return SERVICE_WEIGHT
     base = DWELL_WEIGHT.get(room.room_type, DEFAULT_WEIGHT)
     if room.room_id == hero_id:
-        base *= 1.5        # the hero is revisited, so it earns extra shots
+        base *= 1.5        # the strongest feature earns extra coverage
     return base
 
 
@@ -331,9 +334,9 @@ def allocate_shots(rooms: list[RoomCandidate], budget: int,
     # A room cannot show more shots than it has material for: a pair is one shot
     # and a single photo is one shot, so the cap is the photo count.
     for room in rooms:
+        cap = MAX_HERO_SHOTS if room.room_id == hero_id else MAX_SHOTS_PER_ROOM
         alloc[room.room_id] = min(alloc[room.room_id],
-                                  max(1, len(room.photo_ids)),
-                                  MAX_SHOTS_PER_ROOM)
+                                  max(1, len(room.photo_ids)), cap)
 
     # Hand out any remainder to the strongest rooms, then trim any overshoot
     # from the weakest, so the total lands exactly on the budget.
@@ -348,6 +351,19 @@ def allocate_shots(rooms: list[RoomCandidate], budget: int,
         while sum(alloc.values()) > budget and alloc[room.room_id] > 0:
             alloc[room.room_id] -= 1
     return alloc
+
+
+# A suite, guest annexe or secondary unit is shown after the main house has been
+# shown, not interleaved with it. Cutting from the main living room to the suite
+# living room and back implies they are the same space.
+_SECONDARY_MARKERS = ("suite", "secondary", "guest", "annex", "basement-",
+                      "lower-", "in-law", "studio-")
+
+
+def is_secondary(room: RoomCandidate) -> bool:
+    """Whether this room belongs to a secondary unit rather than the main home."""
+    name = (room.room_id or "").strip().lower()
+    return any(marker in name for marker in _SECONDARY_MARKERS)
 
 
 def story_position(room: RoomCandidate) -> float:
@@ -384,10 +400,11 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     # with four bathrooms should show the best two, not all of them equally.
     kept: list[RoomCandidate] = []
     seen: dict[str, int] = {}
+    initial_hero = pick_hero(eligible)
     for room in sorted(eligible, key=lambda r: (-len(r.pairs), -r.quality,
                                                 -len(r.photo_ids))):
         cap = MAX_ROOMS_PER_TYPE.get(room.room_type, DEFAULT_MAX_ROOMS_PER_TYPE)
-        if room.room_id == (pick_hero(eligible).room_id if eligible else None):
+        if room.room_id == (initial_hero.room_id if initial_hero else None):
             cap = max(cap, 1)          # the hero always survives its own cap
         if seen.get(room.room_type, 0) < cap:
             seen[room.room_type] = seen.get(room.room_type, 0) + 1
@@ -451,13 +468,22 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
 
     shortfall = budget - sum(alloc.values())
     if shortfall > 0:
-        takers = sorted((r for r in eligible if r.tier is Tier.FEATURE),
+        # The approach cap is editorial, not a temporary allocation limit. Do
+        # not refill it with a second aerial/facade after deliberately reducing
+        # that opening to one look. Spend the capacity in the property tour;
+        # an exterior-only listing can still fall back to its establishing work.
+        takers = [r for r in eligible
+                  if r.tier is Tier.FEATURE and _act_of(r) != 1]
+        if not takers:
+            takers = [r for r in eligible if r.tier is Tier.FEATURE]
+        takers = sorted(takers,
                         key=lambda r: (-_weight(r, hero_id), -r.quality))
         i = 0
         while shortfall > 0 and takers and i < len(takers) * 6:
             room = takers[i % len(takers)]
-            cap = (MAX_HERO_SHOTS if room.room_id == hero_id
-                   else min(len(room.photo_ids), MAX_SHOTS_PER_ROOM))
+            cap = min(len(room.photo_ids),
+                      MAX_HERO_SHOTS if room.room_id == hero_id
+                      else MAX_SHOTS_PER_ROOM)
             if alloc.get(room.room_id, 0) < cap:
                 alloc[room.room_id] = alloc.get(room.room_id, 0) + 1
                 shortfall -= 1
@@ -466,30 +492,17 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     per_shot = shot_seconds(bpm)
     by_id = {r.room_id: r for r in eligible}
 
-    # Lay rooms out in act order, then interleave repeats so a revisited room
-    # comes back later in the film rather than showing twice in a row.
+    # Lay every room out as one continuous run in measured story order.
     ordered: list[tuple[int, RoomCandidate]] = []
     for act in (1, 2, 3):
         members = sorted((r for r in eligible if _act_of(r) == act),
-                         key=lambda r: (_rank_in_act(r), -r.quality))
-        # The approach is walked once. Repeating a front yard after the entrance
-        # would step back outside halfway through going in.
-        passes = 1 if act == 1 else max(
-            (alloc.get(r.room_id, 0) for r in members), default=0)
-        for p in range(passes):
-            wave = [r for r in members if alloc.get(r.room_id, 0) > p]
-            # The reference film alternates -- bedroom, bath, bedroom -- rather
-            # than showing every bathroom back to back. Spread same-type rooms
-            # so no two neighbours share a type where the material allows it.
-            spread: list[RoomCandidate] = []
-            pending = list(wave)
-            while pending:
-                pick = next((r for r in pending
-                             if not spread or r.room_type != spread[-1].room_type),
-                            pending[0])
-                pending.remove(pick)
-                spread.append(pick)
-            ordered.extend((act, room) for room in spread)
+                         key=lambda r: (is_secondary(r), _rank_in_act(r), -r.quality))
+        # Every shot of a room runs consecutively. Cutting away to a bedroom in
+        # the middle of the living room and back again reads as a shuffle, not a
+        # tour: you look at a room, then you move on.
+        for room in members:
+            for _ in range(alloc.get(room.room_id, 0)):
+                ordered.append((act, room))
 
     # No mid-film hero motif. The measurement does not support one: aerial is
     # absent from Anthony Pl entirely and bookends the other two, while the
@@ -518,20 +531,33 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         # several photos can supply several disjoint pairs, one per appearance;
         # only once those run out do we fall back to a single image.
         taken = used_pair.setdefault(room.room_id, set())
+        # Every photograph this room has already put on screen, in a pair or
+        # alone. Reusing one is what produced a pair shot followed by a single
+        # of the same photo -- a duplicate of a frame the viewer just watched.
+        shown = {pid for shot in shots if shot.room_id == room.room_id
+                 for pid in shot.photo_ids}
         pair = next((p for p in room.pairs
-                     if (p[0], p[1]) not in taken
-                     and not (taken and {p[0], p[1]} & {x for t in taken for x in t})),
+                     if (p[0], p[1]) not in taken and not ({p[0], p[1]} & shown)),
                     None)
         if pair is None:
-            pair = next((p for p in room.pairs if (p[0], p[1]) not in taken), None)
+            pair = next((p for p in room.pairs
+                         if (p[0], p[1]) not in taken
+                         and not (taken and {p[0], p[1]} & {x for t in taken for x in t})),
+                        None)
         if pair is not None:
             a, b, _ = pair
             photo_ids = [a, b]
             kind = "pair_keyframes"
             taken.add((a, b))
         else:
-            offset = sum(1 for s in shots if s.room_id == room.room_id)
-            photo_ids = [room.photo_ids[offset % len(room.photo_ids)]]
+            unseen = [pid for pid in room.photo_ids if pid not in shown]
+            is_closing = i == len(ordered) - 1
+            if not unseen and not is_closing:
+                # Nothing new left to show: skip rather than repeat a frame.
+                continue
+            # The closing shot is a deliberate return to the property's face, so
+            # it may reuse a frame where an ordinary repeat would not.
+            photo_ids = [unseen[0] if unseen else room.photo_ids[0]]
             kind = "single_image"
         establishing = room.room_type in ("aerial view", "exterior front",
                                           "front yard", "building exterior")
@@ -548,14 +574,22 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     return ShotLine(shots=shots, bpm=bpm, hero_room_id=hero_id, dropped_rooms=dropped)
 
 
+def _unit_for(seed: str) -> float:
+    """Deterministic value in [0,1) so a listing always produces the same film."""
+    import hashlib
+
+    digest = hashlib.sha256(seed.encode()).digest()
+    return int.from_bytes(digest[:4], "big") / 2**32
+
+
 def _insert_close_ups(shots: list[Shot], per_shot: float) -> list[Shot]:
-    """Add a close-up after roughly every third shot, sourced from that shot.
+    """Add a measured share of close-ups, sourced from their preceding shot.
 
     The close-up is a crop of the frame immediately before it, which is what
     makes the pair read as one continuous look rather than two pictures. The
-    crop box itself is filled in later by `detail_crop.details_for_rooms`, which
-    needs the image; a shot marked `is_close_up` with `crop_box` still None is a
-    request that the crop finder has not yet answered.
+    crop box itself is filled in later by `detail_crop.resolve_close_up_crops`,
+    which needs the image; a shot marked `is_close_up` with `crop_box` still
+    None is a request that the crop finder has not yet answered.
 
     The opening approach and the closing run stay wide: the reference films thin
     their close-ups out at both ends.
@@ -565,27 +599,55 @@ def _insert_close_ups(shots: list[Shot], per_shot: float) -> list[Shot]:
 
     head = 2                      # leave the approach alone
     tail = max(1, len(shots) // 8)  # and the close
+
+    # The measured per-room rates were taken from films whose room mix differed
+    # from any given listing's. Pick an exact count from the actual wide line:
+    # a 25% close-up share means C / (W + C) = 0.25, or C = W / 3. Earlier code
+    # requested 25% of W, which produced only 20% of the finished film.
+    eligible = [(idx, shot) for idx, shot in enumerate(shots)
+                if head <= idx < len(shots) - tail and close_up_rate(shot.room_type) > 0]
+    wanted = min(round(len(shots) * CLOSE_UP_SHARE / (1.0 - CLOSE_UP_SHARE)),
+                 len(eligible))
+    if wanted == 0:
+        return shots
+
+    # Weighted sampling without replacement, but seeded from the room and
+    # position. It gives kitchen/outdoor shots their measured higher chance
+    # without making every film of the same room mix look mechanically alike.
+    import math
+    chosen_indices = {
+        index
+        for index, shot in sorted(
+            eligible,
+            key=lambda candidate: -math.log(max(_unit_for(
+                f"{candidate[1].room_id}:{candidate[0]}:closeup"), 1e-12))
+            / close_up_rate(candidate[1].room_type),
+        )[:wanted]
+    }
+
     out: list[Shot] = []
-    since = 0
     for i, shot in enumerate(shots):
         out.append(shot)
-        in_body = head <= i < len(shots) - tail
-        since += 1
-        if in_body and since >= CLOSE_UP_EVERY and not shot.is_close_up:
-            out.append(Shot(
-                index=-1,                     # renumbered below
-                room_id=shot.room_id,
-                room_type=shot.room_type,
-                photo_ids=[shot.photo_ids[0]],
-                kind="single_image",          # a crop has one source frame
-                act=shot.act,
-                start_seconds=0.0,
-                duration_seconds=per_shot,
-                move=choose_move(f"{shot.room_id}:closeup:{i}"),
-                is_hero=shot.is_hero,
-                is_close_up=True,
-            ))
-            since = 0
+        if not (head <= i < len(shots) - tail) or shot.is_close_up:
+            continue
+        # Selection is weighted by each room type's measured close-up rate and
+        # deterministic for this listing. It is not a fixed every-third-shot
+        # cadence, which systematically underrepresents short kitchen runs.
+        if i not in chosen_indices:
+            continue
+        out.append(Shot(
+            index=-1,
+            room_id=shot.room_id,
+            room_type=shot.room_type,
+            photo_ids=[shot.photo_ids[0]],
+            kind="single_image",
+            act=shot.act,
+            start_seconds=0.0,
+            duration_seconds=per_shot,
+            move=choose_move(f"{shot.room_id}:closeup:{i}"),
+            is_hero=shot.is_hero,
+            is_close_up=True,
+        ))
 
     cursor = 0.0
     renumbered: list[Shot] = []

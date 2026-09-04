@@ -67,6 +67,49 @@ _Y_POSITIONS = (0.15, 0.35, 0.55, 0.75)
 # exteriors with planting score +0.01..+0.04, plain interiors score negative.
 MIN_DETAIL_SCORE = 0.005
 
+# How often each kind of room earns a close-up, measured by scoring every shot
+# in the three reference films for close-up-ness and cross-tabulating against
+# its room classification:
+#
+#   ENTRY 36%   KITCHEN 35%   OUTDOOR 32%   BEDROOM 21%   BATH 21%
+#   LIVING 20%  DINING 14%    SERVICE 20%   EXTERIOR 0%   AERIAL 0%
+#
+# Two things this corrected. Bedrooms and bathrooms *do* get close-ups -- a
+# faucet, a lamp, a folded towel -- so excluding them was wrong and cost us the
+# overall rate. And aerials and wide exteriors get none at all, which makes
+# sense: at that distance there is no detail subject to crop to.
+CLOSE_UP_RATE_BY_ROOM: dict[str, float] = {
+    "entrance": 0.36,
+    "hallway": 0.36,
+    "shared space": 0.36,
+    "kitchen": 0.35,
+    "patio": 0.32,
+    "pool": 0.32,
+    "backyard": 0.32,
+    "exterior back": 0.32,
+    "amenities": 0.32,
+    "bedroom": 0.21,
+    "bathroom": 0.21,
+    "living room": 0.20,
+    "office": 0.20,
+    "dining room": 0.14,
+    "garage": 0.20,
+    "storage": 0.20,
+    "laundry room": 0.20,
+    # No close-up subject exists at this distance.
+    "aerial view": 0.0,
+    "exterior front": 0.0,
+    "front yard": 0.0,
+    "building exterior": 0.0,
+}
+DEFAULT_CLOSE_UP_RATE = 0.20
+
+
+def close_up_rate(room_type: str | None) -> float:
+    """How often this kind of room earns a close-up, from the reference films."""
+    return CLOSE_UP_RATE_BY_ROOM.get(
+        (room_type or "").strip().lower(), DEFAULT_CLOSE_UP_RATE)
+
 
 @dataclass(frozen=True)
 class DetailCrop:
@@ -143,62 +186,103 @@ def find_detail(image, model, preprocess, detail_centroid, non_detail_centroid,
 
     boxes = candidate_boxes(*image.size)
     crops = [image.crop((x, y, x + w, y + h)) for x, y, w, h in boxes]
+    try:
+        batch = torch.stack([preprocess(c) for c in crops])
+    finally:
+        for crop in crops:
+            crop.close()
+    device = getattr(model, "device", None) or next(model.parameters()).device
     with torch.no_grad():
-        features = model.encode_image(torch.stack([preprocess(c) for c in crops]))
+        features = model.encode_image(batch.to(device))
         features = features / features.norm(dim=-1, keepdim=True)
     scores = score_crops(features.cpu().numpy(), detail_centroid, non_detail_centroid)
     return best_crop(boxes, scores, min_score=min_score)
 
 
-def details_for_rooms(
-    room_photos: dict[str, list[int]],
-    image_loader,
-    model,
-    preprocess,
-    detail_centroid: np.ndarray,
-    non_detail_centroid: np.ndarray,
-    *,
-    prefer: dict[str, list[int]] | None = None,
-    min_score: float = MIN_DETAIL_SCORE,
-) -> dict[str, tuple[int, DetailCrop]]:
-    """Find one detail per room, sourced from that room's own photographs.
+def resolve_close_up_crops(shots, photo_uri, *, min_score: float = MIN_DETAIL_SCORE):
+    """Fill in the crop box for every close-up shot in a line.
 
-    `room_photos` maps a room id to the photo ids that belong to it, and
-    `prefer` optionally names the photos already chosen for that room's wide
-    shots -- those are searched first, because a close-up cut from the very frame
-    the viewer just saw reads as the same look continuing rather than as a jump
-    to somewhere new.
+    `shots` are mutated in place -- each close-up gets the box the crop finder
+    chose within its own source frame, or is left with `crop_box=None` if that
+    frame has nothing worth cropping into. `photo_uri` maps a photo id to its S3
+    URI.
 
-    Returns room id -> (source photo id, crop). Rooms whose photographs contain
-    nothing worth cropping into are simply absent, so the planner schedules no
-    detail beat for them.
+    Only close-up shots are searched, and each is searched only inside the frame
+    it follows, so the cost is one image load and one batch of candidate windows
+    per close-up rather than a scan of the listing.
     """
     import torch
 
-    found: dict[str, tuple[int, DetailCrop]] = {}
-    for room_id, photo_ids in room_photos.items():
-        ordered = list(dict.fromkeys((prefer or {}).get(room_id, []) + list(photo_ids)))
-        best: tuple[int, DetailCrop] | None = None
-        for photo_id in ordered:
-            image = image_loader(photo_id)
-            if image is None:
-                continue
-            boxes = candidate_boxes(*image.size)
-            crops = [image.crop((x, y, x + w, y + h)) for x, y, w, h in boxes]
-            with torch.no_grad():
-                features = model.encode_image(
-                    torch.stack([preprocess(c) for c in crops]))
-                features = features / features.norm(dim=-1, keepdim=True)
-            scores = score_crops(features.cpu().numpy(),
-                                 detail_centroid, non_detail_centroid)
-            crop = best_crop(boxes, scores, min_score=min_score)
-            if crop is not None and (best is None or crop.score > best[1].score):
-                best = (photo_id, crop)
-            # A preferred frame that already yields a good detail wins outright:
-            # continuity with the shot just seen beats a marginally prettier crop
-            # from elsewhere in the room.
-            if best is not None and photo_id in (prefer or {}).get(room_id, []):
-                break
-        if best is not None:
-            found[room_id] = best
-    return found
+    from app.models.openclip import openclip_model
+    from app.services.storage.s3_client import s3_client
+
+    close_ups = [s for s in shots if getattr(s, "is_close_up", False)]
+    if not close_ups:
+        return shots
+
+    openclip_model._ensure_loaded()
+    model = openclip_model._model
+    preprocess = openclip_model._preprocess
+    tokenizer = openclip_model._tokenizer
+    # The singleton keeps the model on MPS where available, so inputs have to be
+    # moved to match or torch raises "Placeholder storage has not been allocated".
+    device = openclip_model._device
+
+    def centroid(prompts):
+        with torch.no_grad():
+            e = model.encode_text(tokenizer(list(prompts)).to(device))
+            e = e / e.norm(dim=-1, keepdim=True)
+            f = e.mean(0, keepdim=True)
+            return (f / f.norm(dim=-1, keepdim=True)).cpu().numpy()[0]
+
+    detail_c = centroid(DETAIL_PROMPTS)
+    plain_c = centroid(NON_DETAIL_PROMPTS)
+
+    # Retain crop decisions, never decoded full-resolution images. A 50-photo
+    # listing can otherwise leave hundreds of MB of PIL buffers live while the
+    # review request is running.
+    cache: dict[int, tuple[DetailCrop | None, tuple[int, int] | None]] = {}
+    for shot in close_ups:
+        photo_id = shot.photo_ids[0]
+        if photo_id not in cache:
+            uri = photo_uri.get(photo_id)
+            try:
+                image = s3_client.download_image(uri) if uri else None
+                if image is None:
+                    cache[photo_id] = (None, None)
+                else:
+                    try:
+                        cache[photo_id] = (
+                            find_detail(image, model, preprocess, detail_c, plain_c,
+                                        min_score=min_score),
+                            image.size,
+                        )
+                    finally:
+                        image.close()
+            except Exception:
+                cache[photo_id] = (None, None)
+        crop, source_size = cache[photo_id]
+        if crop is not None:
+            shot.crop_box = crop.box
+            shot.crop_score = crop.score
+            shot.source_size = source_size
+    return shots
+
+
+def drop_unresolved_close_ups(shots):
+    """Remove close-ups whose source frame had nothing worth cropping into.
+
+    A close-up that never got a crop box would render as a second copy of the
+    wide shot before it -- the same picture twice, which is worse than not
+    having the beat at all. Timings are recomputed so the grid stays contiguous.
+    """
+    from dataclasses import replace
+
+    kept = [s for s in shots
+            if not getattr(s, "is_close_up", False) or s.crop_box is not None]
+    out = []
+    cursor = 0.0
+    for index, shot in enumerate(kept):
+        out.append(replace(shot, index=index, start_seconds=round(cursor, 3)))
+        cursor += shot.duration_seconds
+    return out

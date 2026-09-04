@@ -505,6 +505,10 @@ async def get_project_shot_line(
     """
     from scripts.build_shot_line import load_rooms
     from app.pipeline.phase1_analyze.shot_line import build_shot_line
+    from app.pipeline.phase1_analyze.detail_crop import (
+        drop_unresolved_close_ups,
+        resolve_close_up_crops,
+    )
 
     try:
         rooms, source = load_rooms(db, project_id)
@@ -513,6 +517,25 @@ async def get_project_shot_line(
                 "source": "no analysis yet"}
 
     line = build_shot_line(rooms, target_seconds=seconds, bpm=bpm)
+
+    # Resolve where each close-up actually crops into its source frame, so the
+    # review UI can show the box rather than a duplicate thumbnail. Only close-up
+    # shots are searched and only inside the frame they follow.
+    if line.shots:
+        uri_rows = db.query(JobPhoto).filter(
+            JobPhoto.id.in_([s.photo_ids[0] for s in line.shots if s.is_close_up])
+        ).all()
+        if uri_rows:
+            try:
+                resolve_close_up_crops(
+                    line.shots, {int(p.id): p.s3_uri for p in uri_rows})
+            except Exception:
+                # The planning view is still useful without optional detail
+                # crops. Never turn a model/download failure into a 500 here.
+                logger.exception("Could not resolve close-up crops for %s", project_id)
+            # A close-up with no crop would render as the same picture twice.
+            line.shots = drop_unresolved_close_ups(line.shots)
+
     photo_rows = db.query(JobPhoto).filter(
         JobPhoto.id.in_([p for shot in line.shots for p in shot.photo_ids])
     ).all() if line.shots else []
@@ -548,7 +571,18 @@ async def get_project_shot_line(
             "is_hero": s.is_hero,
             "start_seconds": s.start_seconds,
             "duration_seconds": s.duration_seconds,
+            "is_close_up": s.is_close_up,
+            "crop_box": list(s.crop_box) if s.crop_box else None,
+            "source_size": list(s.source_size) if s.source_size else None,
+            # Fractions per second, so the UI can draw the motion rather than
+            # only name it.
             "move": s.move.label,
+            "move_vector": {
+                "zoom": round(s.move.zoom, 4),
+                "pan": round(s.move.pan, 4),
+                "tilt": round(s.move.tilt, 4),
+                "roll_deg": round(s.move.roll_deg, 3),
+            },
             "photos": [photo_payload(p) for p in s.photo_ids],
         } for s in line.shots],
     }
