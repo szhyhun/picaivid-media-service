@@ -370,6 +370,13 @@ def _story_role(cluster: RoomCluster, photos: list[JobPhoto], hero: JobPhoto) ->
         return "outdoor_payoff"
     if any(token in label for token in ("front", "exterior", "facade")):
         return "front_exterior"
+    # Apartment listings: shared circulation reads as the approach, and shared
+    # amenities are a selling feature in their own right rather than a service
+    # space -- for a condo the gym and lounge are much of the pitch.
+    if "shared" in label:
+        return "approach_entry"
+    if "amenit" in label:
+        return "social_hero" if _editorial_role(hero) == "hero" else "social_room"
     if any(token in label for token in ("entry", "entrance", "foyer", "hall", "stair")):
         return "approach_entry"
     if any(token in label for token in ("living", "kitchen", "dining", "great room")):

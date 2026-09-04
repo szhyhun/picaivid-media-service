@@ -19,6 +19,9 @@ ROOM_TYPES = [
     "laundry room",
     "bathroom",
     "storage",
+    "amenities",
+    "shared space",
+    "building exterior",
     "dining room",
     "office",
     "garage",
@@ -33,7 +36,6 @@ ROOM_TYPES = [
     "exterior front",
     "exterior back",
     "aerial view",
-    "drone shot",
 ]
 
 ROOM_PROMPTS = {
@@ -66,6 +68,25 @@ ROOM_PROMPTS = {
         "a photo of a bathroom",
         "a real estate photo of a bathroom with sink vanity mirror shower or toilet",
         "an interior listing photo of a bathroom",
+    ],
+    # Apartment and condo listings, which the single-family taxonomy missed
+    # entirely. Ground-truth labelling of an apartment produced "amenities",
+    # "shared-territory" and "building-front" -- categories the classifier could
+    # not express, so those photos were guaranteed wrong.
+    "amenities": [
+        "a photo of a building gym or fitness room",
+        "a photo of a shared residents lounge or clubhouse",
+        "a photo of a building amenity room such as a games room or media room",
+    ],
+    "shared space": [
+        "a photo of a shared apartment building corridor or lobby",
+        "a photo of a communal courtyard or shared outdoor area of an apartment building",
+        "a photo of a shared entrance lobby with mailboxes or an elevator",
+    ],
+    "building exterior": [
+        "a photo of the exterior facade of an apartment or condo building",
+        "a street view of a multi-unit residential building",
+        "an exterior photo of a low rise apartment block",
     ],
     "storage": [
         "a photo of shelving stacked with boxes and stored items",
@@ -130,12 +151,16 @@ ROOM_PROMPTS = {
         "a photo of the rear exterior of a house",
         "a real estate photo of the back facade of a home seen from the garden",
     ],
+    # "drone shot" was folded in here: it duplicated this category (its prompts
+    # were near-identical, and one of them already lived in this list), and it
+    # won 3 photos against aerial view's 263. A four-way split into
+    # front/back/general/roof was measured and rejected -- 30 of 32 aerial
+    # photos collapsed onto "general" with a median top-1/top-2 margin of 0.016,
+    # i.e. noise. Front vs back is not a visual property of an aerial frame.
     "aerial view": [
         "an aerial photo of a house and its lot",
         "a drone photo looking down on a residential property and neighbourhood",
         "a high angle aerial view of houses and streets",
-    ],
-    "drone shot": [
         "a drone photograph of a property from above",
         "an aerial drone view of a house, roof and surrounding land",
     ],

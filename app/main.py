@@ -491,6 +491,69 @@ def _job_progress_payload(project_id: str, job) -> JobProgressResponse:
     )
 
 
+@app.get("/api/projects/{project_id}/shot-line")
+async def get_project_shot_line(
+    project_id: str,
+    seconds: float = 45.0,
+    bpm: float = 100.0,
+    db: Session = Depends(get_db),
+):
+    """The ordered shot line: what the film would be, before anything is rendered.
+
+    Exists so the story order can be reviewed before paying for video
+    generation, which is by far the most expensive step.
+    """
+    from scripts.build_shot_line import load_rooms
+    from app.pipeline.phase1_analyze.shot_line import build_shot_line
+
+    try:
+        rooms, source = load_rooms(db, project_id)
+    except SystemExit:
+        return {"project_id": project_id, "shots": [], "rooms": 0,
+                "source": "no analysis yet"}
+
+    line = build_shot_line(rooms, target_seconds=seconds, bpm=bpm)
+    photo_rows = db.query(JobPhoto).filter(
+        JobPhoto.id.in_([p for shot in line.shots for p in shot.photo_ids])
+    ).all() if line.shots else []
+    photo_map = {int(p.id): p for p in photo_rows}
+
+    def photo_payload(pid: int):
+        photo = photo_map.get(int(pid))
+        if photo is None:
+            return {"id": pid, "thumbnail_url": None, "position": None}
+        return {
+            "id": int(photo.id),
+            "thumbnail_url": _signed_url(photo.s3_uri),
+            "position": photo.position,
+            "room_label": photo.room_label,
+        }
+
+    return {
+        "project_id": project_id,
+        "source": source,
+        "rooms": len(rooms),
+        "bpm": line.bpm,
+        "shot_seconds": line.shots[0].duration_seconds if line.shots else 0,
+        "duration": round(line.duration, 2),
+        "hero_room_id": line.hero_room_id,
+        "keyframe_fraction": round(line.keyframe_fraction(), 3),
+        "dropped_rooms": line.dropped_rooms,
+        "shots": [{
+            "index": s.index,
+            "act": s.act,
+            "room_id": s.room_id,
+            "room_type": s.room_type,
+            "kind": s.kind,
+            "is_hero": s.is_hero,
+            "start_seconds": s.start_seconds,
+            "duration_seconds": s.duration_seconds,
+            "move": s.move.label,
+            "photos": [photo_payload(p) for p in s.photo_ids],
+        } for s in line.shots],
+    }
+
+
 @app.get("/api/projects/{project_id}/progress", response_model=JobProgressResponse)
 async def get_project_progress(project_id: str, db: Session = Depends(get_db)):
     """Live progress for the newest job on a project. Safe to poll."""

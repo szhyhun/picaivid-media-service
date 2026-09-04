@@ -41,8 +41,10 @@ class _Photo:
 
 EXPECTED = {
     "aerial view": "drone_opener",
-    "drone shot": "drone_opener",
     "exterior front": "front_exterior",
+    "building exterior": "front_exterior",
+    "shared space": "approach_entry",
+    "amenities": "social_room",
     "front yard": "front_exterior",
     "exterior back": "outdoor_payoff",
     "backyard": "outdoor_payoff",
