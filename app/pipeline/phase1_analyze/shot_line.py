@@ -97,6 +97,13 @@ MAX_ROOMS_PER_TYPE: dict[str, int] = {
 }
 DEFAULT_MAX_ROOMS_PER_TYPE = 2
 
+# A later kitchen is editorially a separate unit only after a meaningful gap in
+# the uploaded capture sequence. This keeps a main kitchen split across two VGGT
+# components together while moving a later in-law/suite kitchen behind the main
+# home. It is a story heuristic, never geometry or membership evidence.
+SECONDARY_KITCHEN_GAP = 8
+SECONDARY_KITCHEN_POSITION = 0.68
+
 # Close-ups, measured by scoring every shot in the three reference films against
 # the wide-room centroid and taking each film's top quartile:
 #
@@ -227,6 +234,11 @@ class RoomCandidate:
     # A room with several photos often yields several disjoint pairs, and each
     # one can anchor a separate shot -- two real endpoints beat one every time.
     pairs: list[tuple[int, int, float]] = field(default_factory=list)
+    # Geometry components may span open-plan labels. These fields preserve the
+    # semantic zone and capture order without pretending they are new geometry.
+    photo_positions: dict[int, int] = field(default_factory=dict)
+    parent_component_id: int | None = None
+    secondary: bool = False
 
     @property
     def best_pair(self) -> tuple[int, int, float] | None:
@@ -369,12 +381,16 @@ _SECONDARY_MARKERS = ("suite", "secondary", "guest", "annex", "basement-",
 
 def is_secondary(room: RoomCandidate) -> bool:
     """Whether this room belongs to a secondary unit rather than the main home."""
+    if room.secondary:
+        return True
     name = (room.room_id or "").strip().lower()
     return any(marker in name for marker in _SECONDARY_MARKERS)
 
 
 def story_position(room: RoomCandidate) -> float:
     """Where this room belongs in the film, from the measured medians."""
+    if room.secondary and room.room_type == "kitchen":
+        return SECONDARY_KITCHEN_POSITION
     return STORY_POSITION.get(room.room_type, DEFAULT_POSITION)
 
 
@@ -396,10 +412,93 @@ def _rank_in_act(room: RoomCandidate) -> int:
     return int(story_position(room) * 1000)
 
 
+def _room_start(room: RoomCandidate) -> int:
+    """Earliest capture position, with photo id as deterministic fixture fallback."""
+    positions = [room.photo_positions.get(photo_id, photo_id) for photo_id in room.photo_ids]
+    return min(positions) if positions else 0
+
+
+def _mark_secondary_kitchens(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
+    """Move a clearly later kitchen run behind the main-home story.
+
+    Two adjacent kitchen components often represent one open-plan main kitchen,
+    so the first contiguous capture run stays primary. A kitchen that starts only
+    after a gap is a separate unit for ordering purposes. No CLIP similarity or
+    component merge can override this editorial distinction.
+    """
+    copies = [replace(room, secondary=is_secondary(room)) for room in rooms]
+    kitchens = sorted(
+        (room for room in copies if room.room_type == "kitchen" and room.photo_ids),
+        key=lambda room: (_room_start(room), room.room_id),
+    )
+    if not kitchens:
+        return copies
+
+    primary = kitchens[0]
+    primary_end = max(
+        primary.photo_positions.get(photo_id, photo_id)
+        for photo_id in primary.photo_ids
+    )
+    for kitchen in kitchens[1:]:
+        start = _room_start(kitchen)
+        if start <= primary_end + SECONDARY_KITCHEN_GAP:
+            primary_end = max(
+                primary_end,
+                max(kitchen.photo_positions.get(photo_id, photo_id)
+                    for photo_id in kitchen.photo_ids),
+            )
+        else:
+            kitchen.secondary = True
+    return copies
+
+
+def _opening_sequence(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
+    """Choose the protected approach: aerial -> facade -> entry/corridor.
+
+    `front yard` is only an approach fallback when no facade was recognised. It
+    must not displace a genuine front exterior simply because its image-quality
+    score happens to be higher.
+    """
+    def strongest(candidates: list[RoomCandidate]) -> RoomCandidate | None:
+        return max(candidates, key=lambda room: (room.quality, len(room.photo_ids), -_room_start(room)), default=None)
+
+    aerial = strongest([room for room in rooms if room.room_type == "aerial view"])
+    facade = strongest([
+        room for room in rooms
+        if room.room_type in {"exterior front", "building exterior"}
+    ])
+    arrival = facade or strongest([room for room in rooms if room.room_type == "front yard"])
+    entry = strongest([room for room in rooms if room.room_type == "entrance"])
+    corridor = strongest([room for room in rooms if room.room_type == "hallway"])
+    sequence = [room for room in (aerial, arrival, entry or corridor) if room is not None]
+    unique: list[RoomCandidate] = []
+    seen_ids: set[str] = set()
+    for room in sequence:
+        if room.room_id not in seen_ids:
+            unique.append(room)
+            seen_ids.add(room.room_id)
+    return unique
+
+
+def _closing_room(rooms: list[RoomCandidate]) -> RoomCandidate | None:
+    """Return the most legible exterior bookend, preferring a true facade."""
+    priorities = ("exterior front", "building exterior", "aerial view", "front yard")
+    for room_type in priorities:
+        candidate = max(
+            (room for room in rooms if room.room_type == room_type),
+            key=lambda room: (room.quality, len(room.photo_ids), -_room_start(room)),
+            default=None,
+        )
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
                     bpm: float, allow_service: bool = False,
                     include_close_ups: bool = True) -> ShotLine:
     """Produce the ordered shot line for a listing."""
+    rooms = _mark_secondary_kitchens(rooms)
     eligible = [r for r in rooms
                 if r.photo_ids and is_eligible(r.room_type, allow_service=allow_service)]
     dropped = [r.room_id for r in rooms if r not in eligible]
@@ -451,28 +550,28 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     # Shots freed by capping service rooms belong to the feature rooms, not to
     # the floor: otherwise a house with three utility rooms produces a film
     # several seconds shorter than the one the owner asked for.
-    # Cap the establishing sequence: extra exterior shots belong in the tour,
-    # where outdoor space is a feature, not stacked in front of the door.
-    act1 = sorted((r for r in eligible if _act_of(r) == 1 and r.room_id != hero_id),
-                  key=lambda r: (_rank_in_act(r), -r.quality))
-    # The entrance is the transition from outside to inside -- the film's hinge.
-    # Reserve it a shot before the cap is applied, or an exterior-heavy listing
-    # spends the whole establishing sequence outdoors and cuts straight to a
-    # bedroom.
-    entrances = [r for r in act1 if r.room_type == "entrance"]
-    reserved = 0
-    if entrances:
-        alloc[entrances[0].room_id] = 1
-        reserved = 1
-    spent = 0
-    for r in act1:
-        if entrances and r.room_id == entrances[0].room_id:
-            continue
-        # One shot per approach step, never two of the same place.
-        allowed = min(1, max(0, MAX_ACT1_SHOTS - reserved - spent),
-                      alloc.get(r.room_id, 0))
-        spent += allowed
-        alloc[r.room_id] = allowed
+    # Cap and protect the approach. Generic allocation once allowed two aerial
+    # components and a side-yard singleton to consume all four slots before a
+    # front facade could appear. The approach has a fixed visual grammar, so
+    # its candidates are selected by role rather than by generic room weight.
+    opening = _opening_sequence(eligible)
+    opening_ids = {room.room_id for room in opening}
+    for room in eligible:
+        if _act_of(room) == 1:
+            alloc[room.room_id] = 1 if room.room_id in opening_ids else 0
+
+    # Reserving an absent facade or entry can add shots that generic weighted
+    # allocation had already dropped in a short edit. Make room in the body now
+    # and keep one beat available for the deliberate exterior closing return.
+    if sum(alloc.values()) > budget:
+        body_budget = max(0, budget - (1 if _closing_room(eligible) else 0))
+        removable = sorted(
+            (room for room in eligible if room.room_id not in opening_ids),
+            key=lambda room: (_weight(room, hero_id), room.quality, len(room.photo_ids), room.room_id),
+        )
+        for room in removable:
+            while sum(alloc.values()) > body_budget and alloc.get(room.room_id, 0) > 0:
+                alloc[room.room_id] -= 1
 
     shortfall = budget - sum(alloc.values())
     if shortfall > 0:
@@ -500,9 +599,14 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     per_shot = shot_seconds(bpm)
     by_id = {r.room_id: r for r in eligible}
 
-    # Lay every room out as one continuous run in measured story order.
+    # Lay every room out as one continuous run in measured story order. Act 1 is
+    # deliberately protected above; it is not an arbitrary subset of outdoor
+    # components sorted by quality.
     ordered: list[tuple[int, RoomCandidate]] = []
-    for act in (1, 2, 3):
+    for room in opening:
+        if alloc.get(room.room_id, 0):
+            ordered.append((1, room))
+    for act in (2, 3):
         members = sorted((r for r in eligible if _act_of(r) == act),
                          key=lambda r: (is_secondary(r), _rank_in_act(r), -r.quality))
         # Every shot of a room runs consecutively. Cutting away to a bedroom in
@@ -521,12 +625,10 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     # What all three films do share is the close: every one ends outdoors or on
     # an exterior, and two end on the front exterior as the literal last shot.
     if ordered:
-        closing_types = ("aerial view", "exterior front", "front yard",
-                         "building exterior")
+        closing_types = ("aerial view", "exterior front", "front yard", "building exterior")
         already = ordered[-1][1].room_type in closing_types
         if not already:
-            closer = next((r for r in eligible
-                           if r.room_type in closing_types), None)
+            closer = _closing_room(eligible)
             if closer is not None:
                 ordered.append((3, closer))
 

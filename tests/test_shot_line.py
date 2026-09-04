@@ -108,6 +108,19 @@ class StructureTests(unittest.TestCase):
         }]
         self.assertLessEqual(len(establishing), 2)
 
+    def test_opening_protects_a_facade_from_extra_aerial_or_side_yard_components(self):
+        rooms = [
+            room("aerial-a", "aerial view", 2, quality=0.95, start=100),
+            room("aerial-b", "aerial view", 2, quality=0.99, start=110),
+            room("side-yard", "front yard", 2, quality=1.0, start=120),
+            room("front-facade", "exterior front", 2, quality=0.20, start=130),
+            room("entry", "entrance", 1, quality=0.30, start=140),
+            room("living", "living room", 3, quality=0.9, start=150),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        opening = [shot.room_id for shot in line.shots if shot.act == 1]
+        self.assertEqual(opening, ["aerial-b", "front-facade", "entry"])
+
     def test_acts_do_not_interleave(self):
         """Act 1 establishes, act 2 tours, act 3 closes -- in that order."""
         acts = [s.act for s in self.line.shots if not s.is_hero]
@@ -261,6 +274,23 @@ class SelectionTests(unittest.TestCase):
         b = build_shot_line(a_property(), target_seconds=45, bpm=100)
         self.assertEqual([(s.room_id, tuple(s.photo_ids), s.move.label) for s in a.shots],
                          [(s.room_id, tuple(s.photo_ids), s.move.label) for s in b.shots])
+
+    def test_later_kitchen_capture_run_moves_after_main_private_rooms(self):
+        rooms = [
+            room("front", "exterior front", 1, start=1),
+            room("living", "living room", 2, quality=0.9, start=10),
+            room("main-kitchen", "kitchen", 3, quality=0.9, start=20),
+            room("bedroom", "bedroom", 2, quality=0.8, start=40),
+            room("suite-kitchen", "kitchen", 2, quality=0.9, start=60),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        indices = {
+            room_id: min(shot.index for shot in line.shots if shot.room_id == room_id)
+            for room_id in {"main-kitchen", "bedroom", "suite-kitchen"}
+            if any(shot.room_id == room_id for shot in line.shots)
+        }
+        self.assertLess(indices["main-kitchen"], indices["bedroom"])
+        self.assertGreater(indices["suite-kitchen"], indices["bedroom"])
 
 
 if __name__ == "__main__":

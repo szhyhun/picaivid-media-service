@@ -29,9 +29,13 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
     if not job_id:
         raise SystemExit(f"No job for project {project_id}")
 
-    photos = db.execute(text(
-        "SELECT id, rails_photo_id, room_label, COALESCE(final_score,0), position "
+    photo_rows = db.execute(text(
+        "SELECT id, rails_photo_id, COALESCE(room_override, room_label), COALESCE(final_score,0), position, "
+        "COALESCE(is_duplicate, false) "
         "FROM job_photos WHERE job_id = :j"), {"j": job_id}).fetchall()
+    # A VGGT duplicate remains in the scene-map evidence, but it cannot enter the
+    # film. Filter it before either truth or predicted semantic zones are built.
+    photos = [row for row in photo_rows if not row[5]]
     by_key = {r[1]: r for r in photos}
     by_id = {r[0]: r for r in photos}
 
@@ -42,7 +46,9 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
     pair_score: dict[tuple[int, int], float] = {}
     for a, b, dm in pairs:
         dm = dm or {}
-        if dm.get("direct_membership_edge") or dm.get("same_component"):
+        if dm.get("verification_source") != "vggt_pairwise_v2":
+            continue
+        if dm.get("is_transition") and not dm.get("is_duplicate"):
             pair_score[(a, b)] = float(dm.get("pair_score") or 0.0)
 
     truth = db.execute(text(
@@ -63,6 +69,7 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
             rooms.append(RoomCandidate(
                 room_id=inst["instance"], room_type=room_type, photo_ids=ids,
                 quality=sum(by_id[i][3] for i in ids) / len(ids),
+                photo_positions={i: int(by_id[i][4] or 0) for i in ids},
             ))
     else:
         source = "predicted components"
@@ -72,14 +79,30 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
         groups = collections.defaultdict(list)
         for cid, pid in memberships:
             groups[cid].append(pid)
-        for cid, ids in groups.items():
-            labels = [by_id[i][2] for i in ids if i in by_id and by_id[i][2]]
-            room_type = collections.Counter(labels).most_common(1)[0][0] if labels else "other"
-            rooms.append(RoomCandidate(
-                room_id=f"component-{cid}", room_type=room_type,
-                photo_ids=[i for i in ids if i in by_id],
-                quality=sum(by_id[i][3] for i in ids if i in by_id) / max(len(ids), 1),
-            ))
+        for cid, component_ids in groups.items():
+            # VGGT components are continuity structures, not semantic rooms. A
+            # living/kitchen/entry component is useful geometry, but collapsing
+            # it to its majority label makes the whole component show as a
+            # kitchen and destroys the property's story order. Split only the
+            # editorial view; all member photos retain their shared geometry.
+            zones: dict[str, list[int]] = collections.defaultdict(list)
+            for photo_id in component_ids:
+                row = by_id.get(photo_id)
+                if row is None:
+                    continue
+                label = (row[2] or "other").strip().lower()
+                zones[room_type_from_name(label, label)].append(photo_id)
+            for room_type, ids in sorted(zones.items(), key=lambda item: min(by_id[i][4] or 0 for i in item[1])):
+                suffix = room_type.replace(" ", "-")
+                room_id = f"component-{cid}" if len(zones) == 1 else f"component-{cid}:{suffix}"
+                rooms.append(RoomCandidate(
+                    room_id=room_id,
+                    room_type=room_type,
+                    photo_ids=ids,
+                    quality=sum(by_id[i][3] for i in ids) / len(ids),
+                    photo_positions={i: int(by_id[i][4] or 0) for i in ids},
+                    parent_component_id=int(cid),
+                ))
 
     for room in rooms:
         found = []
