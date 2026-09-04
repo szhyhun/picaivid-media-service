@@ -24,12 +24,11 @@ average, and visual inspection of the winners returns flowering shrubs,
 hydrangeas beside a front door, and foliage -- the exact subjects the reference
 films use.
 
-Resolution: source photographs are 2048x1365 and output is 1080p, so a native
-crop could only be ~94% of the width, which is not a detail. Generative video
-models regenerate pixels at their own resolution, so a tighter crop is
-acceptable as *conditioning*; 45% of width is about 920px, enough to condition a
-generator while reading as a genuine close-up. Tighter than this and the model
-has too little to work from, which is where hallucination starts.
+Resolution: source photographs are typically 2048x1365 and output is 1080p.
+A 35% crop is roughly 716px wide: tight enough to read as a different visual
+beat, while retaining meaningful visual context for a later video model. The
+renderer must validate that conditioning resolution when it is selected; this
+planner does not assume an untested model-specific lower limit.
 """
 from __future__ import annotations
 
@@ -51,10 +50,14 @@ NON_DETAIL_PROMPTS = (
     "an out of focus blurry area",
     "a plain ceiling",
     "a plain floor",
+    "an ordinary wide room photograph",
+    "an exposed mechanical fixture, pipe or hardware",
+    "an exterior awning, roof or canopy mechanism",
+    "an unstyled utility area",
 )
 
 # Fraction of the source width one crop spans. See the resolution note above.
-CROP_WIDTH_FRACTION = 0.45
+CROP_WIDTH_FRACTION = 0.35
 OUTPUT_ASPECT = 16 / 9
 
 # Where to look. A coarse grid is enough -- detail subjects are large relative to
@@ -67,42 +70,37 @@ _Y_POSITIONS = (0.15, 0.35, 0.55, 0.75)
 # exteriors with planting score +0.01..+0.04, plain interiors score negative.
 MIN_DETAIL_SCORE = 0.005
 
-# How often each kind of room earns a close-up, measured by scoring every shot
-# in the three reference films for close-up-ness and cross-tabulating against
-# its room classification:
-#
-#   ENTRY 36%   KITCHEN 35%   OUTDOOR 32%   BEDROOM 21%   BATH 21%
-#   LIVING 20%  DINING 14%    SERVICE 20%   EXTERIOR 0%   AERIAL 0%
-#
-# Two things this corrected. Bedrooms and bathrooms *do* get close-ups -- a
-# faucet, a lamp, a folded towel -- so excluding them was wrong and cost us the
-# overall rate. And aerials and wide exteriors get none at all, which makes
-# sense: at that distance there is no detail subject to crop to.
+# A room type is a conservative eligibility gate, not proof that a close-up is
+# worthwhile. The reference films include bathrooms and bedrooms, but this
+# product cannot yet identify a genuinely premium bathroom fixture or bedroom
+# object reliably. A generic crop there is usually a wall, bedspread, shower
+# panel, or towel. Keep them out until a grounded object scorer earns an
+# exception. The rate only breaks ties between *validated* candidates.
 CLOSE_UP_RATE_BY_ROOM: dict[str, float] = {
-    "entrance": 0.36,
-    "hallway": 0.36,
-    "shared space": 0.36,
-    "kitchen": 0.35,
-    "patio": 0.32,
-    "pool": 0.32,
-    "backyard": 0.32,
-    "exterior back": 0.32,
-    "amenities": 0.32,
-    "bedroom": 0.21,
-    "bathroom": 0.21,
-    "living room": 0.20,
-    "office": 0.20,
-    "dining room": 0.14,
-    "garage": 0.20,
-    "storage": 0.20,
-    "laundry room": 0.20,
-    # No close-up subject exists at this distance.
+    "entrance": 0.20,
+    "kitchen": 0.40,
+    "living room": 0.25,
+    "dining room": 0.20,
+    "patio": 0.35,
+    "pool": 0.35,
+    "backyard": 0.35,
+    "exterior back": 0.30,
+    "amenities": 0.25,
+    # Not eligible without a future object-specific exception.
+    "bedroom": 0.0,
+    "bathroom": 0.0,
+    "hallway": 0.0,
+    "shared space": 0.0,
+    "office": 0.0,
+    "garage": 0.0,
+    "storage": 0.0,
+    "laundry room": 0.0,
     "aerial view": 0.0,
     "exterior front": 0.0,
     "front yard": 0.0,
     "building exterior": 0.0,
 }
-DEFAULT_CLOSE_UP_RATE = 0.20
+DEFAULT_CLOSE_UP_RATE = 0.0
 
 
 def close_up_rate(room_type: str | None) -> float:
@@ -125,6 +123,14 @@ class DetailCrop:
     def box(self) -> tuple[int, int, int, int]:
         """(left, upper, right, lower), ready for PIL's crop()."""
         return (self.x, self.y, self.x + self.width, self.y + self.height)
+
+
+@dataclass(frozen=True)
+class ResolvedDetail:
+    """A crop that passed visual scoring for one selected wide shot."""
+
+    crop: DetailCrop
+    source_size: tuple[int, int]
 
 
 def candidate_boxes(width: int, height: int) -> list[tuple[int, int, int, int]]:
@@ -199,26 +205,24 @@ def find_detail(image, model, preprocess, detail_centroid, non_detail_centroid,
     return best_crop(boxes, scores, min_score=min_score)
 
 
-def resolve_close_up_crops(shots, photo_uri, *, min_score: float = MIN_DETAIL_SCORE):
-    """Fill in the crop box for every close-up shot in a line.
+def resolve_detail_candidates(shots, photo_uri, *, min_score: float = MIN_DETAIL_SCORE):
+    """Score every eligible wide shot before any close-up is scheduled.
 
-    `shots` are mutated in place -- each close-up gets the box the crop finder
-    chose within its own source frame, or is left with `crop_box=None` if that
-    frame has nothing worth cropping into. `photo_uri` maps a photo id to its S3
-    URI.
-
-    Only close-up shots are searched, and each is searched only inside the frame
-    it follows, so the cost is one image load and one batch of candidate windows
-    per close-up rather than a scan of the listing.
+    `shots` must be the selected wide line, not every uploaded photo. The return
+    value maps a wide shot index to the validated crop that can follow it. This
+    order matters: selecting positions first and testing crops afterwards left
+    holes in the edit whenever a chosen source had no real detail.
     """
     import torch
 
     from app.models.openclip import openclip_model
     from app.services.storage.s3_client import s3_client
 
-    close_ups = [s for s in shots if getattr(s, "is_close_up", False)]
-    if not close_ups:
-        return shots
+    candidates = [s for s in shots
+                  if not getattr(s, "is_close_up", False)
+                  and close_up_rate(getattr(s, "room_type", "")) > 0]
+    if not candidates:
+        return {}
 
     openclip_model._ensure_loaded()
     model = openclip_model._model
@@ -241,48 +245,31 @@ def resolve_close_up_crops(shots, photo_uri, *, min_score: float = MIN_DETAIL_SC
     # Retain crop decisions, never decoded full-resolution images. A 50-photo
     # listing can otherwise leave hundreds of MB of PIL buffers live while the
     # review request is running.
-    cache: dict[int, tuple[DetailCrop | None, tuple[int, int] | None]] = {}
-    for shot in close_ups:
+    cache: dict[int, ResolvedDetail | None] = {}
+    resolved: dict[int, ResolvedDetail] = {}
+    for shot in candidates:
         photo_id = shot.photo_ids[0]
         if photo_id not in cache:
             uri = photo_uri.get(photo_id)
             try:
                 image = s3_client.download_image(uri) if uri else None
                 if image is None:
-                    cache[photo_id] = (None, None)
+                    cache[photo_id] = None
                 else:
                     try:
+                        crop = find_detail(
+                            image, model, preprocess, detail_c, plain_c,
+                            min_score=min_score,
+                        )
                         cache[photo_id] = (
-                            find_detail(image, model, preprocess, detail_c, plain_c,
-                                        min_score=min_score),
-                            image.size,
+                            ResolvedDetail(crop=crop, source_size=image.size)
+                            if crop is not None else None
                         )
                     finally:
                         image.close()
             except Exception:
-                cache[photo_id] = (None, None)
-        crop, source_size = cache[photo_id]
-        if crop is not None:
-            shot.crop_box = crop.box
-            shot.crop_score = crop.score
-            shot.source_size = source_size
-    return shots
-
-
-def drop_unresolved_close_ups(shots):
-    """Remove close-ups whose source frame had nothing worth cropping into.
-
-    A close-up that never got a crop box would render as a second copy of the
-    wide shot before it -- the same picture twice, which is worse than not
-    having the beat at all. Timings are recomputed so the grid stays contiguous.
-    """
-    from dataclasses import replace
-
-    kept = [s for s in shots
-            if not getattr(s, "is_close_up", False) or s.crop_box is not None]
-    out = []
-    cursor = 0.0
-    for index, shot in enumerate(kept):
-        out.append(replace(shot, index=index, start_seconds=round(cursor, 3)))
-        cursor += shot.duration_seconds
-    return out
+                cache[photo_id] = None
+        detail = cache[photo_id]
+        if detail is not None:
+            resolved[int(shot.index)] = detail
+    return resolved

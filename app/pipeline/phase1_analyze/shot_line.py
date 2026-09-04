@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from app.pipeline.phase1_analyze.camera_move import CameraMove, choose_move
-from app.pipeline.phase1_analyze.detail_crop import close_up_rate
+from app.pipeline.phase1_analyze.detail_crop import ResolvedDetail, close_up_rate
 from app.pipeline.phase1_analyze.editorial import (
     MIN_SHOTS,
     Tier,
@@ -390,7 +390,8 @@ def _rank_in_act(room: RoomCandidate) -> int:
 
 
 def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
-                    bpm: float, allow_service: bool = False) -> ShotLine:
+                    bpm: float, allow_service: bool = False,
+                    include_close_ups: bool = True) -> ShotLine:
     """Produce the ordered shot line for a listing."""
     eligible = [r for r in rooms
                 if r.photo_ids and is_eligible(r.room_type, allow_service=allow_service)]
@@ -570,7 +571,8 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         ))
         cursor += per_shot
 
-    shots = _insert_close_ups(shots, per_shot)
+    if include_close_ups:
+        shots = _insert_close_ups(shots, per_shot)
     return ShotLine(shots=shots, bpm=bpm, hero_room_id=hero_id, dropped_rooms=dropped)
 
 
@@ -582,14 +584,28 @@ def _unit_for(seed: str) -> float:
     return int.from_bytes(digest[:4], "big") / 2**32
 
 
-def _insert_close_ups(shots: list[Shot], per_shot: float) -> list[Shot]:
-    """Add a measured share of close-ups, sourced from their preceding shot.
+def schedule_resolved_close_ups(
+    shots: list[Shot],
+    resolved: dict[int, ResolvedDetail],
+) -> list[Shot]:
+    """Insert only crop-validated close-ups into a selected wide line."""
+    if not shots:
+        return []
+    return _insert_close_ups(shots, shots[0].duration_seconds, resolved)
+
+
+def _insert_close_ups(
+    shots: list[Shot],
+    per_shot: float,
+    resolved: dict[int, ResolvedDetail] | None = None,
+) -> list[Shot]:
+    """Add crop-validated close-ups on an approximate four-shot cadence.
 
     The close-up is a crop of the frame immediately before it, which is what
-    makes the pair read as one continuous look rather than two pictures. The
-    crop box itself is filled in later by `detail_crop.resolve_close_up_crops`,
-    which needs the image; a shot marked `is_close_up` with `crop_box` still
-    None is a request that the crop finder has not yet answered.
+    makes the pair read as one continuous look rather than two pictures. In the
+    API path `resolved` contains crop-validated candidates and every emitted
+    detail therefore has a concrete crop box. The no-argument path is retained
+    only for inexpensive planner-only tests and CLI previews.
 
     The opening approach and the closing run stay wide: the reference films thin
     their close-ups out at both ends.
@@ -600,40 +616,64 @@ def _insert_close_ups(shots: list[Shot], per_shot: float) -> list[Shot]:
     head = 2                      # leave the approach alone
     tail = max(1, len(shots) // 8)  # and the close
 
-    # The measured per-room rates were taken from films whose room mix differed
-    # from any given listing's. Pick an exact count from the actual wide line:
-    # a 25% close-up share means C / (W + C) = 0.25, or C = W / 3. Earlier code
-    # requested 25% of W, which produced only 20% of the finished film.
-    eligible = [(idx, shot) for idx, shot in enumerate(shots)
-                if head <= idx < len(shots) - tail and close_up_rate(shot.room_type) > 0]
+    # A quarter of the finished cut means C / (W + C) = 0.25, or C = W / 3.
+    # This is a ceiling, never a quota that forces generic material on screen.
+    # The API passes `resolved` after testing every selected wide shot. The
+    # no-argument path supports dry-run scripts and unit tests only.
+    eligible = [
+        (idx, shot)
+        for idx, shot in enumerate(shots)
+        if head <= idx < len(shots) - tail
+        and close_up_rate(shot.room_type) > 0
+        and (resolved is None or shot.index in resolved)
+    ]
     wanted = min(round(len(shots) * CLOSE_UP_SHARE / (1.0 - CLOSE_UP_SHARE)),
                  len(eligible))
     if wanted == 0:
         return shots
 
-    # Weighted sampling without replacement, but seeded from the room and
-    # position. It gives kitchen/outdoor shots their measured higher chance
-    # without making every film of the same room mix look mechanically alike.
-    import math
-    chosen_indices = {
-        index
-        for index, shot in sorted(
-            eligible,
-            key=lambda candidate: -math.log(max(_unit_for(
-                f"{candidate[1].room_id}:{candidate[0]}:closeup"), 1e-12))
-            / close_up_rate(candidate[1].room_type),
-        )[:wanted]
-    }
+    # Work in four-wide-shot windows. This produces the intended rhythm without
+    # allowing a high-scoring patio or kitchen to create a burst of consecutive
+    # details. One detail per room is enough for a first cut; the full room wide
+    # shots already carry the coverage.
+    chosen: dict[int, ResolvedDetail | None] = {}
+    used_rooms: set[str] = set()
+    last_index = -4
+    body_end = len(shots) - tail
+    for window_start in range(head, body_end, 4):
+        options = [
+            (idx, shot)
+            for idx, shot in eligible
+            if window_start <= idx < min(window_start + 4, body_end)
+            and idx - last_index >= 4
+            and shot.room_id not in used_rooms
+        ]
+        if not options:
+            continue
+        # A validated crop's score decides the visual choice. Dry runs do not
+        # have that score, so use deterministic room-type weighting instead.
+        index, shot = max(
+            options,
+            key=lambda candidate: (
+                resolved[candidate[1].index].crop.score
+                if resolved is not None else close_up_rate(candidate[1].room_type),
+                close_up_rate(candidate[1].room_type),
+                _unit_for(f"{candidate[1].room_id}:{candidate[0]}:closeup"),
+            ),
+        )
+        chosen[index] = resolved[shot.index] if resolved is not None else None
+        used_rooms.add(shot.room_id)
+        last_index = index
+        if len(chosen) >= wanted:
+            break
 
     out: list[Shot] = []
     for i, shot in enumerate(shots):
         out.append(shot)
         if not (head <= i < len(shots) - tail) or shot.is_close_up:
             continue
-        # Selection is weighted by each room type's measured close-up rate and
-        # deterministic for this listing. It is not a fixed every-third-shot
-        # cadence, which systematically underrepresents short kitchen runs.
-        if i not in chosen_indices:
+        detail = chosen.get(i)
+        if i not in chosen:
             continue
         out.append(Shot(
             index=-1,
@@ -647,6 +687,9 @@ def _insert_close_ups(shots: list[Shot], per_shot: float) -> list[Shot]:
             move=choose_move(f"{shot.room_id}:closeup:{i}"),
             is_hero=shot.is_hero,
             is_close_up=True,
+            crop_box=detail.crop.box if detail else None,
+            crop_score=detail.crop.score if detail else None,
+            source_size=detail.source_size if detail else None,
         ))
 
     cursor = 0.0

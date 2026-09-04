@@ -16,8 +16,21 @@ from app.pipeline.phase1_analyze.detail_crop import (
     OUTPUT_ASPECT,
     best_crop,
     candidate_boxes,
+    close_up_rate,
     score_crops,
 )
+
+
+class EditorialEligibilityTests(unittest.TestCase):
+    def test_only_rooms_with_reliably_scorable_details_are_eligible(self):
+        self.assertGreater(close_up_rate("kitchen"), 0.0)
+        self.assertGreater(close_up_rate("patio"), 0.0)
+        for room_type in ("bedroom", "bathroom", "hallway", "office",
+                          "garage", "storage", "laundry room"):
+            self.assertEqual(close_up_rate(room_type), 0.0)
+
+    def test_unknown_room_types_do_not_get_generic_details(self):
+        self.assertEqual(close_up_rate("unclassified space"), 0.0)
 
 
 class CandidateBoxTests(unittest.TestCase):

@@ -504,10 +504,13 @@ async def get_project_shot_line(
     generation, which is by far the most expensive step.
     """
     from scripts.build_shot_line import load_rooms
-    from app.pipeline.phase1_analyze.shot_line import build_shot_line
+    from app.pipeline.phase1_analyze.shot_line import (
+        build_shot_line,
+        schedule_resolved_close_ups,
+    )
     from app.pipeline.phase1_analyze.detail_crop import (
-        drop_unresolved_close_ups,
-        resolve_close_up_crops,
+        close_up_rate,
+        resolve_detail_candidates,
     )
 
     try:
@@ -516,25 +519,30 @@ async def get_project_shot_line(
         return {"project_id": project_id, "shots": [], "rooms": 0,
                 "source": "no analysis yet"}
 
-    line = build_shot_line(rooms, target_seconds=seconds, bpm=bpm)
-
-    # Resolve where each close-up actually crops into its source frame, so the
-    # review UI can show the box rather than a duplicate thumbnail. Only close-up
-    # shots are searched and only inside the frame they follow.
+    # Build the actual selected wides first. Details are optional: crop-validate
+    # every eligible source before choosing the four-shot positions. The former
+    # order chose positions first, then removed failed crops, which created
+    # uneven detail rhythm and occasionally retained the least-bad generic crop.
+    line = build_shot_line(
+        rooms, target_seconds=seconds, bpm=bpm, include_close_ups=False)
     if line.shots:
+        candidate_photo_ids = [
+            s.photo_ids[0]
+            for s in line.shots
+            if close_up_rate(s.room_type) > 0
+        ]
         uri_rows = db.query(JobPhoto).filter(
-            JobPhoto.id.in_([s.photo_ids[0] for s in line.shots if s.is_close_up])
+            JobPhoto.id.in_(candidate_photo_ids)
         ).all()
         if uri_rows:
             try:
-                resolve_close_up_crops(
+                resolved = resolve_detail_candidates(
                     line.shots, {int(p.id): p.s3_uri for p in uri_rows})
+                line.shots = schedule_resolved_close_ups(line.shots, resolved)
             except Exception:
                 # The planning view is still useful without optional detail
                 # crops. Never turn a model/download failure into a 500 here.
-                logger.exception("Could not resolve close-up crops for %s", project_id)
-            # A close-up with no crop would render as the same picture twice.
-            line.shots = drop_unresolved_close_ups(line.shots)
+                logger.exception("Could not resolve detail candidates for %s", project_id)
 
     photo_rows = db.query(JobPhoto).filter(
         JobPhoto.id.in_([p for shot in line.shots for p in shot.photo_ids])
@@ -573,6 +581,7 @@ async def get_project_shot_line(
             "duration_seconds": s.duration_seconds,
             "is_close_up": s.is_close_up,
             "crop_box": list(s.crop_box) if s.crop_box else None,
+            "crop_score": round(s.crop_score, 4) if s.crop_score is not None else None,
             "source_size": list(s.source_size) if s.source_size else None,
             # Fractions per second, so the UI can draw the motion rather than
             # only name it.

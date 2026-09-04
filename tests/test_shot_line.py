@@ -14,7 +14,9 @@ from app.pipeline.phase1_analyze.shot_line import (
     RoomCandidate,
     build_shot_line,
     pick_hero,
+    schedule_resolved_close_ups,
 )
+from app.pipeline.phase1_analyze.detail_crop import DetailCrop, ResolvedDetail
 from app.pipeline.phase1_analyze.editorial import shot_budget
 
 
@@ -41,6 +43,18 @@ def a_property():
         room("laundry", "laundry room", 1, quality=0.3, start=900),
         room("storage", "storage", 1, quality=0.2, start=950),
     ]
+
+
+def resolved_details(shots):
+    """Deterministic stand-in for crop validation; no model is needed here."""
+    return {
+        shot.index: ResolvedDetail(
+            crop=DetailCrop(x=100, y=200, width=900, height=506,
+                            score=0.1 + shot.index / 1000),
+            source_size=(2048, 1365),
+        )
+        for shot in shots
+    }
 
 
 class HeroTests(unittest.TestCase):
@@ -146,22 +160,26 @@ class RhythmTests(unittest.TestCase):
             self.assertAlmostEqual(a.start_seconds + a.duration_seconds,
                                    b.start_seconds, places=2)
 
-    def test_close_up_quota_is_calculated_from_the_finished_cut(self):
-        """C / (W + C), not C / W, is the measured close-up share."""
+    def test_close_up_target_is_an_upper_bound_not_a_forced_quota(self):
+        """A film skips a detail rather than inserting generic material."""
         line = build_shot_line(a_property(), target_seconds=45, bpm=100)
         close_ups = sum(s.is_close_up for s in line.shots)
         wides = len(line.shots) - close_ups
-        self.assertEqual(close_ups, round(wides * 0.25 / 0.75))
+        self.assertLessEqual(close_ups, round(wides * 0.25 / 0.75))
 
     def test_full_footage_fill_uses_the_requested_grid(self):
         """When there is enough distinct material, a 45s cut fills its grid."""
         rooms = [room(f"room-{i}", f"type-{i}", 1, start=1000 + i)
                  for i in range(25)]
-        line = build_shot_line(rooms, target_seconds=45, bpm=100)
-        self.assertEqual(len(line.shots), shot_budget(45, 100))
+        line = build_shot_line(
+            rooms, target_seconds=45, bpm=100, include_close_ups=False)
+        self.assertEqual(
+            len(line.shots),
+            round(shot_budget(45, 100) * 0.75),
+        )
         self.assertAlmostEqual(
             line.duration,
-            shot_budget(45, 100) * line.shots[0].duration_seconds,
+            len(line.shots) * line.shots[0].duration_seconds,
             places=2,
         )
 
@@ -232,13 +250,20 @@ class CloseUpTests(unittest.TestCase):
     close-up, recurring every two to three shots, thinning at both ends."""
 
     def setUp(self):
-        self.line = build_shot_line(a_property(), target_seconds=60, bpm=100)
+        wides = build_shot_line(
+            a_property(), target_seconds=60, bpm=100, include_close_ups=False)
+        self.line = type(wides)(
+            shots=schedule_resolved_close_ups(
+                wides.shots, resolved_details(wides.shots)),
+            bpm=wides.bpm,
+            hero_room_id=wides.hero_room_id,
+            dropped_rooms=wides.dropped_rooms,
+        )
         self.shots = self.line.shots
 
-    def test_close_ups_are_about_a_quarter_of_the_film(self):
+    def test_close_ups_never_exceed_a_quarter_of_the_film(self):
         share = sum(s.is_close_up for s in self.shots) / len(self.shots)
-        self.assertGreater(share, 0.15)
-        self.assertLess(share, 0.35)
+        self.assertLessEqual(share, 0.25)
 
     def test_a_close_up_is_cropped_from_the_shot_it_follows(self):
         """Cutting into the frame just seen reads as one continuous look; a
@@ -263,6 +288,26 @@ class CloseUpTests(unittest.TestCase):
             if s.is_close_up:
                 self.assertEqual(len(s.photo_ids), 1)
                 self.assertEqual(s.kind, "single_image")
+                self.assertIsNotNone(s.crop_box)
+                self.assertIsNotNone(s.crop_score)
+
+    def test_unvalidated_sources_never_become_close_ups(self):
+        wides = build_shot_line(
+            a_property(), target_seconds=60, bpm=100, include_close_ups=False)
+        scheduled = schedule_resolved_close_ups(wides.shots, {})
+        self.assertEqual(len(scheduled), len(wides.shots))
+        self.assertFalse(any(s.is_close_up for s in scheduled))
+
+    def test_bedrooms_and_bathrooms_are_not_detail_eligible(self):
+        """A valid generic crop is still not enough for these room types."""
+        details = [s for s in self.shots if s.is_close_up]
+        self.assertTrue(details)
+        self.assertFalse(any(s.room_type in {"bedroom", "bathroom"}
+                             for s in details))
+
+    def test_only_one_detail_is_selected_per_room(self):
+        detail_rooms = [s.room_id for s in self.shots if s.is_close_up]
+        self.assertEqual(len(detail_rooms), len(set(detail_rooms)))
 
     def test_shots_stay_contiguous_after_insertion(self):
         for a, b in zip(self.shots, self.shots[1:]):
@@ -273,13 +318,13 @@ class CloseUpTests(unittest.TestCase):
         self.assertEqual([s.index for s in self.shots],
                          list(range(len(self.shots))))
 
-    def test_the_rate_holds_even_on_the_shortest_film(self):
-        """A short film keeps the same quarter-of-shots rate rather than
-        dropping close-ups entirely -- they are part of the grammar, not a
-        luxury added when there is spare runtime."""
-        tiny = build_shot_line(a_property(), target_seconds=4, bpm=100)
-        share = sum(s.is_close_up for s in tiny.shots) / len(tiny.shots)
-        self.assertGreater(share, 0.1)
-        self.assertLess(share, 0.4)
-        self.assertFalse(tiny.shots[0].is_close_up)
-        self.assertFalse(tiny.shots[-1].is_close_up)
+    def test_short_edits_can_be_wide_only(self):
+        """Details are optional; a compact edit may have no usable candidate."""
+        tiny = build_shot_line(
+            [room("bed", "bedroom", 4, start=100)],
+            target_seconds=4,
+            bpm=100,
+            include_close_ups=False,
+        )
+        scheduled = schedule_resolved_close_ups(tiny.shots, resolved_details(tiny.shots))
+        self.assertFalse(any(s.is_close_up for s in scheduled))
