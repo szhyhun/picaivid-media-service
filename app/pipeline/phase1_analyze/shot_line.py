@@ -59,8 +59,10 @@ DWELL_WEIGHT: dict[str, float] = {
     "backyard": 1.6,
     "living room": 1.6,
     "kitchen": 1.4,
-    "bathroom": 1.3,
-    "bedroom": 1.2,
+    # Bedrooms earn coverage before bathrooms. A finished tour should show the
+    # best private rooms before it spends beats on additional bath coverage.
+    "bedroom": 1.3,
+    "bathroom": 1.1,
     # Dining is a core social selling space. Its smaller reference-film share
     # does not justify allowing bathrooms to erase it from the property tour.
     "dining room": 1.4,
@@ -407,7 +409,7 @@ def is_secondary(room: RoomCandidate) -> bool:
 
 def story_position(room: RoomCandidate) -> float:
     """Where this room belongs in the film, from the measured medians."""
-    if room.secondary and room.room_type == "kitchen":
+    if room.secondary:
         return SECONDARY_KITCHEN_POSITION
     return STORY_POSITION.get(room.room_type, DEFAULT_POSITION)
 
@@ -449,24 +451,35 @@ def _mark_secondary_kitchens(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
         (room for room in copies if room.room_type == "kitchen" and room.photo_ids),
         key=lambda room: (_room_start(room), room.room_id),
     )
-    if not kitchens:
-        return copies
+    if kitchens:
+        primary = kitchens[0]
+        primary_end = max(
+            primary.photo_positions.get(photo_id, photo_id)
+            for photo_id in primary.photo_ids
+        )
+        for kitchen in kitchens[1:]:
+            start = _room_start(kitchen)
+            if start <= primary_end + SECONDARY_KITCHEN_GAP:
+                primary_end = max(
+                    primary_end,
+                    max(kitchen.photo_positions.get(photo_id, photo_id)
+                        for photo_id in kitchen.photo_ids),
+                )
+            else:
+                kitchen.secondary = True
 
-    primary = kitchens[0]
-    primary_end = max(
-        primary.photo_positions.get(photo_id, photo_id)
-        for photo_id in primary.photo_ids
-    )
-    for kitchen in kitchens[1:]:
-        start = _room_start(kitchen)
-        if start <= primary_end + SECONDARY_KITCHEN_GAP:
-            primary_end = max(
-                primary_end,
-                max(kitchen.photo_positions.get(photo_id, photo_id)
-                    for photo_id in kitchen.photo_ids),
-            )
-        else:
-            kitchen.secondary = True
+    # Semantic zones are editorial views of one VGGT component. A late kitchen
+    # identifies a secondary unit, not merely an isolated kitchen: its sibling
+    # living/hall/bedroom zones must follow that unit rather than jumping back
+    # into the early main-house tour.
+    secondary_components = {
+        room.parent_component_id
+        for room in copies
+        if room.secondary and room.parent_component_id is not None
+    }
+    for room in copies:
+        if room.parent_component_id in secondary_components:
+            room.secondary = True
     return copies
 
 
@@ -477,13 +490,14 @@ def _core_social_coverage(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
         candidate = max(
             (room for room in rooms
              if room.room_type == room_type and not is_secondary(room)),
-            # A verified two-photo shot is more useful than an equally pretty
-            # singleton because it constrains both ends of video generation.
+            # Photographer coverage is the strongest same-type importance
+            # signal. Pair evidence then decides the better-supported room
+            # when two candidates received comparable coverage.
             key=lambda room: (
+                len(room.photo_ids),
                 bool(room.pairs),
                 len(room.pairs),
                 room.quality,
-                len(room.photo_ids),
                 -_room_start(room),
                 room.room_id,
             ),
@@ -638,8 +652,8 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     kept: list[RoomCandidate] = []
     seen: dict[str, int] = {}
     initial_hero = pick_hero(eligible)
-    for room in sorted(eligible, key=lambda r: (-len(r.pairs), -r.quality,
-                                                -len(r.photo_ids))):
+    for room in sorted(eligible, key=lambda r: (-len(r.photo_ids), -len(r.pairs),
+                                                -r.quality, r.room_id)):
         cap = MAX_ROOMS_PER_TYPE.get(room.room_type, DEFAULT_MAX_ROOMS_PER_TYPE)
         if room.room_id == (initial_hero.room_id if initial_hero else None):
             cap = max(cap, 1)          # the hero always survives its own cap
@@ -759,7 +773,11 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     for act in (2, 3):
         members = sorted((r for r in eligible
                           if _act_of(r) == act and r.room_id not in opening_ids),
-                         key=lambda r: (is_secondary(r), _rank_in_act(r), -r.quality))
+                         key=lambda r: (
+                             is_secondary(r),
+                             _room_start(r) if is_secondary(r) else _rank_in_act(r),
+                             -r.quality,
+                         ))
         # Every shot of a room runs consecutively. Cutting away to a bedroom in
         # the middle of the living room and back again reads as a shuffle, not a
         # tour: you look at a room, then you move on.

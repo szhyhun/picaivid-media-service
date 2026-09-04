@@ -14,6 +14,8 @@ from app.pipeline.phase1_analyze.shot_line import (
     MAX_SERVICE_SHOTS,
     RoomCandidate,
     Shot,
+    _core_social_coverage,
+    allocate_shots,
     build_shot_line,
     pick_hero,
     schedule_resolved_close_ups,
@@ -28,10 +30,11 @@ from app.pipeline.phase1_analyze.editorial import shot_budget
 
 
 def room(room_id, room_type, n_photos, *, quality=0.5, pairs=0, start=100,
-         scene_type=None):
+         scene_type=None, parent_component_id=None):
     ids = list(range(start, start + n_photos))
     cand = RoomCandidate(room_id=room_id, room_type=room_type,
-                         photo_ids=ids, quality=quality, scene_type=scene_type)
+                         photo_ids=ids, quality=quality, scene_type=scene_type,
+                         parent_component_id=parent_component_id)
     cand.pairs = [(ids[2 * i], ids[2 * i + 1], 0.9 - 0.1 * i) for i in range(pairs)]
     return cand
 
@@ -303,6 +306,30 @@ class KeyframeTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_bedroom_wins_a_one_shot_budget_over_a_bathroom(self):
+        bedroom = room("bedroom", "bedroom", 1, quality=0.1, start=10)
+        bathroom = room("bathroom", "bathroom", 4, quality=1.0, pairs=2, start=20)
+        alloc = allocate_shots([bedroom, bathroom], budget=1, hero_id=None)
+        self.assertEqual(alloc, {"bedroom": 1, "bathroom": 0})
+
+    def test_more_photo_coverage_wins_the_same_type_cap(self):
+        rooms = [
+            room("bedroom-five", "bedroom", 5, quality=0.1, start=10),
+            room("bedroom-four", "bedroom", 4, quality=0.2, start=20),
+            room("bedroom-three", "bedroom", 3, quality=0.3, start=30),
+            room("bedroom-two", "bedroom", 2, quality=1.0, pairs=1, start=40),
+        ]
+        line = build_shot_line(rooms, target_seconds=45, bpm=100, include_close_ups=False)
+        self.assertNotIn("bedroom-five", line.dropped_rooms)
+        self.assertIn("bedroom-two", line.dropped_rooms)
+
+    def test_core_social_selection_prefers_more_photographer_coverage(self):
+        rooms = [
+            room("dining-wide", "dining room", 5, quality=0.1, start=10),
+            room("dining-thin", "dining room", 2, quality=1.0, pairs=1, start=20),
+        ]
+        self.assertEqual(_core_social_coverage(rooms)[0].room_id, "dining-wide")
+
     def test_main_dining_is_reserved_ahead_of_optional_bathroom_coverage(self):
         rooms = [
             room("front", "exterior front", 1, quality=0.9, start=1),
@@ -333,6 +360,25 @@ class SelectionTests(unittest.TestCase):
         ]
         line = build_shot_line(rooms, target_seconds=15, bpm=100, include_close_ups=False)
         self.assertIn("main-kitchen", {shot.room_id for shot in line.shots})
+
+    def test_secondary_component_siblings_stay_in_one_late_capture_ordered_block(self):
+        rooms = [
+            room("front", "exterior front", 1, quality=0.9, start=1),
+            room("main-living", "living room", 2, quality=0.8, start=10),
+            room("main-kitchen", "kitchen", 2, quality=0.8, start=20),
+            room("main-bedroom", "bedroom", 2, quality=0.8, start=30),
+            room("suite-kitchen", "kitchen", 3, quality=0.8, start=60,
+                 parent_component_id=900),
+            room("suite-living", "living room", 2, quality=1.0, start=70,
+                 parent_component_id=900),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        first = {
+            room_id: min(shot.index for shot in line.shots if shot.room_id == room_id)
+            for room_id in {"main-bedroom", "suite-kitchen", "suite-living"}
+        }
+        self.assertLess(first["main-bedroom"], first["suite-kitchen"])
+        self.assertLess(first["suite-kitchen"], first["suite-living"])
 
     def test_a_short_film_drops_rooms_rather_than_compressing_shots(self):
         """Shot length is set by the music, so a 15s film shows fewer rooms --
