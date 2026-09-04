@@ -9,6 +9,7 @@ from __future__ import annotations
 import unittest
 
 from app.pipeline.phase1_analyze.shot_line import (
+    MAX_ACT1_SHOTS,
     MAX_HERO_SHOTS,
     MAX_SERVICE_SHOTS,
     RoomCandidate,
@@ -26,10 +27,11 @@ from app.pipeline.phase1_analyze.detail_crop import (
 from app.pipeline.phase1_analyze.editorial import shot_budget
 
 
-def room(room_id, room_type, n_photos, *, quality=0.5, pairs=0, start=100):
+def room(room_id, room_type, n_photos, *, quality=0.5, pairs=0, start=100,
+         scene_type=None):
     ids = list(range(start, start + n_photos))
     cand = RoomCandidate(room_id=room_id, room_type=room_type,
-                         photo_ids=ids, quality=quality)
+                         photo_ids=ids, quality=quality, scene_type=scene_type)
     cand.pairs = [(ids[2 * i], ids[2 * i + 1], 0.9 - 0.1 * i) for i in range(pairs)]
     return cand
 
@@ -100,26 +102,78 @@ class StructureTests(unittest.TestCase):
             "aerial view", "exterior front", "front yard", "building exterior",
         })
 
-    def test_establishing_material_is_not_repeated_before_the_tour(self):
-        """Aerial/facade images establish the property once, then bookend it."""
+    def test_establishing_material_is_adaptive_but_bounded_before_the_tour(self):
+        """A strong approach can breathe, but never becomes an exterior tour."""
         body = self.line.shots[:-1]
         establishing = [s for s in body if s.room_type in {
             "aerial view", "exterior front", "front yard", "building exterior",
         }]
-        self.assertLessEqual(len(establishing), 2)
+        self.assertLessEqual(len(establishing), MAX_ACT1_SHOTS)
 
-    def test_opening_protects_a_facade_from_extra_aerial_or_side_yard_components(self):
+    def test_opening_uses_two_aerials_two_front_views_and_an_entry_when_earned(self):
         rooms = [
             room("aerial-a", "aerial view", 2, quality=0.95, start=100),
             room("aerial-b", "aerial view", 2, quality=0.99, start=110),
-            room("side-yard", "front yard", 2, quality=1.0, start=120),
             room("front-facade", "exterior front", 2, quality=0.20, start=130),
+            room("front-yard", "front yard", 2, quality=1.0, start=120),
             room("entry", "entrance", 1, quality=0.30, start=140),
             room("living", "living room", 3, quality=0.9, start=150),
         ]
         line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
         opening = [shot.room_id for shot in line.shots if shot.act == 1]
-        self.assertEqual(opening, ["aerial-b", "front-facade", "entry"])
+        self.assertEqual(opening, ["aerial-b", "aerial-a", "front-yard", "front-facade", "entry"])
+
+    def test_one_component_can_supply_two_distinct_aerial_views(self):
+        rooms = [
+            room("aerial", "aerial view", 4, quality=0.95, pairs=2, start=100),
+            room("front", "exterior front", 2, quality=0.8, pairs=1, start=110),
+            room("entry", "entrance", 1, quality=0.7, start=120),
+            room("living", "living room", 3, quality=0.9, start=130),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        opening = [shot.room_id for shot in line.shots if shot.act == 1]
+        self.assertEqual(opening, ["aerial", "aerial", "front", "entry"])
+        aerial_photos = [shot.photo_ids for shot in line.shots[:2]]
+        self.assertFalse(set(aerial_photos[0]) & set(aerial_photos[1]))
+
+    def test_opening_prefers_a_yard_and_facade_over_two_yard_labels(self):
+        rooms = [
+            room("front-yard-a", "front yard", 2, quality=0.95, start=10),
+            room("front-yard-b", "front yard", 2, quality=0.90, start=11),
+            room("facade", "exterior front", 2, quality=0.60, start=12),
+            room("entry", "entrance", 1, quality=0.7, start=20),
+            room("living", "living room", 3, quality=0.9, start=25),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        opening = [shot.room_id for shot in line.shots if shot.act == 1]
+        self.assertEqual(opening, ["front-yard-a", "facade", "entry"])
+
+    def test_early_exterior_mislabel_can_complete_the_approach_but_not_repeat_late(self):
+        rooms = [
+            room("facade", "exterior front", 2, quality=0.8, start=10, scene_type="exterior"),
+            room("uncertain-exterior", "backyard", 2, quality=0.7, start=15, scene_type="exterior"),
+            room("late-backyard", "backyard", 2, quality=1.0, start=50, scene_type="exterior"),
+            room("entry", "entrance", 1, quality=0.7, start=20),
+            room("living", "living room", 3, quality=0.9, start=25),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        opening = [shot.room_id for shot in line.shots if shot.act == 1]
+        self.assertEqual(opening, ["facade", "uncertain-exterior", "entry"])
+        self.assertEqual(sum(shot.room_id == "uncertain-exterior" for shot in line.shots), 1)
+        self.assertNotIn("late-backyard", opening)
+
+    def test_opening_fallback_survives_the_generic_backyard_type_cap(self):
+        rooms = [
+            room("facade", "exterior front", 2, quality=0.8, start=10, scene_type="exterior"),
+            room("early-backyard-a", "backyard", 2, quality=0.95, start=12, scene_type="exterior"),
+            room("early-backyard-b", "backyard", 2, quality=0.90, start=14, scene_type="exterior"),
+            room("early-backyard-c", "backyard", 2, quality=0.85, start=16, scene_type="exterior"),
+            room("entry", "entrance", 1, quality=0.7, start=20),
+            room("living", "living room", 3, quality=0.9, start=25),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100, include_close_ups=False)
+        opening = [shot.room_id for shot in line.shots if shot.act == 1]
+        self.assertEqual(opening, ["facade", "early-backyard-a", "entry"])
 
     def test_acts_do_not_interleave(self):
         """Act 1 establishes, act 2 tours, act 3 closes -- in that order."""

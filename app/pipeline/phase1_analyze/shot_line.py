@@ -34,6 +34,7 @@ them, so the detail reads as a continuation rather than an unrelated image.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field, replace
 
 from app.pipeline.phase1_analyze.camera_move import CameraMove, choose_move
@@ -79,9 +80,14 @@ SERVICE_WEIGHT = 0.25          # garage got 3% of runtime: present, minimal
 MAX_HERO_SHOTS = 4
 # One short service beat for the whole film, as observed.
 MAX_SERVICE_SHOTS = 1
-# Wallace Dr spent 2s on the front yard before going inside, and 5 of its 16
-# rooms were exterior. Establishing is an approach, not a tour of the outside.
-MAX_ACT1_SHOTS = 4
+# The reference films use a directional establishing run rather than a single
+# obligatory exterior: aerial/garden when it earns its place, two or more
+# approach views, then the threshold. Five lets a well-covered property breathe
+# without turning the opening into an exterior tour. Sparse listings naturally
+# use fewer because this is a candidate cap, never a quota.
+MAX_ACT1_SHOTS = 5
+MAX_ACT1_AERIAL_SHOTS = 2
+MAX_ACT1_APPROACH_SHOTS = 3
 # The reference film averaged 2.2 shots per room. Letting one room take three
 # while another takes one produces a film that keeps returning to the same
 # kitchen instead of showing the house.
@@ -238,6 +244,10 @@ class RoomCandidate:
     # semantic zone and capture order without pretending they are new geometry.
     photo_positions: dict[int, int] = field(default_factory=dict)
     parent_component_id: int | None = None
+    # Component-level broad semantic class persisted alongside VGGT geometry.
+    # It does not claim which side of the house a photo shows and cannot turn a
+    # scene classifier's "backyard" label into evidence of a front facade.
+    scene_type: str | None = None
     secondary: bool = False
 
     @property
@@ -453,32 +463,114 @@ def _mark_secondary_kitchens(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
     return copies
 
 
+_PRIMARY_APPROACH_TYPES = ("front yard", "building exterior", "exterior front")
+_TOUR_INTERIOR_TYPES = ("entrance", "hallway", "living room", "dining room", "kitchen")
+
+
+def _opening_source_key(room: RoomCandidate) -> tuple[str, int | str]:
+    """Group semantic zones that came from one VGGT component."""
+    if room.parent_component_id is not None:
+        return ("component", room.parent_component_id)
+    return ("room", room.room_id)
+
+
+def _has_second_opening_view(room: RoomCandidate) -> bool:
+    """Whether this room can supply a second non-repeated establishing beat."""
+    return len(room.pairs) >= 2 or len(room.photo_ids) >= 4
+
+
+def _opening_slots(candidates: list[RoomCandidate], limit: int,
+                   *, diversify_types: bool = False) -> list[RoomCandidate]:
+    """Pick distinct components first, then a second verified view where earned."""
+    selected: list[RoomCandidate] = []
+    seen_sources: set[tuple[str, int | str]] = set()
+    seen_types: set[str] = set()
+    for room in candidates:
+        source = _opening_source_key(room)
+        if source in seen_sources or (diversify_types and room.room_type in seen_types):
+            continue
+        selected.append(room)
+        seen_sources.add(source)
+        seen_types.add(room.room_type)
+        if len(selected) == limit:
+            return selected
+
+    # A well photographed aerial or facade may live in one component. Its
+    # second disjoint pair is a new view; replaying the same photo is not.
+    for room in candidates:
+        if len(selected) == limit:
+            break
+        if room in selected and _has_second_opening_view(room):
+            selected.append(room)
+    return selected
+
+
+def _first_tour_interior_start(rooms: list[RoomCandidate]) -> int | None:
+    """Find the first plausible main-house interior in the upload sequence."""
+    starts = [
+        _room_start(room)
+        for room in rooms
+        if room.room_type in _TOUR_INTERIOR_TYPES and not is_secondary(room)
+    ]
+    return min(starts) if starts else None
+
+
 def _opening_sequence(rooms: list[RoomCandidate]) -> list[RoomCandidate]:
-    """Choose the protected approach: aerial -> facade -> entry/corridor.
+    """Choose an adaptive approach: up to two aerials -> approach -> entry.
 
-    `front yard` is only an approach fallback when no facade was recognised. It
-    must not displace a genuine front exterior simply because its image-quality
-    score happens to be higher.
+    Semantic labels identify explicit front material. A component-level exterior
+    label plus capture position before the first main-house interior can make an
+    uncertain `backyard` label eligible as a *fallback* approach candidate. It
+    remains lower priority than recognised front material, and patios/pools/back
+    exteriors never receive that promotion.
     """
-    def strongest(candidates: list[RoomCandidate]) -> RoomCandidate | None:
-        return max(candidates, key=lambda room: (room.quality, len(room.photo_ids), -_room_start(room)), default=None)
+    aerial_candidates = sorted(
+        (room for room in rooms
+         if room.room_type == "aerial view" or room.scene_type == "drone"),
+        key=lambda room: (-room.quality, -len(room.pairs), -len(room.photo_ids), _room_start(room), room.room_id),
+    )
+    aerials = _opening_slots(aerial_candidates, MAX_ACT1_AERIAL_SHOTS)
 
-    aerial = strongest([room for room in rooms if room.room_type == "aerial view"])
-    facade = strongest([
-        room for room in rooms
-        if room.room_type in {"exterior front", "building exterior"}
-    ])
-    arrival = facade or strongest([room for room in rooms if room.room_type == "front yard"])
-    entry = strongest([room for room in rooms if room.room_type == "entrance"])
-    corridor = strongest([room for room in rooms if room.room_type == "hallway"])
-    sequence = [room for room in (aerial, arrival, entry or corridor) if room is not None]
-    unique: list[RoomCandidate] = []
-    seen_ids: set[str] = set()
-    for room in sequence:
-        if room.room_id not in seen_ids:
-            unique.append(room)
-            seen_ids.add(room.room_id)
-    return unique
+    entry = max(
+        (room for room in rooms if room.room_type == "entrance"),
+        key=lambda room: (room.quality, len(room.photo_ids), -_room_start(room)),
+        default=None,
+    )
+    if entry is None:
+        # A corridor substitutes for an entry only when the listing lacks a
+        # labelled threshold. The first capture is a better approximation of
+        # the real approach than a high-quality hallway from a later suite.
+        entry = min(
+            (room for room in rooms if room.room_type == "hallway" and not is_secondary(room)),
+            key=lambda room: (_room_start(room), -room.quality, room.room_id),
+            default=None,
+        )
+
+    first_interior = _first_tour_interior_start(rooms)
+    approach: list[RoomCandidate] = []
+    for room in rooms:
+        if room.room_type in _PRIMARY_APPROACH_TYPES:
+            approach.append(room)
+            continue
+        # `backyard` is the only semantic fallback because it is frequently an
+        # exterior classifier's uncertain bucket. A genuine late backyard stays
+        # Act 3; position before the first house interior is required here.
+        if (room.room_type == "backyard" and room.scene_type == "exterior"
+                and (first_interior is None or _room_start(room) < first_interior)):
+            approach.append(room)
+    approach_priority = {room_type: index for index, room_type in enumerate(_PRIMARY_APPROACH_TYPES)}
+    approach.sort(key=lambda room: (
+        approach_priority.get(room.room_type, len(_PRIMARY_APPROACH_TYPES)),
+        _room_start(room),
+        -room.quality,
+        room.room_id,
+    ))
+    approach_limit = min(
+        MAX_ACT1_APPROACH_SHOTS,
+        max(0, MAX_ACT1_SHOTS - len(aerials) - int(entry is not None)),
+    )
+    approach = _opening_slots(approach, approach_limit, diversify_types=True)
+    return [*aerials, *approach, *([entry] if entry is not None else [])]
 
 
 def _closing_room(rooms: list[RoomCandidate]) -> RoomCandidate | None:
@@ -503,6 +595,12 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     eligible = [r for r in rooms
                 if r.photo_ids and is_eligible(r.room_type, allow_service=allow_service)]
     dropped = [r.room_id for r in rooms if r not in eligible]
+    # Select the protected approach before generic semantic caps. The caps are
+    # for the body of the tour; applying them first can discard a real front
+    # exterior merely because the classifier called several photos "backyard".
+    opening = _opening_sequence(eligible)
+    opening_ids = {room.room_id for room in opening}
+    opening_counts = Counter(room.room_id for room in opening)
 
     # Keep only the strongest few instances of any one room type: a property
     # with four bathrooms should show the best two, not all of them equally.
@@ -514,7 +612,12 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         cap = MAX_ROOMS_PER_TYPE.get(room.room_type, DEFAULT_MAX_ROOMS_PER_TYPE)
         if room.room_id == (initial_hero.room_id if initial_hero else None):
             cap = max(cap, 1)          # the hero always survives its own cap
-        if seen.get(room.room_type, 0) < cap:
+        if room.room_id in opening_ids:
+            # A deliberate opening candidate outranks the generic per-type
+            # cap. It is still bounded by MAX_ACT1_SHOTS above.
+            seen[room.room_type] = seen.get(room.room_type, 0) + 1
+            kept.append(room)
+        elif seen.get(room.room_type, 0) < cap:
             seen[room.room_type] = seen.get(room.room_type, 0) + 1
             kept.append(room)
         else:
@@ -555,11 +658,14 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     # components and a side-yard singleton to consume all four slots before a
     # front facade could appear. The approach has a fixed visual grammar, so
     # its candidates are selected by role rather than by generic room weight.
-    opening = _opening_sequence(eligible)
-    opening_ids = {room.room_id for room in opening}
     for room in eligible:
-        if _act_of(room) == 1:
-            alloc[room.room_id] = 1 if room.room_id in opening_ids else 0
+        if room.room_id in opening_counts:
+            # One component may earn two opening beats when it has two disjoint
+            # verified views. A fallback exterior promoted into Act 1 must not
+            # also reappear later under its noisy "backyard" label.
+            alloc[room.room_id] = opening_counts[room.room_id]
+        elif _act_of(room) == 1:
+            alloc[room.room_id] = 0
 
     # Reserving an absent facade or entry can add shots that generic weighted
     # allocation had already dropped in a short edit. Make room in the body now
@@ -608,7 +714,8 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         if alloc.get(room.room_id, 0):
             ordered.append((1, room))
     for act in (2, 3):
-        members = sorted((r for r in eligible if _act_of(r) == act),
+        members = sorted((r for r in eligible
+                          if _act_of(r) == act and r.room_id not in opening_ids),
                          key=lambda r: (is_secondary(r), _rank_in_act(r), -r.quality))
         # Every shot of a room runs consecutively. Cutting away to a bedroom in
         # the middle of the living room and back again reads as a shuffle, not a

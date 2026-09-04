@@ -73,6 +73,9 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
             ))
     else:
         source = "predicted components"
+        component_scene_types = dict(db.execute(text(
+            "SELECT id, scene_type FROM scene_components WHERE job_id = :j"),
+            {"j": job_id}).fetchall())
         memberships = db.execute(text(
             "SELECT scene_component_id, photo_id FROM scene_component_memberships "
             "WHERE job_id = :j"), {"j": job_id}).fetchall()
@@ -102,6 +105,7 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
                     quality=sum(by_id[i][3] for i in ids) / len(ids),
                     photo_positions={i: int(by_id[i][4] or 0) for i in ids},
                     parent_component_id=int(cid),
+                    scene_type=component_scene_types.get(cid),
                 ))
 
     for room in rooms:
