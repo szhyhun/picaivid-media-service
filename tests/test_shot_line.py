@@ -154,6 +154,15 @@ class RhythmTests(unittest.TestCase):
         self.assertGreater(slow.shots[0].duration_seconds,
                            fast.shots[0].duration_seconds)
 
+    def test_every_shot_requests_two_seconds_of_source_footage(self):
+        """Generation length is deliberately independent of the music tempo."""
+        for bpm in (80, 100, 120):
+            line = build_shot_line(a_property(), target_seconds=45, bpm=bpm)
+            self.assertTrue(all(
+                shot.generation_duration_seconds == 2.0
+                for shot in line.shots
+            ))
+
     def test_shots_are_contiguous_on_the_grid(self):
         line = build_shot_line(a_property(), target_seconds=45, bpm=100)
         for a, b in zip(line.shots, line.shots[1:]):

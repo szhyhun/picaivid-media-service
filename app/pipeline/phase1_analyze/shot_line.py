@@ -41,6 +41,7 @@ from app.pipeline.phase1_analyze.detail_crop import ResolvedDetail, close_up_rat
 from app.pipeline.phase1_analyze.editorial import (
     MIN_SHOTS,
     Tier,
+    SOURCE_GENERATION_SECONDS,
     is_eligible,
     shot_budget,
     shot_seconds,
@@ -238,7 +239,7 @@ class RoomCandidate:
 
 @dataclass
 class Shot:
-    """One beat of the film, ready to hand to video generation."""
+    """One two-beat final edit, with its fixed two-second source request."""
 
     index: int
     room_id: str
@@ -249,6 +250,9 @@ class Shot:
     start_seconds: float
     duration_seconds: float
     move: CameraMove
+    # This is source footage requested from the video provider, not the final
+    # edit hold. The renderer trims it to `duration_seconds` on the music grid.
+    generation_duration_seconds: float = SOURCE_GENERATION_SECONDS
     is_hero: bool = False
     # A close-up cropped from the shot it follows. `crop_box` is in source-pixel
     # coordinates on `photo_ids[0]`; None means the whole frame is used.

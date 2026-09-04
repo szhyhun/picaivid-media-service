@@ -566,6 +566,9 @@ async def get_project_shot_line(
         "rooms": len(rooms),
         "bpm": line.bpm,
         "shot_seconds": line.shots[0].duration_seconds if line.shots else 0,
+        "generation_seconds": (
+            line.shots[0].generation_duration_seconds if line.shots else 0
+        ),
         "duration": round(line.duration, 2),
         "hero_room_id": line.hero_room_id,
         "keyframe_fraction": round(line.keyframe_fraction(), 3),
@@ -579,6 +582,7 @@ async def get_project_shot_line(
             "is_hero": s.is_hero,
             "start_seconds": s.start_seconds,
             "duration_seconds": s.duration_seconds,
+            "generation_duration_seconds": s.generation_duration_seconds,
             "is_close_up": s.is_close_up,
             "crop_box": list(s.crop_box) if s.crop_box else None,
             "crop_score": round(s.crop_score, 4) if s.crop_score is not None else None,
