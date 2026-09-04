@@ -681,6 +681,11 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         ))
         cursor += per_shot
 
+    # A planned room can exhaust its distinct images and be skipped above. Make
+    # the response a true contiguous timeline rather than exposing planner-loop
+    # indices with holes to the editor.
+    shots = [replace(shot, index=index) for index, shot in enumerate(shots)]
+
     # Object-aware details are saved during Phase 1 and selected by the API after
     # the wide line is built. Planner-only invocation never makes a generic crop
     # simply to fill this optional slot.

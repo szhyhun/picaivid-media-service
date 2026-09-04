@@ -275,6 +275,15 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual([(s.room_id, tuple(s.photo_ids), s.move.label) for s in a.shots],
                          [(s.room_id, tuple(s.photo_ids), s.move.label) for s in b.shots])
 
+    def test_skipped_exhausted_room_does_not_leave_timeline_index_holes(self):
+        rooms = [
+            room("front", "exterior front", 1, quality=0.5, start=1),
+            room("living", "living room", 2, quality=1.0, pairs=1, start=10),
+            room("kitchen", "kitchen", 2, quality=0.8, pairs=1, start=20),
+        ]
+        line = build_shot_line(rooms, target_seconds=45, bpm=100, include_close_ups=False)
+        self.assertEqual([shot.index for shot in line.shots], list(range(len(line.shots))))
+
     def test_later_kitchen_capture_run_moves_after_main_private_rooms(self):
         rooms = [
             room("front", "exterior front", 1, start=1),
