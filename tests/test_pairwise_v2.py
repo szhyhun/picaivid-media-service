@@ -416,7 +416,8 @@ class PairingTests(unittest.TestCase):
     def test_unsafe_geometry_cannot_become_a_renderer_pair(self):
         from app.pipeline.phase1_analyze.pairing import score_pair
 
-        self.assertEqual(score_pair(self._ev(1, 2, 0.80, 85, 20.0)), 0.0)
+        self.assertGreater(score_pair(self._ev(1, 2, 0.80, 90, 20.0)), 0.0)
+        self.assertEqual(score_pair(self._ev(1, 2, 0.80, 150, 20.0)), 0.0)
         self.assertEqual(score_pair(self._ev(1, 3, 0.20, 30, 20.0)), 0.0)
 
     def test_duplicate_scores_zero(self):

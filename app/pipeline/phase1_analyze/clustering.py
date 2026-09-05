@@ -434,7 +434,7 @@ def _derive_render_groups(
                 continue        # historical V1 relation; no pairing evidence
             is_v2 = metrics.get("verification_source") == "vggt_pairwise_v2"
             has_v2_evidence = has_v2_evidence or is_v2
-            if is_v2 and not metrics.get("is_transition"):
+            if is_v2 and pairing.persisted_pair_score(left, right, metrics) <= 0:
                 continue        # broad component membership never authorizes a renderer pair
             evidence.append({
                 "photo_a_id": left,

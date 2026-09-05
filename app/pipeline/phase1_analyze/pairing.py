@@ -1,12 +1,14 @@
-"""Choose renderable two-keyframe shots using VGGT evidence.
+"""Choose cinematic two-keyframe candidates using VGGT evidence.
 
 Membership answers "is this part of the same broad scene?". A pair shot answers
-"can the renderer safely use these two images as endpoints?". Only the latter
-can create video motion, so a VGGT transition gate is a hard prerequisite.
+"do these views share enough geometry to propose a cinematic move?". Candidate
+selection allows up to 120 degrees, mutual depth agreement >= 0.30 and normalized
+baseline <= 2.0. These are provisional selection limits, not renderer validation.
 
 The older `preferred_cinematic_pairs` labels selected complementary story views;
 they are not ground truth for interpolability. They can influence how safe pairs
-are ranked, but cannot make a non-overlapping or high-rotation pair renderable.
+are ranked, but cannot make a non-overlapping pair eligible. The stricter
+transition assessment remains available separately in transitions.py.
 
 Per-room caps come from the owner: living room 3 pairs, any other room 2,
 exterior+aerial 3-4 combined. Caps are ceilings, never quotas -- a room with one
@@ -21,7 +23,7 @@ from dataclasses import dataclass
 from app.pipeline.phase1_analyze.transitions import is_duplicate, is_transition_safe
 
 MOTION_SWEET_SPOT_DEG = 35.0
-MOTION_MAX_DEG = 60.0
+MOTION_MAX_DEG = 120.0
 
 DEFAULT_CAPS = {"living": 3, "exterior": 4, "default": 2}
 
@@ -43,8 +45,7 @@ def _angle_fit(rot_deg: float) -> float:
         return 0.0
     if rot_deg <= MOTION_SWEET_SPOT_DEG:
         return rot_deg / MOTION_SWEET_SPOT_DEG
-    return max(0.0, 1.0 - (rot_deg - MOTION_SWEET_SPOT_DEG) /
-               (MOTION_MAX_DEG - MOTION_SWEET_SPOT_DEG))
+    return 1.0
 
 
 def _confidence_fit(conf_pair: float) -> float:
@@ -53,8 +54,13 @@ def _confidence_fit(conf_pair: float) -> float:
 
 
 def score_pair(evidence: dict) -> float:
-    """Quality of a safe VGGT pair, 0..1. Unsafe pairs always score zero."""
-    if not is_transition_safe(evidence):
+    """Rank overlapping cinematic candidates; renderer quality is unvalidated.
+
+    The strict transition assessment remains separate. Wide-angle candidates
+    need shared depth in both views, bounded translation and distinct poses.
+    """
+    if not is_transition_safe(evidence, min_depth_ok=0.30,
+                              max_bl_over_depth=2.0, max_rot_deg=MOTION_MAX_DEG):
         return 0.0
     depth_ok = evidence["depth_ok_min"]
     return (
@@ -62,6 +68,25 @@ def score_pair(evidence: dict) -> float:
         + 0.30 * _angle_fit(evidence["rot_deg"])
         + 0.20 * _confidence_fit(evidence["conf_pair"])
     )
+
+
+def persisted_pair_score(a: int, b: int, metrics: dict) -> float:
+    """Reassess saved geometry without trusting an older score or gate flag."""
+    if metrics.get("verification_source") != "vggt_pairwise_v2" or metrics.get("is_duplicate"):
+        return 0.0
+    try:
+        evidence = {
+            "photo_a_id": a, "photo_b_id": b,
+            "depth_ok_min": min(float(metrics["depth_ok_forward"]), float(metrics["depth_ok_backward"])),
+            "rot_deg": float(metrics["rotation_degrees"]),
+            "bl_over_depth": float(metrics["bl_over_depth"]),
+            "conf_pair": float(metrics["conf_pair"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    if not all(math.isfinite(value) for value in evidence.values()):
+        return 0.0
+    return score_pair(evidence)
 
 
 def cap_for(room_name: str | None, caps: dict[str, int] | None = None) -> int:

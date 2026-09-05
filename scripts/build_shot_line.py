@@ -16,6 +16,7 @@ import json
 from sqlalchemy import text
 
 from app.db.session import SessionLocal
+from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase1_analyze.shot_line import (
     RoomCandidate,
     build_shot_line,
@@ -66,8 +67,9 @@ def load_rooms(db, project_id: str) -> tuple[list[RoomCandidate], str]:
         dm = dm or {}
         if dm.get("verification_source") != "vggt_pairwise_v2":
             continue
-        if dm.get("is_transition") and not is_persisted_vggt_duplicate(dm):
-            pair_score[(a, b)] = float(dm.get("pair_score") or 0.0)
+        score = persisted_pair_score(a, b, dm)
+        if score > 0:
+            pair_score[(a, b)] = score
 
     truth = db.execute(text(
         "SELECT room_instances FROM scene_truth_sets WHERE project_id = :p"),
