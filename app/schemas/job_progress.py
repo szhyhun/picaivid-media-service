@@ -50,3 +50,23 @@ class CancelResponse(BaseModel):
     job_id: Optional[int] = None
     cancelled: bool
     detail: str
+
+
+class ProjectPurgeResponse(BaseModel):
+    """What removing a project's media-service data actually deleted.
+
+    Counts are reported per table rather than as a single total because the
+    caller (Rails) has no visibility into this schema, and a silent zero is the
+    failure mode that produced orphaned jobs in the first place.
+    """
+
+    project_id: str
+    jobs: int = 0
+    job_photos: int = 0
+    photo_relations: int = 0
+    scene_components: int = 0
+    photo_scene_geometry: int = 0
+    analysis_results: int = 0
+    room_clusters: int = 0
+    truth_sets: int = 0
+    detail: str = ""

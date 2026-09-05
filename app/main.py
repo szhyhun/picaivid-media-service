@@ -26,7 +26,11 @@ from app.db.session import get_db
 from app.models.warmup import warmup_core_models
 from app.pipeline.orchestrator import PipelineOrchestrator
 from app.pipeline.progress import STALE_AFTER_SECONDS
-from app.schemas.job_progress import CancelResponse, JobProgressResponse
+from app.schemas.job_progress import (
+    CancelResponse,
+    JobProgressResponse,
+    ProjectPurgeResponse,
+)
 from app.schemas.clip import (
     AnalysisInfo,
     ClipListResponse,
@@ -653,6 +657,70 @@ async def cancel_project_job(project_id: str, db: Session = Depends(get_db)):
     return CancelResponse(
         project_id=project_id, job_id=int(job.id), cancelled=True,
         detail="Cancellation requested; the worker will stop at the next checkpoint.",
+    )
+
+
+@app.delete("/api/projects/{project_id}", response_model=ProjectPurgeResponse)
+async def purge_project(project_id: str, db: Session = Depends(get_db)):
+    """Remove every media-service row belonging to a project.
+
+    Rails owns `projects` and cannot cascade into this service's tables:
+    `projects.id` is a uuid while `jobs.project_id` is a varchar, so no foreign
+    key can exist between them. Deleting a project in Rails therefore left its
+    jobs, photos, relations and whole scene graph behind -- eight projects had
+    accumulated sixteen orphaned jobs, a third of the table, before this
+    endpoint existed.
+
+    Every job-scoped table already cascades from `jobs`, so removing the job
+    rows is enough for them. `scene_truth_sets` is project-scoped with no job
+    reference and is deleted directly.
+
+    Idempotent by design: purging an unknown or already-purged project reports
+    zeros rather than failing, so a retried delete is always safe.
+    """
+    job_ids = [int(row[0]) for row in
+               db.query(Job.id).filter(Job.project_id == project_id).all()]
+
+    counts: dict[str, int] = {}
+    if job_ids:
+        for field, model in (
+            ("job_photos", JobPhoto),
+            ("photo_relations", PhotoRelation),
+            ("scene_components", SceneComponent),
+            ("photo_scene_geometry", PhotoSceneGeometry),
+            ("analysis_results", AnalysisResult),
+            ("room_clusters", RoomCluster),
+        ):
+            counts[field] = (
+                db.query(model).filter(model.job_id.in_(job_ids)).count()
+            )
+
+    truth = (
+        db.query(SceneTruthSet)
+        .filter(SceneTruthSet.project_id == project_id)
+        .delete(synchronize_session=False)
+    )
+    # The cascade does the rest; deleting jobs row-by-row would emit thousands
+    # of statements for a listing that has a full pairwise relation matrix.
+    deleted_jobs = (
+        db.query(Job)
+        .filter(Job.project_id == project_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    logger.info(
+        "PROJECT_PURGED project_id=%s jobs=%s photos=%s relations=%s truth_sets=%s",
+        project_id, deleted_jobs, counts.get("job_photos", 0),
+        counts.get("photo_relations", 0), truth,
+    )
+    return ProjectPurgeResponse(
+        project_id=project_id,
+        jobs=int(deleted_jobs),
+        truth_sets=int(truth),
+        detail=("Nothing to purge." if not deleted_jobs and not truth
+                else "Media-service data removed."),
+        **counts,
     )
 
 
