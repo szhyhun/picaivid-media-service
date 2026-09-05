@@ -37,6 +37,17 @@ class ScriptTests(unittest.TestCase):
     def test_camera_moves_are_carried_into_direction(self):
         self.assertIn("push in", self.script.prompt)
 
+    def test_exterior_pair_uses_a_restrained_partial_path(self):
+        exterior = next(
+            shot for shot in self.line.shots
+            if shot.room_type == "exterior front" and shot.uses_keyframes
+        )
+        script = build_script([exterior], bpm=100)
+        self.assertIn("second reference only to infer depth and travel direction", script.prompt)
+        self.assertIn("first half of that path", script.prompt)
+        self.assertIn("intermediate composition", script.prompt)
+        self.assertIn("leaves, grass, and shrubs may move softly", script.prompt)
+
     def test_room_ids_never_leak_into_the_prompt(self):
         """Instance ids like "bedroom-a" disambiguate for us, not for a model."""
         for suffix in ("bedroom-a", "living-room-staged", "component-"):
