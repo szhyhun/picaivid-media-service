@@ -240,6 +240,13 @@ def room_type_from_name(room_id: str, fallback: str = "") -> str:
     is the correct precedence: a person typing "bedroom-a" is ground truth.
     """
     name = (room_id or "").strip().lower()
+    # Explicit outdoor destinations place connecting stairs with the outdoor
+    # sequence; the generic "stairs" hint would otherwise make them a hallway.
+    if "stairs-to-" in name:
+        for destination, room_type in (("patio", "patio"), ("deck", "patio"),
+                                       ("backyard", "backyard"), ("pool", "pool")):
+            if destination in name.split("stairs-to-", 1)[1]:
+                return room_type
     for token, room_type in sorted(_NAME_HINTS, key=lambda h: -len(h[0])):
         if token in name:
             return room_type
