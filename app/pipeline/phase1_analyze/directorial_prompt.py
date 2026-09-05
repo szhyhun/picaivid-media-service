@@ -64,44 +64,6 @@ ROOM_PHRASES: dict[str, str] = {
     "walk-in closet": "the walk-in wardrobe",
 }
 
-EXTERIOR_ROOM_TYPES = frozenset({
-    "aerial view",
-    "building exterior",
-    "exterior front",
-    "exterior back",
-    "front yard",
-    "backyard",
-    "patio",
-    "pool",
-})
-
-
-def _exterior_motion_direction(shot) -> str:
-    """Direct a low-parallax exterior move without weakening its depth cue.
-
-    A second image is valuable geometric evidence, but completing the full
-    source-to-source path makes short exterior beats feel like a transition
-    demo. The generator instead uses it as a direction/depth reference and
-    ends while the move is still in progress.
-    """
-    if shot.room_type not in EXTERIOR_ROOM_TYPES:
-        return ""
-    if len(shot.photo_ids) >= 2:
-        return (
-            "Begin anchored in the first reference. Use the second reference "
-            "only to infer depth and travel direction, not as a required final "
-            "frame. Make a restrained, low-parallax move through roughly the "
-            "first half of that path and end on an intermediate composition. "
-            "Keep the facade, roofline, windows, doors, vehicles, and landscaping "
-            "layout fixed. Where visible, nearby leaves, grass, and shrubs may "
-            "move softly in a light breeze; this is subtle secondary motion only."
-        )
-    return (
-        "Keep the camera nearly anchored, with only a restrained low-parallax "
-        "drift. Keep the facade and landscaping layout fixed. Where visible, "
-        "nearby leaves, grass, and shrubs may move softly in a light breeze."
-    )
-
 
 @dataclass(frozen=True)
 class DirectorialScript:
@@ -172,9 +134,6 @@ def build_script(shots, *, bpm: float, property_description: str = "") -> Direct
             f"Shot {shot.index + 1} ({start:.1f}-{end:.1f}s): {room}, "
             f"{_move_phrase(shot.move.label)}."
         )
-        exterior_direction = _exterior_motion_direction(shot)
-        if exterior_direction:
-            lines[-1] = f"{lines[-1]} {exterior_direction}"
 
     prompt = "\n".join(header) + "\n\n" + "\n".join(lines)
     photo_ids: list[int] = []
