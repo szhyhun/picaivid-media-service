@@ -383,6 +383,8 @@ def _disjoint_pair_capacity(room: RoomCandidate) -> int:
 def _room_shot_capacity(room: RoomCandidate, hero_id: str | None) -> int:
     """Maximum distinct cinematic beats this room can supply."""
     cap = MAX_HERO_SHOTS if room.room_id == hero_id else MAX_SHOTS_PER_ROOM
+    if room.room_type in PRIMARY_SOCIAL_ROOM_TYPES and not is_secondary(room):
+        cap = 3
     pairs = _disjoint_pair_capacity(room)
     if room.room_type in PAIR_ONLY_ROOM_TYPES:
         return min(cap, pairs)
@@ -730,6 +732,10 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     for room in sorted(eligible, key=lambda r: (-len(r.photo_ids), -len(r.pairs),
                                                 -r.quality, r.room_id)):
         cap = MAX_ROOMS_PER_TYPE.get(room.room_type, DEFAULT_MAX_ROOMS_PER_TYPE)
+        if room.room_type in PRIMARY_SOCIAL_ROOM_TYPES and not is_secondary(room):
+            # Preserve split main-room components until aggregate shot budgeting.
+            kept.append(room)
+            continue
         if room.room_id == (initial_hero.room_id if initial_hero else None):
             cap = max(cap, 1)          # the hero always survives its own cap
         if room.room_id in opening_ids:
@@ -798,6 +804,34 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     for room in core_social:
         alloc[room.room_id] = max(alloc.get(room.room_id, 0), 1)
 
+    # Reserve two main-room beats across component boundaries, with a combined
+    # ceiling of three per type. Pair capacity already accounts for used photos.
+    social_pools = {
+        kind: sorted(
+            (room for room in eligible
+             if room.room_type == kind and not is_secondary(room)),
+            key=lambda room: (-len(room.pairs), -room.quality, _room_start(room), room.room_id),
+        ) for kind in PRIMARY_SOCIAL_ROOM_TYPES
+    }
+    floors = {room_id: 1 for room_id in core_social_ids}
+    for pool in social_pools.values():
+        for room in reversed(pool):
+            while sum(alloc.get(r.room_id, 0) for r in pool) > 3 and alloc.get(room.room_id, 0) > 0:
+                alloc[room.room_id] -= 1
+        remaining = max(0, core_capacity - sum(floors.values()))
+        protected = sum(floors.get(r.room_id, 0) for r in pool)
+        for room in pool:
+            already = floors.get(room.room_id, 0)
+            extra = min(_room_shot_capacity(room, hero_id) - already,
+                        2 - protected, remaining)
+            reserve = already + max(0, extra)
+            if reserve:
+                alloc[room.room_id] = max(alloc.get(room.room_id, 0), reserve)
+                core_social_ids.add(room.room_id)
+                floors[room.room_id] = reserve
+                remaining -= max(0, extra)
+                protected += max(0, extra)
+
     # Reserving an absent facade or entry can add shots that generic weighted
     # allocation had already dropped in a short edit. Make room in the body now
     # and keep one beat available for the deliberate exterior closing return.
@@ -828,6 +862,10 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         while shortfall > 0 and takers and i < len(takers) * 6:
             room = takers[i % len(takers)]
             cap = _room_shot_capacity(room, hero_id)
+            pool = social_pools.get(room.room_type, [])
+            if room in pool and sum(alloc.get(r.room_id, 0) for r in pool) >= 3:
+                i += 1
+                continue
             if alloc.get(room.room_id, 0) < cap:
                 alloc[room.room_id] = alloc.get(room.room_id, 0) + 1
                 shortfall -= 1

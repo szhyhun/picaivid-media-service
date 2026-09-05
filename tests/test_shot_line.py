@@ -331,6 +331,24 @@ class KeyframeTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_main_social_coverage_spans_components_without_suite_consuming_slots(self):
+        rooms = [
+            room("living-a", "living room", 1, start=10),
+            room("living-b", "living room", 1, start=11),
+            room("kitchen-a", "kitchen", 6, pairs=2, start=20),
+            room("kitchen-b", "kitchen", 2, start=22),
+            room("bed", "bedroom", 2, start=40),
+            room("suite-living", "living room", 4, start=70),
+        ]
+        line = build_shot_line(rooms, target_seconds=45, bpm=100)
+        main_living = [s for s in line.shots if s.room_id in {"living-a", "living-b"}]
+        main_kitchen = [s for s in line.shots if s.room_id in {"kitchen-a", "kitchen-b"}]
+        self.assertEqual(len(main_living), 2)
+        self.assertGreaterEqual(len(main_kitchen), 2)
+        self.assertLessEqual(len(main_kitchen), 3)
+        self.assertLess(max(s.index for s in main_living),
+                        min(s.index for s in line.shots if s.room_id == "suite-living"))
+
     def test_pair_consumes_one_budget_slot_and_remainder_goes_to_available_room(self):
         bedroom = room("bed", "bedroom", 2, pairs=1, start=10)
         patio = room("patio", "patio", 4, start=20)
