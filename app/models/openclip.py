@@ -21,6 +21,10 @@ ROOM_TYPES = [
     "storage",
     "amenities",
     "shared space",
+    "gym",
+    "walk-in closet",
+    "building lobby",
+    "elevator lobby",
     "building exterior",
     "dining room",
     "office",
@@ -39,6 +43,26 @@ ROOM_TYPES = [
 ]
 
 ROOM_PROMPTS = {
+    "gym": [
+        "a photo of a fitness room with exercise equipment",
+        "an interior photo of a gym with weights, a treadmill or an exercise bike",
+        "a real estate photo of a small home workout room",
+    ],
+    "walk-in closet": [
+        "a photo of a walk-in wardrobe with hanging clothes",
+        "an interior photo of a clothes closet with clothing rails and shoe shelves",
+        "a real estate photo of a dressing room with wardrobes",
+    ],
+    "building lobby": [
+        "a photo of an apartment building lobby with mailboxes and an intercom",
+        "an interior photo of a communal residential reception lobby",
+        "a photo of a shared building entrance with multiple apartment mailboxes",
+    ],
+    "elevator lobby": [
+        "a photo of elevator doors and call buttons in a residential building",
+        "an interior photo of an apartment elevator landing",
+        "a photo of a communal lift lobby with elevator doors",
+    ],
     # Every room type gets several descriptive prompts. Earlier only garage,
     # bathroom, storage and laundry were tuned while the rest fell back to a bare
     # "a photo of a {room}", so the tuned classes acted as attractors: measured
@@ -74,7 +98,7 @@ ROOM_PROMPTS = {
     # "shared-territory" and "building-front" -- categories the classifier could
     # not express, so those photos were guaranteed wrong.
     "amenities": [
-        "a photo of a building gym or fitness room",
+        "a photo of a communal recreation room for residents",
         "a photo of a shared residents lounge or clubhouse",
         "a photo of a building amenity room such as a games room or media room",
     ],

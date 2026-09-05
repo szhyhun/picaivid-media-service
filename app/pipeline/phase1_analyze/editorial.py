@@ -50,6 +50,10 @@ EDITORIAL_TIER: dict[str, Tier] = {
     "pool": Tier.FEATURE,
     "exterior back": Tier.FEATURE,
     "amenities": Tier.FEATURE,      # for apartments this *is* the selling point
+    "gym": Tier.FEATURE,
+    "building lobby": Tier.CONNECTIVE,
+    "elevator lobby": Tier.CONNECTIVE,
+    "walk-in closet": Tier.SERVICE,
     # Needed to move between spaces, but not a destination.
     "entrance": Tier.CONNECTIVE,
     "hallway": Tier.CONNECTIVE,

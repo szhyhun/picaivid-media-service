@@ -22,6 +22,7 @@ from app.pipeline.phase1_analyze.shot_line import (
     build_shot_line,
     is_persisted_vggt_duplicate,
     room_type_from_name,
+    space_scope,
 )
 
 
@@ -185,6 +186,7 @@ def main() -> None:
                 "hero_room_id": line.hero_room_id,
                 "shots": [{
                     "index": s.index, "room_id": s.room_id, "room_type": s.room_type,
+                    "space_scope": space_scope(s.room_type),
                     "photo_ids": s.photo_ids, "kind": s.kind, "act": s.act,
                     "start_seconds": s.start_seconds,
                     "duration_seconds": s.duration_seconds,

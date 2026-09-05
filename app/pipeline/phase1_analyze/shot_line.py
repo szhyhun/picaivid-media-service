@@ -176,8 +176,12 @@ STORY_POSITION: dict[str, float] = {
     "hallway": 0.24,
     "dining room": 0.29,
     "kitchen": 0.31,
-    "amenities": 0.45,
-    "shared space": 0.45,
+    "amenities": 0.69,
+    "shared space": 0.69,
+    "building lobby": 0.69,
+    "elevator lobby": 0.69,
+    "gym": 0.64,
+    "walk-in closet": 0.88,
     "office": 0.56,
     "bedroom": 0.59,
     "bathroom": 0.62,
@@ -447,8 +451,17 @@ def is_secondary(room: RoomCandidate) -> bool:
     return any(marker in name for marker in _SECONDARY_MARKERS)
 
 
+def space_scope(room_type: str) -> str:
+    """Describe predicted communal use; room function alone cannot prove ownership."""
+    if room_type in {"shared space", "building lobby", "elevator lobby"}:
+        return "shared"
+    return "unknown"
+
+
 def story_position(room: RoomCandidate) -> float:
     """Where this room belongs in the film, from the measured medians."""
+    if space_scope(room.room_type) == "shared":
+        return 0.69
     if room.secondary:
         return SECONDARY_UNIT_POSITION
     return STORY_POSITION.get(room.room_type, DEFAULT_POSITION)

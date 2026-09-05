@@ -58,6 +58,10 @@ ROOM_PHRASES: dict[str, str] = {
     "exterior back": "the rear exterior",
     "amenities": "the building amenities",
     "shared space": "the shared residents' area",
+    "gym": "the fitness room",
+    "building lobby": "the building lobby",
+    "elevator lobby": "the elevator lobby",
+    "walk-in closet": "the walk-in wardrobe",
 }
 
 
