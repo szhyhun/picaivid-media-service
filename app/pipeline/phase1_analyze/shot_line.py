@@ -801,14 +801,6 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     core_capacity = max(0, budget - sum(opening_counts.values()) - close_reserve)
     core_social = _core_social_coverage(eligible)[:core_capacity]
     core_social_ids = {room.room_id for room in core_social}
-    closing_yard = max(
-        (room for room in eligible if room.room_type == "front yard"
-         and room.room_id not in opening_ids and room.pairs),
-        key=lambda room: (room.pairs[0][2], room.quality), default=None,
-    )
-    if closing_yard is not None:
-        alloc[closing_yard.room_id] = max(1, alloc.get(closing_yard.room_id, 0))
-        core_social_ids.add(closing_yard.room_id)
     for room in core_social:
         alloc[room.room_id] = max(alloc.get(room.room_id, 0), 1)
 
@@ -915,10 +907,6 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
     if ordered:
         closing_types = ("aerial view", "exterior front", "front yard", "building exterior")
         already = ordered[-1][1].room_type in closing_types
-        if ordered[-1][1].room_type == "front yard" and any(
-            room.room_type in _FACADE_APPROACH_TYPES for room in eligible
-        ):
-            already = False
         if not already:
             closer = _closing_room(eligible)
             if closer is not None:
