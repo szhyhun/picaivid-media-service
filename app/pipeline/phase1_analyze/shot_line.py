@@ -383,9 +383,12 @@ def _disjoint_pair_capacity(room: RoomCandidate) -> int:
 def _room_shot_capacity(room: RoomCandidate, hero_id: str | None) -> int:
     """Maximum distinct cinematic beats this room can supply."""
     cap = MAX_HERO_SHOTS if room.room_id == hero_id else MAX_SHOTS_PER_ROOM
+    pairs = _disjoint_pair_capacity(room)
     if room.room_type in PAIR_ONLY_ROOM_TYPES:
-        return min(cap, _disjoint_pair_capacity(room))
-    return min(cap, len(room.photo_ids))
+        return min(cap, pairs)
+    # Each selected pair consumes two source photos but produces one beat.
+    singles = max(0, len(room.photo_ids) - 2 * pairs)
+    return min(cap, pairs + singles)
 
 
 def allocate_shots(rooms: list[RoomCandidate], budget: int,

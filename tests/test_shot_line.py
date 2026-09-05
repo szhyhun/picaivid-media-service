@@ -331,6 +331,18 @@ class KeyframeTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_pair_consumes_one_budget_slot_and_remainder_goes_to_available_room(self):
+        bedroom = room("bed", "bedroom", 2, pairs=1, start=10)
+        patio = room("patio", "patio", 4, start=20)
+        allocation = allocate_shots([bedroom, patio], budget=3, hero_id=None)
+        self.assertEqual(allocation, {"bed": 1, "patio": 2})
+
+    def test_overlapping_pairs_do_not_remove_unpaired_single_capacity(self):
+        living = room("living", "living room", 4, start=10)
+        living.pairs = [(10, 11, 0.9), (11, 12, 0.8)]
+        allocation = allocate_shots([living], budget=4, hero_id="living")
+        self.assertEqual(allocation, {"living": 3})
+
     def test_bedroom_wins_a_one_shot_budget_over_a_bathroom(self):
         bedroom = room("bedroom", "bedroom", 1, quality=0.1, start=10)
         bathroom = room("bathroom", "bathroom", 4, quality=1.0, pairs=2, start=20)
