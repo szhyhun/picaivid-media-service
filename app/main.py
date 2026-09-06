@@ -1,9 +1,11 @@
 """FastAPI application for Picaivid Media Service."""
 from datetime import datetime
+import uuid
 import logging
 from typing import Dict
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -30,6 +32,28 @@ from app.schemas.job_progress import (
     CancelResponse,
     JobProgressResponse,
     ProjectPurgeResponse,
+)
+from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
+from app.db.models.timeline import TimelineClip
+from app.pipeline.phase1_analyze.pairing import persisted_pair_score
+from app.pipeline.phase4_assembly.render import assemble_timeline_film
+from app.pipeline.phase3_timeline.generate import (
+    generate_timeline_clips,
+    pending_shots,
+)
+from app.pipeline.phase3_timeline.materialize import (
+    latest_timeline,
+    materialize_timeline,
+)
+from app.pipeline.progress import JobProgress
+from app.db.session import SessionLocal
+from app.schemas.timeline import (
+    CandidateListResponse,
+    CandidatePhoto,
+    TimelinePhoto,
+    TimelineResponse,
+    TimelineShot,
+    TimelineUpdateRequest,
 )
 from app.schemas.clip import (
     AnalysisInfo,
@@ -109,9 +133,11 @@ def _s3_key_from_uri(s3_uri: str | None) -> str | None:
     return s3_uri
 
 
-def _signed_url(s3_uri: str | None) -> str | None:
+def _signed_url(s3_uri: str | None, expires_in: int = 3600) -> str | None:
+    """Presign an object. Generation submits need a longer window than the UI:
+    a Runware job can sit in a queue for minutes and then fetch the image."""
     key = _s3_key_from_uri(s3_uri)
-    return s3_client.generate_presigned_url(key, expires_in=3600) if key else None
+    return s3_client.generate_presigned_url(key, expires_in=expires_in) if key else None
 
 
 def _photo_geometry_map(db: Session, job_id: int) -> dict[int, PhotoSceneGeometry]:
@@ -722,6 +748,305 @@ async def purge_project(project_id: str, db: Session = Depends(get_db)):
                 else "Media-service data removed."),
         **counts,
     )
+
+
+def _latest_job_id(db: Session, project_id: str) -> int | None:
+    row = (db.query(Job.id).filter(Job.project_id == project_id)
+           .order_by(Job.id.desc()).first())
+    return int(row[0]) if row else None
+
+
+def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineResponse:
+    """Serialise a stored timeline. Timing is recomputed here, never trusted."""
+    if timeline is None:
+        return TimelineResponse(project_id=project_id,
+                                detail="No timeline yet. POST to create one.")
+
+    clips = timeline.ordered_clips()
+    timeline.retime()
+
+    photo_ids = [pid for c in clips for pid in (c.photo_ids or [])]
+    photo_rows = (db.query(JobPhoto).filter(JobPhoto.id.in_(photo_ids)).all()
+                  if photo_ids else [])
+    photo_map = {int(p.id): p for p in photo_rows}
+
+    def photo(pid: int) -> TimelinePhoto:
+        row = photo_map.get(int(pid))
+        if row is None:
+            return TimelinePhoto(id=int(pid))
+        return TimelinePhoto(id=int(row.id), thumbnail_url=_signed_url(row.s3_uri),
+                             position=row.position, room_label=row.room_label)
+
+    grid = timeline.grid_seconds
+    shots = [
+        TimelineShot(
+            shot_uid=c.shot_uid, order_index=c.order_index, state=c.state,
+            room_id=c.room_id, room_type=c.room_type, act=c.act, kind=c.kind,
+            is_close_up=bool(c.is_close_up),
+            in_time=c.in_time or 0.0, duration=c.duration_for(grid),
+            trim_start=c.trim_start or 0.0, max_duration=c.max_duration(),
+            duration_override=c.duration_override,
+            move=c.move_label, move_vector=c.move_vector,
+            crop_box=c.crop_box, subject_box=c.subject_box,
+            source_size=c.source_size, detail_subject=c.detail_subject,
+            prompt_override=c.prompt_override,
+            video_url=_signed_url(c.clip.s3_uri) if c.clip else None,
+            photos=[photo(pid) for pid in (c.photo_ids or [])],
+        )
+        for c in clips
+    ]
+    return TimelineResponse(
+        project_id=project_id, timeline_id=timeline.id, version=timeline.version,
+        status=timeline.status or "draft", bpm=timeline.bpm,
+        beats_per_shot=timeline.beats_per_shot, shot_seconds=grid,
+        source_seconds=TL_SOURCE_SECONDS, duration=timeline.total_duration or 0.0,
+        shots=shots,
+    )
+
+
+@app.get("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
+async def get_timeline(project_id: str, db: Session = Depends(get_db)):
+    """The stored, editable timeline. Empty until one is materialised."""
+    job_id = _latest_job_id(db, project_id)
+    if job_id is None:
+        return TimelineResponse(project_id=project_id, detail="No job for this project.")
+    return _timeline_payload(db, project_id, latest_timeline(db, job_id))
+
+
+@app.post("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
+async def create_timeline(project_id: str, seconds: float = 45.0, bpm: float = 100.0,
+                          force: bool = False, db: Session = Depends(get_db)):
+    """Materialise the computed shot line into an editable timeline.
+
+    Returns the existing one unless `force` -- re-materialising discards manual
+    arrangement, so it has to be asked for rather than happening on a refresh.
+    """
+    job_id = _latest_job_id(db, project_id)
+    if job_id is None:
+        raise HTTPException(status_code=404, detail="No job for this project.")
+
+    existing = latest_timeline(db, job_id)
+    if existing is not None and not force:
+        return _timeline_payload(db, project_id, existing)
+
+    from scripts.build_shot_line import load_rooms
+    try:
+        rooms, _ = load_rooms(db, project_id)
+    except SystemExit as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    timeline = materialize_timeline(db, job_id, rooms,
+                                    target_seconds=seconds, bpm=bpm)
+    return _timeline_payload(db, project_id, timeline)
+
+
+@app.put("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
+async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
+                          db: Session = Depends(get_db)):
+    """Replace the shot list with the order given.
+
+    A drag is a reorder, an insert and a delete at once, so the whole list is
+    sent and applied atomically; a half-applied drag is worse than a refused one.
+    Rows are matched by `shot_uid` so a generated clip survives being moved.
+    """
+    job_id = _latest_job_id(db, project_id)
+    timeline = latest_timeline(db, job_id) if job_id else None
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="No timeline to update.")
+
+    if payload.bpm or payload.beats_per_shot:
+        grid = dict(timeline.beat_grid or {})
+        if payload.bpm:
+            grid["bpm"] = payload.bpm
+        if payload.beats_per_shot:
+            grid["beats_per_shot"] = payload.beats_per_shot
+        timeline.beat_grid = grid
+
+    existing = {c.shot_uid: c for c in timeline.timeline_clips if c.shot_uid}
+    keep: set[str] = set()
+
+    for index, incoming in enumerate(payload.shots):
+        row = existing.get(incoming.shot_uid) if incoming.shot_uid else None
+        if row is None:
+            # A photo dropped onto the timeline. It is a real row immediately --
+            # duration comes from the beat grid, not from a video that does not
+            # exist yet, so the schedule is correct before generation finishes.
+            row = TimelineClip(timeline_id=timeline.id,
+                               shot_uid=str(uuid.uuid4()),
+                               transition_type="cut")
+            db.add(row)
+            row.room_id = incoming.room_id
+            row.room_type = incoming.room_type
+            row.act = incoming.act
+            row.move_label = incoming.move or "push in + pan right"
+        row.order_index = index
+        row.photo_ids = list(incoming.photo_ids)
+        row.kind = incoming.kind
+        row.trim_start = max(0.0, float(incoming.trim_start or 0.0))
+        row.duration_override = incoming.duration_override
+        row.prompt_override = incoming.prompt_override
+        keep.add(row.shot_uid)
+
+    for uid, row in existing.items():
+        if uid not in keep:
+            db.delete(row)
+
+    db.flush()
+    db.expire(timeline, ["timeline_clips"])
+    timeline.retime()
+    db.commit()
+    db.refresh(timeline)
+    return _timeline_payload(db, project_id, timeline)
+
+
+@app.get("/api/projects/{project_id}/timeline/candidates",
+         response_model=CandidateListResponse)
+async def get_timeline_candidates(project_id: str, db: Session = Depends(get_db)):
+    """Photos with no shot on the timeline, for the add-shot rail.
+
+    Each carries the verified partner it could form a pair shot with, when one
+    exists and is also unused -- two real endpoints beat one, so the UI should
+    offer that rather than making the user find it.
+    """
+    job_id = _latest_job_id(db, project_id)
+    if job_id is None:
+        return CandidateListResponse(project_id=project_id)
+
+    timeline = latest_timeline(db, job_id)
+    used = {int(pid) for c in (timeline.timeline_clips if timeline else [])
+            for pid in (c.photo_ids or [])}
+
+    photos = (db.query(JobPhoto)
+              .filter(JobPhoto.job_id == job_id)
+              .filter(JobPhoto.exclude.isnot(True))
+              .filter(JobPhoto.is_duplicate.isnot(True))
+              .order_by(JobPhoto.position).all())
+    free = [p for p in photos if int(p.id) not in used]
+    free_ids = {int(p.id) for p in free}
+
+    partner: dict[int, int] = {}
+    if free_ids:
+        for a, b, metrics in db.execute(text(
+            "SELECT photo_a_id, photo_b_id, debug_metrics FROM photo_relations "
+            "WHERE job_id = :j"), {"j": job_id}).fetchall():
+            a, b = int(a), int(b)
+            if a not in free_ids or b not in free_ids:
+                continue
+            if a in partner or b in partner:
+                continue
+            if persisted_pair_score(a, b, metrics or {}) > 0.0:
+                partner[a] = b
+                partner[b] = a
+
+    return CandidateListResponse(
+        project_id=project_id,
+        photos=[CandidatePhoto(id=int(p.id), thumbnail_url=_signed_url(p.s3_uri),
+                               position=p.position, room_label=p.room_label,
+                               pair_with=partner.get(int(p.id)))
+                for p in free],
+    )
+
+
+class GenerateRequest(BaseModel):
+    """Which shots to generate. Empty means every shot that still needs one."""
+
+    shot_uids: list[str] = []
+    resolution: str | None = None
+
+
+@app.post("/api/projects/{project_id}/timeline/generate")
+async def generate_timeline(project_id: str, payload: GenerateRequest,
+                            background: BackgroundTasks,
+                            db: Session = Depends(get_db)):
+    """Generate video for the timeline's pending shots.
+
+    Returns immediately with what it is about to do; the work runs in the
+    background and reports through the normal job progress endpoint, because a
+    thirty-shot listing takes minutes and no browser should hold a request open
+    for that.
+
+    Generation costs real money per shot, so the response states the count and
+    the resolution it is spending at rather than leaving that implicit.
+    """
+    job_id = _latest_job_id(db, project_id)
+    timeline = latest_timeline(db, job_id) if job_id else None
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="No timeline to generate.")
+    if not settings.RUNWARE_API_KEY:
+        raise HTTPException(status_code=503,
+                            detail="RUNWARE_API_KEY is not configured.")
+
+    wanted = set(payload.shot_uids or [])
+    pending = [c for c in pending_shots(timeline)
+               if not wanted or c.shot_uid in wanted]
+    if not pending:
+        return {"project_id": project_id, "requested": 0,
+                "detail": "Every shot already has video."}
+
+    resolution = payload.resolution or settings.RUNWARE_RESOLUTION
+    uids = [c.shot_uid for c in pending]
+
+    def run() -> None:
+        session = SessionLocal()
+        try:
+            tl = latest_timeline(session, job_id)
+            generate_timeline_clips(
+                session, tl, progress=JobProgress(job_id), shot_uids=uids)
+        except Exception:                       # noqa: BLE001 - logged, not raised
+            logger.exception("TIMELINE_GENERATION_FAILED project_id=%s", project_id)
+        finally:
+            session.close()
+
+    background.add_task(run)
+    logger.info("TIMELINE_GENERATION_QUEUED project_id=%s shots=%s resolution=%s",
+                project_id, len(pending), resolution)
+    return {"project_id": project_id, "requested": len(pending),
+            "resolution": resolution, "shot_uids": uids,
+            "detail": f"Generating {len(pending)} shot(s) at {resolution}."}
+
+
+@app.post("/api/projects/{project_id}/timeline/assemble")
+async def assemble_timeline(project_id: str, background: BackgroundTasks,
+                            db: Session = Depends(get_db)):
+    """Cut the generated clips into the finished film.
+
+    Refuses while any shot is still planned, generating or failed. Silently
+    holding a freeze-frame where a clip should be would be worse than saying
+    which shots are outstanding.
+    """
+    job_id = _latest_job_id(db, project_id)
+    timeline = latest_timeline(db, job_id) if job_id else None
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="No timeline to assemble.")
+
+    clips = timeline.ordered_clips()
+    if not clips:
+        raise HTTPException(status_code=409, detail="The timeline is empty.")
+
+    outstanding = [c.shot_uid for c in clips if c.state != "ready"]
+    if outstanding:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{len(outstanding)} shot(s) have no video yet.")
+
+    grid = timeline.grid_seconds
+    plan = [{"shot_uid": c.shot_uid, "s3_uri": c.clip.s3_uri,
+             "trim_start": c.trim_start or 0.0, "duration": c.duration_for(grid)}
+            for c in clips]
+    total = round(sum(p["duration"] for p in plan), 2)
+
+    def run() -> None:
+        session = SessionLocal()
+        try:
+            assemble_timeline_film(session, job_id, plan)
+        except Exception:                       # noqa: BLE001 - logged, not raised
+            logger.exception("TIMELINE_ASSEMBLY_FAILED project_id=%s", project_id)
+        finally:
+            session.close()
+
+    background.add_task(run)
+    return {"project_id": project_id, "shots": len(plan), "duration": total,
+            "detail": f"Assembling {len(plan)} shots into {total}s."}
 
 
 @app.get("/api/projects/{project_id}/scenes/debug", response_model=SceneDebugResponse)

@@ -31,6 +31,13 @@ class Clip(Base):
     id = Column(Integer, primary_key=True)
     job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
     room_cluster_id = Column(Integer, ForeignKey("room_clusters.id"), nullable=True)
+    # Links back to the shot that asked for this clip. Survives reordering,
+    # unlike the clip's position in any list.
+    shot_uid = Column(String(36), index=True)
+    provider = Column(String(50))
+    # Written before we await the provider, so a worker restart resumes an
+    # in-flight generation rather than paying for it a second time.
+    provider_task_uuid = Column(String(64), index=True)
     source_photo_ids = Column(JSONB)  # Array of photo IDs
     motion_type = Column(String(50))
     model_used = Column(String(100))  # LTX-2 single/interp/parallax/multi-view, SEVA

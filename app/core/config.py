@@ -67,6 +67,29 @@ class Settings(BaseSettings):
     DETAIL_DETECTOR_MIN_SCORE: float = 0.35
     DETAIL_DETECTOR_BATCH_SIZE: int = 4
 
+    # Video generation (Runware -> Vidu Q3 Turbo).
+    #
+    # Every shot buys RUNWARE_DURATION_SECONDS of source and the editor cuts a
+    # beat-length slice out of the middle. Buying 3s costs a little more than
+    # the ~1.2s we show, and it is what makes retiming and trimming free: any
+    # tempo above 40 BPM fits inside it, so changing the music never
+    # regenerates a clip.
+    #
+    # RESOLUTION defaults to the cheapest tier on purpose. Generation costs real
+    # money per shot, so raising it is an explicit act, not a default anyone
+    # inherits by forgetting.
+    RUNWARE_API_KEY: str | None = None
+    RUNWARE_API_URL: str = "https://api.runware.ai/v1"
+    RUNWARE_MODEL: str = "vidu:4@2"
+    RUNWARE_DURATION_SECONDS: int = 3
+    RUNWARE_RESOLUTION: str = "540p"          # 720p for test, 1080p for production
+    # Runware publishes no hard rate limit but queues dynamically; their own
+    # guidance is 2-4 concurrent for best throughput.
+    RUNWARE_MAX_CONCURRENCY: int = 4
+    RUNWARE_POLL_INTERVAL_SECONDS: float = 5.0
+    RUNWARE_MAX_POLL_ATTEMPTS: int = 240
+    RUNWARE_SUBMIT_URL_EXPIRY_SECONDS: int = 21600   # 6h: a queued job fetches late
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

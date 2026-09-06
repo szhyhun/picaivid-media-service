@@ -180,3 +180,128 @@ def split_for_generation(shots, *, max_seconds: float = 30.0) -> list[list]:
     if current:
         segments.append(current)
     return segments
+
+
+# --- Per-shot prompts for clip-by-clip image-to-video generation -------------
+#
+# Everything above builds ONE prompt for a whole film, for models that generate
+# a multi-shot sequence in a single pass. Vidu Q3 Turbo works the other way:
+# one clip per shot, from one or two real photographs. That inverts the job.
+# The model already has the pixels, so the prompt's only work is motion.
+#
+# Rules, all measured in REFERENCE_FILM_FINDINGS.md:
+#
+# * **Never describe the room.** Describing a building the model can already see
+#   invites it to invent a different one. Motion instructions only.
+# * **Pairs name no direction.** With a start and an end frame the path is
+#   already decided; naming a direction on top asks the model to satisfy two
+#   constraints at once and it satisfies neither.
+# * **Singles must name one**, because nothing else determines it.
+# * **Ask for slower than you want.** A 3s clip cut down to a 1.2s beat plays
+#   2.5x faster than generated.
+# * **Give the scene life.** Only 4% of reference shots hold still, and a frozen
+#   world under a moving camera reads as a slideshow -- the exact failure this
+#   product exists to avoid.
+
+# What the camera does, per shot class. Interiors name two axes because over
+# 80% of reference shots move on two or more; a single axis reads as a pan
+# across a photograph.
+_MOTION_BY_CLASS: dict[str, str] = {
+    "aerial": "pulling back and up to reveal the property and its setting",
+    "approach": "drifting forward with a gentle pan",
+    "threshold": "moving forward through the doorway",
+    "interior": "pushing in slowly with a slight pan and a gentle tilt",
+    "detail": "pushing in slowly toward the subject",
+    "outdoor": "drifting slowly across the space",
+    "closing": "pulling back slowly to leave the property",
+}
+
+# What moves besides the camera. Empty where invented movement would look wrong
+# -- nothing should stir in a bathroom, and an aerial is too far up to read it.
+_SCENE_LIFE: dict[str, str] = {
+    "aerial": "",
+    "approach": "Leaves and grasses move gently in a light breeze.",
+    "threshold": "",
+    "interior": "Soft daylight, curtains settling gently.",
+    "detail": "",
+    "outdoor": "Foliage moving gently in a light breeze.",
+    "closing": "Leaves moving gently in a light breeze.",
+}
+
+_AERIAL_TYPES = frozenset({"aerial view"})
+_APPROACH_TYPES = frozenset({"front yard", "exterior front", "building exterior"})
+_THRESHOLD_TYPES = frozenset({"entrance", "hallway"})
+_OUTDOOR_TYPES = frozenset({"patio", "pool", "backyard", "exterior back"})
+
+# Applies to every shot. "Static architecture" is the load-bearing phrase: the
+# building must not change, only the camera looking at it.
+_INVARIANTS = (
+    "Photorealistic. Static architecture, unchanged building geometry. "
+    "Constant speed, no acceleration, no easing. "
+    "No people, no text, no logos. No cuts, no dissolves."
+)
+
+
+def shot_class(room_type: str | None, *, is_close_up: bool = False,
+               act: int | None = None, is_last: bool = False) -> str:
+    """Which of the seven directorial classes this shot belongs to."""
+    room = (room_type or "").strip().lower()
+    if is_close_up:
+        return "detail"
+    if room in _AERIAL_TYPES:
+        return "closing" if is_last else "aerial"
+    if room in _APPROACH_TYPES:
+        return "closing" if (is_last or act == 3) else "approach"
+    if room in _THRESHOLD_TYPES:
+        return "threshold"
+    if room in _OUTDOOR_TYPES:
+        return "outdoor"
+    return "interior"
+
+
+def _speed_word(squeeze_factor: float) -> str:
+    """How slow to ask for, given how much the edit will speed it up.
+
+    Generating 3s to show 1.2s multiplies apparent motion by 2.5. It is far
+    easier to make a model move too little than to make it move smoothly, so
+    we lean on the side of too little.
+    """
+    if squeeze_factor >= 2.0:
+        return "Very slow"
+    if squeeze_factor >= 1.4:
+        return "Slow"
+    return "Gentle"
+
+
+def build_shot_prompt(shot, *, squeeze_factor: float = 2.5,
+                      is_last: bool = False) -> str:
+    """Write the motion direction for one generated clip.
+
+    `shot` needs `room_type`, `kind`, `is_close_up`, `act` and `move`; both the
+    in-memory `Shot` and a stored `TimelineClip` satisfy that.
+    """
+    override = getattr(shot, "prompt_override", None)
+    if override and override.strip():
+        return override.strip()
+
+    room_type = getattr(shot, "room_type", None)
+    is_close_up = bool(getattr(shot, "is_close_up", False))
+    kind = getattr(shot, "kind", "single_image")
+    act = getattr(shot, "act", None)
+
+    cls = shot_class(room_type, is_close_up=is_close_up, act=act, is_last=is_last)
+    speed = _speed_word(squeeze_factor)
+
+    if kind == "pair_keyframes":
+        # Two real photographs already fix where the camera starts and ends.
+        # Only the character of the travel is still ours to specify.
+        motion = f"{speed}, continuous camera movement between the two views."
+    else:
+        motion = f"{speed} camera movement, {_MOTION_BY_CLASS[cls]}."
+
+    subject = getattr(shot, "detail_subject", None)
+    if cls == "detail" and subject:
+        motion = f"{speed} camera movement, pushing in slowly toward the {subject.lower()}."
+
+    parts = [motion, _SCENE_LIFE[cls], _INVARIANTS]
+    return " ".join(p for p in parts if p)

@@ -25,7 +25,9 @@ FROM python:3.11-slim as production
 WORKDIR /app
 
 # Install system dependencies
+# ffmpeg: CPU workers own phase 4, which cuts and joins the film.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libsm6 \
