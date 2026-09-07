@@ -35,6 +35,7 @@ from app.schemas.job_progress import (
 )
 from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
 from app.db.models.timeline import TimelineClip
+from app.pipeline.phase1_analyze.camera_move import reverse_label, reverse_vector
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase4_assembly.render import assemble_timeline_film
 from app.pipeline.phase3_timeline.generate import (
@@ -880,7 +881,18 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
             row.act = incoming.act
             row.move_label = incoming.move or "push in + pan right"
         row.order_index = index
-        row.photo_ids = list(incoming.photo_ids)
+        incoming_ids = list(incoming.photo_ids)
+        # Reversing the frames reverses the move. Detected here rather than
+        # asked for, because it is a fact about the shot, not an option: the
+        # camera that travelled A -> B now travels B -> A. It matters beyond
+        # display -- a pair carries no direction into its prompt, but the
+        # moment it is downgraded to a single image this label starts driving
+        # the camera, and a stale one would point the wrong way.
+        if (len(incoming_ids) == 2 and row.photo_ids
+                and list(row.photo_ids) == list(reversed(incoming_ids))):
+            row.move_label = reverse_label(row.move_label)
+            row.move_vector = reverse_vector(row.move_vector)
+        row.photo_ids = incoming_ids
         row.kind = incoming.kind
         row.trim_start = max(0.0, float(incoming.trim_start or 0.0))
         row.duration_override = incoming.duration_override

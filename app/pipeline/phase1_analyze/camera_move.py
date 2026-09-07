@@ -130,3 +130,41 @@ def required_headroom(move: CameraMove, shot_seconds: float) -> float:
     pan_need = abs(move.pan) * shot_seconds
     tilt_need = abs(move.tilt) * shot_seconds
     return 1.0 + zoom_need + max(pan_need, tilt_need)
+
+
+# Reversing which photograph is the start frame reverses the move. That is
+# physics, not a UI preference: if the camera travelled A -> B it now travels
+# B -> A, so a push in becomes a pull back and a rightward pan becomes leftward.
+#
+# It has to be applied to the stored move, not just the display. A pair carries
+# no direction into its prompt -- the two frames decide it -- but the moment a
+# pair is downgraded to a single image that label *does* drive the prompt, and a
+# stale one would direct the camera the wrong way.
+_OPPOSITE_ATOM: dict[str, str] = {
+    "push in": "pull out",
+    "pull out": "push in",
+    "pan right": "pan left",
+    "pan left": "pan right",
+    "tilt up": "tilt down",
+    "tilt down": "tilt up",
+    "static hold": "static hold",
+}
+
+
+def reverse_label(label: str | None) -> str:
+    """Invert every atom of a compound move label."""
+    if not label:
+        return ""
+    atoms = [a.strip() for a in label.split("+") if a.strip()]
+    return " + ".join(_OPPOSITE_ATOM.get(a, a) for a in atoms)
+
+
+def reverse_vector(vector: dict | None) -> dict:
+    """Negate a move vector. Zero stays zero, so a static hold is unaffected."""
+    v = vector or {}
+    return {
+        "zoom": -float(v.get("zoom") or 0.0),
+        "pan": -float(v.get("pan") or 0.0),
+        "tilt": -float(v.get("tilt") or 0.0),
+        "roll_deg": -float(v.get("roll_deg") or 0.0),
+    }

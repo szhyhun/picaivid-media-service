@@ -10,6 +10,8 @@ from app.pipeline.phase1_analyze.camera_move import (
     PAN_RIGHT_SHARE,
     choose_move,
     required_headroom,
+    reverse_label,
+    reverse_vector,
 )
 
 
@@ -88,3 +90,32 @@ class HeadroomTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReverseTests(unittest.TestCase):
+    """Swapping which photograph is the start frame reverses the move."""
+
+    def test_it_inverts_every_atom_of_a_compound_move(self):
+        self.assertEqual(
+            reverse_label("push in + pan right + tilt up"),
+            "pull out + pan left + tilt down",
+        )
+
+    def test_a_static_hold_has_no_direction_to_reverse(self):
+        self.assertEqual(reverse_label("static hold"), "static hold")
+
+    def test_reversing_twice_returns_the_original(self):
+        for label in ("push in + pan left", "pull out + tilt down", "pan right"):
+            self.assertEqual(
+                reverse_label(reverse_label(label)), label)
+
+    def test_it_negates_the_vector(self):
+        out = reverse_vector(
+            {"zoom": 0.067, "pan": 0.046, "tilt": -0.05, "roll_deg": 1.36})
+        self.assertAlmostEqual(out["zoom"], -0.067)
+        self.assertAlmostEqual(out["pan"], -0.046)
+        self.assertAlmostEqual(out["tilt"], 0.05)
+
+    def test_a_missing_vector_reverses_to_zero_rather_than_failing(self):
+        self.assertEqual(reverse_vector(None),
+                         {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": 0.0})
