@@ -63,12 +63,13 @@ class PromptTests(unittest.TestCase):
         self.assertIn("pan", prompt)
         self.assertIn("tilt", prompt)
 
-    def test_it_asks_for_slower_motion_the_harder_the_edit_squeezes(self):
-        # 3s generated and shown for 1.2s plays 2.5x faster than generated.
+    def test_source_window_keeps_the_same_slow_prompt_at_native_speed(self):
+        # The editor now trims a native-speed centre window; squeeze no longer
+        # asks the provider to accelerate the entire source clip.
         fast = build_shot_prompt(_Shot(), squeeze_factor=2.5)
         slow = build_shot_prompt(_Shot(), squeeze_factor=1.0)
-        self.assertTrue(fast.startswith("Very slow"))
-        self.assertTrue(slow.startswith("Gentle"))
+        self.assertTrue(fast.startswith("Slow"))
+        self.assertEqual(fast, slow)
 
     def test_outdoor_and_approach_shots_are_given_something_that_moves(self):
         # Only 4% of reference shots hold still. A frozen world under a moving

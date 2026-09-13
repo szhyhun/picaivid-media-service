@@ -81,11 +81,10 @@ DEFAULT_TIER = Tier.CONNECTIVE
 # 120/BPM seconds and never varies within a film.
 SHOT_BEATS = 2
 
-# Phase 2 is not wired to the shot line yet, but its initial contract is
-# explicit: request two seconds of source footage for every beat. The editor
-# later trims a stable two-beat window to the selected music grid. Keep this
-# independent from `shot_seconds`, which is the final on-timeline duration.
-SOURCE_GENERATION_SECONDS = 2.0
+# The provider currently returns a three-second source for every beat. The
+# editor later trims a stable two-beat window to the selected music grid. Keep
+# this independent from `shot_seconds`, which is the final on-timeline duration.
+SOURCE_GENERATION_SECONDS = 3.0
 
 # Rooms change roughly every 2.2 shots: Wallace Dr held 16 rooms across 35
 # shots, so a room is typically shown from two angles before moving on. Measured

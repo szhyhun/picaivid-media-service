@@ -63,6 +63,10 @@ EXPECTED = {
     "laundry room": "detail_or_service",
     "basement": "detail_or_service",
     "attic": "detail_or_service",
+    "building lobby": "approach_entry",
+    "elevator lobby": "approach_entry",
+    "gym": "social_room",
+    "walk-in closet": "detail_or_service",
 }
 
 
