@@ -56,6 +56,10 @@ pip install -r requirements.lock.txt
 - `GET /api/projects/{project_id}/clips`
 - `GET /api/projects/{project_id}/scenes/debug`
 - `GET /api/projects/{project_id}/shot_plan`
+- `GET /api/projects/{project_id}/timeline`
+- `POST /api/projects/{project_id}/timeline/generate`
+- `PUT /api/projects/{project_id}/timeline/music`
+- `POST /api/projects/{project_id}/timeline/assemble`
 - `POST /api/projects/{project_id}/relations/debug`
 - `POST /internal/jobs`
 
