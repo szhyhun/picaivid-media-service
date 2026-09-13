@@ -56,6 +56,12 @@ class RetimeTests(unittest.TestCase):
 
 
 class TrimTests(unittest.TestCase):
+    def test_a_three_second_source_has_headroom_for_a_central_two_beat_window(self):
+        trim_start = (SOURCE_SECONDS - 1.2) / 2.0
+        self.assertAlmostEqual(trim_start, 0.9)
+        clip = TimelineClip(order_index=0, trim_start=trim_start)
+        self.assertAlmostEqual(clip.duration_for(1.2), 1.2)
+
     def test_duration_is_clamped_to_the_source_we_actually_bought(self):
         clip = TimelineClip(order_index=0, trim_start=2.5)
         self.assertAlmostEqual(clip.max_duration(), 0.5)

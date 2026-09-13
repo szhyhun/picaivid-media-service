@@ -16,7 +16,7 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.db.models import PhotoSceneGeometry
-from app.db.models.timeline import Timeline, TimelineClip
+from app.db.models.timeline import SOURCE_SECONDS, Timeline, TimelineClip
 from app.pipeline.phase1_analyze.detail_crop import (
     is_detail_eligible,
     resolve_persisted_detail_candidates,
@@ -119,7 +119,9 @@ def materialize_timeline(db: Session, job_id: int, rooms, *,
             subject_box=list(shot.subject_box) if shot.subject_box else None,
             source_size=list(shot.source_size) if shot.source_size else None,
             detail_subject=shot.detail_subject,
-            trim_start=0.0,
+            # The initial edit uses the stable middle of the generated source.
+            # The user can still move this window on the timeline.
+            trim_start=max(0.0, (SOURCE_SECONDS - shot.duration_seconds) / 2.0),
             # Hard cuts in all three reference films; no dissolves anywhere.
             transition_type="cut",
         ))

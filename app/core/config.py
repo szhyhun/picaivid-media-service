@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     RUNWARE_MODEL: str = "vidu:4@2"
     RUNWARE_DURATION_SECONDS: int = 3
     RUNWARE_RESOLUTION: str = "540p"          # 720p for test, 1080p for production
+    # `url` passes a presigned S3 URL. `data_uri` sends the image with the
+    # request. `auto` uses URLs in production but switches to data URIs for
+    # a private local MinIO endpoint that Runware cannot reach.
+    RUNWARE_INPUT_MODE: str = "auto"
     # Runware publishes no hard rate limit but queues dynamically; their own
     # guidance is 2-4 concurrent for best throughput.
     RUNWARE_MAX_CONCURRENCY: int = 4

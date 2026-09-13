@@ -53,7 +53,9 @@ class RunwareError(RuntimeError):
 class VideoResult:
     task_uuid: str
     video_url: str | None
+    video_uuid: str | None = None
     seed: int | None = None
+    cost: float | None = None
     error: str | None = None
 
     @property
@@ -101,6 +103,9 @@ def build_video_task(*, prompt: str, photo_urls: list[str],
         "outputType": "URL",
         "outputFormat": "MP4",
         "deliveryMethod": "async",
+        # Internal billing metadata is retained on the clip record. It is
+        # deliberately not exposed in the customer-facing studio.
+        "includeCost": True,
         # Never on. See the module docstring.
         "providerSettings": {"vidu": {"audio": False}},
         "inputs": {"frameImages": build_frame_images(photo_urls)},
@@ -125,6 +130,20 @@ def _first_result(payload: Any) -> dict[str, Any] | None:
         if isinstance(rows, list) and rows:
             return rows[0]
     return None
+
+
+def _error_message(row: dict[str, Any]) -> str | None:
+    """Normalise Runware's documented top-level and nested error shapes."""
+    message = row.get("message")
+    if message:
+        return str(message)
+    error = row.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("code") or "Runware error")
+    if error:
+        return str(error)
+    code = row.get("code")
+    return str(code) if code else None
 
 
 async def _post(client: httpx.AsyncClient, body: list[dict[str, Any]]) -> Any:
@@ -170,21 +189,30 @@ async def poll_video(client: httpx.AsyncClient, task_uuid: str, *,
     interval = interval or settings.RUNWARE_POLL_INTERVAL_SECONDS
     attempts = max_attempts or settings.RUNWARE_MAX_POLL_ATTEMPTS
 
+    delay = max(1.0, float(interval))
     for _ in range(attempts):
         payload = await _post(client, [{"taskType": "getResponse",
                                         "taskUUID": task_uuid}])
         row = _first_result(payload) or {}
         if row.get("videoURL"):
-            return VideoResult(task_uuid=task_uuid, video_url=str(row["videoURL"]),
-                               seed=row.get("seed"))
-        message = row.get("message") or row.get("error")
-        # A "still processing" message is not a failure; anything else is.
-        if message and "process" not in str(message).lower():
+            cost = row.get("cost")
+            return VideoResult(
+                task_uuid=task_uuid,
+                video_url=str(row["videoURL"]),
+                video_uuid=str(row["videoUUID"]) if row.get("videoUUID") else None,
+                seed=row.get("seed"),
+                cost=float(cost) if cost is not None else None,
+            )
+        # getResponse reports terminal failures through `errors` with
+        # status=error. Do not mistake a normal processing acknowledgement for
+        # a failed generation merely because it has an informational message.
+        if str(row.get("status") or "").lower() == "error":
             return VideoResult(task_uuid=task_uuid, video_url=None,
-                               error=str(message))
+                               error=_error_message(row) or "Runware rejected the task.")
         if on_tick:
             on_tick()
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, 20.0)
 
     return VideoResult(task_uuid=task_uuid, video_url=None,
                        error=f"Timed out after {attempts} polls.")

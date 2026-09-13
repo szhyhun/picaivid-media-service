@@ -41,6 +41,7 @@ from app.pipeline.phase4_assembly.render import assemble_timeline_film
 from app.pipeline.phase3_timeline.generate import (
     generate_timeline_clips,
     pending_shots,
+    queue_timeline_clips,
 )
 from app.pipeline.phase3_timeline.materialize import (
     latest_timeline,
@@ -996,14 +997,26 @@ async def generate_timeline(project_id: str, payload: GenerateRequest,
                 "detail": "Every shot already has video."}
 
     resolution = payload.resolution or settings.RUNWARE_RESOLUTION
-    uids = [c.shot_uid for c in pending]
+    # Validate before accepting a paid background job. The value is also passed
+    # through to the provider; it is not merely a display value in the response.
+    from app.services.runware.client import RunwareError, resolution_size
+    try:
+        resolution_size(resolution)
+    except RunwareError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    uids = queue_timeline_clips(
+        db, timeline,
+        shot_uids=[str(c.shot_uid) for c in pending],
+        resolution=resolution,
+    )
 
     def run() -> None:
         session = SessionLocal()
         try:
             tl = latest_timeline(session, job_id)
             generate_timeline_clips(
-                session, tl, progress=JobProgress(job_id), shot_uids=uids)
+                session, tl, progress=JobProgress(job_id), shot_uids=uids,
+                resolution=resolution)
         except Exception:                       # noqa: BLE001 - logged, not raised
             logger.exception("TIMELINE_GENERATION_FAILED project_id=%s", project_id)
         finally:

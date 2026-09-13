@@ -197,8 +197,8 @@ def split_for_generation(shots, *, max_seconds: float = 30.0) -> list[list]:
 #   already decided; naming a direction on top asks the model to satisfy two
 #   constraints at once and it satisfies neither.
 # * **Singles must name one**, because nothing else determines it.
-# * **Ask for slower than you want.** A 3s clip cut down to a 1.2s beat plays
-#   2.5x faster than generated.
+# * **Ask for a continuous slow move.** The editor takes a central beat-length
+#   window at native speed, rather than accelerating a full source clip.
 # * **Give the scene life.** Only 4% of reference shots hold still, and a frozen
 #   world under a moving camera reads as a slideshow -- the exact failure this
 #   product exists to avoid.
@@ -259,21 +259,12 @@ def shot_class(room_type: str | None, *, is_close_up: bool = False,
     return "interior"
 
 
-def _speed_word(squeeze_factor: float) -> str:
-    """How slow to ask for, given how much the edit will speed it up.
-
-    Generating 3s to show 1.2s multiplies apparent motion by 2.5. It is far
-    easier to make a model move too little than to make it move smoothly, so
-    we lean on the side of too little.
-    """
-    if squeeze_factor >= 2.0:
-        return "Very slow"
-    if squeeze_factor >= 1.4:
-        return "Slow"
-    return "Gentle"
+def _speed_word(_squeeze_factor: float) -> str:
+    """Source windows play at native speed, so one stable cue is enough."""
+    return "Slow"
 
 
-def build_shot_prompt(shot, *, squeeze_factor: float = 2.5,
+def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
                       is_last: bool = False) -> str:
     """Write the motion direction for one generated clip.
 

@@ -1,4 +1,5 @@
 """The request we send Runware, and the money-losing mistakes it must not make."""
+import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -31,6 +32,9 @@ class VideoTaskTests(unittest.TestCase):
         # discard the generated track, so leaving this on is pure waste.
         self.assertIs(self.task()["providerSettings"]["vidu"]["audio"], False)
 
+    def test_it_records_provider_cost_without_exposing_it_to_the_prompt(self):
+        self.assertIs(self.task()["includeCost"], True)
+
     def test_it_asks_for_more_source_than_the_edit_shows(self):
         # The surplus is what makes trimming and retiming free.
         self.assertGreaterEqual(self.task()["duration"], 3)
@@ -45,6 +49,37 @@ class VideoTaskTests(unittest.TestCase):
 
     def test_the_task_id_is_ours_so_a_retry_can_reuse_it(self):
         self.assertEqual(self.task(task_uuid="fixed")["taskUUID"], "fixed")
+
+
+class PollingTests(unittest.TestCase):
+    def test_terminal_error_uses_documented_error_status(self):
+        async def run():
+            async def response(*_args, **_kwargs):
+                return {"errors": [{"status": "error", "code": "timeoutProvider",
+                                    "message": "provider timed out"}]}
+
+            with patch.object(rw, "_post", side_effect=response):
+                return await rw.poll_video(object(), "task", interval=1, max_attempts=1)
+
+        result = asyncio.run(run())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "provider timed out")
+
+    def test_completed_video_keeps_provider_identifiers_and_cost(self):
+        async def run():
+            async def response(*_args, **_kwargs):
+                return {"data": [{"status": "success", "videoUUID": "video-1",
+                                  "videoURL": "https://example.test/clip.mp4",
+                                  "seed": 42, "cost": 0.12}]}
+
+            with patch.object(rw, "_post", side_effect=response):
+                return await rw.poll_video(object(), "task", interval=1, max_attempts=1)
+
+        result = asyncio.run(run())
+        self.assertTrue(result.ok)
+        self.assertEqual(result.video_uuid, "video-1")
+        self.assertEqual(result.seed, 42)
+        self.assertAlmostEqual(result.cost or 0, 0.12)
 
 
 class CredentialTests(unittest.TestCase):

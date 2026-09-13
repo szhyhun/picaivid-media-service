@@ -3,9 +3,10 @@
 Two things happen to every clip, and both come from measurement rather than
 taste.
 
-**Squeeze.** We buy three seconds of source and show a beat's worth -- about
-1.2s at 100 BPM. Compressing 3s into 1.2s is not waste: it lands ~72 real
-generated frames inside the slot, roughly twice what 30fps needs.
+**Middle window.** We buy three seconds of source and show one beat-length
+window from the stable centre -- about 1.2s at 100 BPM. Input anchoring and
+generation artefacts are most visible at the ends, so accelerating the full
+source would put the weakest material into the final cut.
 
 **Shutter.** That surplus is the point. Generated frames are individually
 perfect and perfectly sharp, and a run of sharp frames reads as a slideshow no
@@ -68,16 +69,15 @@ def probe(path: str | Path) -> dict:
 def shot_filter(*, source_seconds: float, trim_start: float,
                 duration: float, blend: int = BLEND_FRAMES,
                 fps: int = OUTPUT_FPS) -> str:
-    """The filter chain that turns one generated clip into one edit slot.
-
-    `setpts` compresses what is left of the source after the trim into the slot
-    the beat grid allows; the ratio is computed per clip, never assumed, because
-    a retimed film changes it without regenerating anything.
-    """
+    """The filter chain that takes a native-speed source window into one slot."""
     usable = max(0.05, source_seconds - max(0.0, trim_start))
-    speed = max(0.01, duration / usable)
-    chain = [f"trim=start={trim_start:.3f}", "setpts=PTS-STARTPTS",
-             f"setpts={speed:.4f}*PTS"]
+    window = min(duration, usable)
+    chain = [f"trim=start={trim_start:.3f}:duration={window:.3f}",
+             "setpts=PTS-STARTPTS"]
+    # An explicit trim too close to the source end still fills the beat slot.
+    # Normal centre windows retain native speed.
+    if window < duration:
+        chain.append(f"setpts={duration / window:.4f}*PTS")
     if blend > 1:
         chain.append(f"tmix=frames={blend}:weights='{' '.join(['1'] * blend)}'")
     chain.append(f"fps={fps}")
@@ -87,7 +87,7 @@ def shot_filter(*, source_seconds: float, trim_start: float,
 def render_shot(src: str | Path, dest: str | Path, *, source_seconds: float,
                 trim_start: float, duration: float,
                 blend: int = BLEND_FRAMES, fps: int = OUTPUT_FPS) -> Path:
-    """Squeeze and blur one clip into its slot."""
+    """Trim and blur one clip into its slot."""
     vf = shot_filter(source_seconds=source_seconds, trim_start=trim_start,
                      duration=duration, blend=blend, fps=fps)
     _run(["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an",
