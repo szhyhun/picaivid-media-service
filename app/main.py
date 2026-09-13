@@ -37,6 +37,7 @@ from app.schemas.job_progress import (
 from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
 from app.db.models.timeline import TimelineClip
 from app.pipeline.phase1_analyze.camera_move import reverse_label, reverse_vector
+from app.pipeline.phase1_analyze.directorial_prompt import build_shot_prompt
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase4_assembly.render import assemble_timeline_film
 from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music_uri
@@ -121,6 +122,17 @@ def _safe_float(value: object) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _timeline_generation_prompt(clip: TimelineClip, index: int, total: int) -> str:
+    """Return the prompt shown in Studio for one stored timeline shot."""
+    if clip.clip is not None and clip.clip.prompt_used:
+        return clip.clip.prompt_used
+    return build_shot_prompt(
+        clip,
+        is_first=index == 0,
+        is_last=index == total - 1,
+    )
 
 
 def _safe_int(value: object) -> int | None:
@@ -796,8 +808,12 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
                 beat_offset=float((timeline.beat_grid or {}).get("beat_offset") or 0.0),
                 duration=_safe_float(music_meta.get("duration")),
             )
-    shots = [
-        TimelineShot(
+    shots = []
+    for index, c in enumerate(clips):
+        # Ready clips expose the immutable prompt that was paid for. Planned
+        # clips expose the current prompt so the user can inspect it first.
+        generation_prompt = _timeline_generation_prompt(c, index, len(clips))
+        shots.append(TimelineShot(
             shot_uid=c.shot_uid, order_index=c.order_index, state=c.state,
             room_id=c.room_id, room_type=c.room_type, act=c.act, kind=c.kind,
             is_close_up=bool(c.is_close_up),
@@ -808,11 +824,10 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             crop_box=c.crop_box, subject_box=c.subject_box,
             source_size=c.source_size, detail_subject=c.detail_subject,
             prompt_override=c.prompt_override,
+            generation_prompt=generation_prompt,
             video_url=_signed_url(c.clip.s3_uri) if c.clip else None,
             photos=[photo(pid) for pid in (c.photo_ids or [])],
-        )
-        for c in clips
-    ]
+        ))
     return TimelineResponse(
         project_id=project_id, timeline_id=timeline.id, version=timeline.version,
         status=timeline.status or "draft", bpm=timeline.bpm,
@@ -902,9 +917,9 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
         # Reversing the frames reverses the move. Detected here rather than
         # asked for, because it is a fact about the shot, not an option: the
         # camera that travelled A -> B now travels B -> A. It matters beyond
-        # display -- a pair carries no direction into its prompt, but the
-        # moment it is downgraded to a single image this label starts driving
-        # the camera, and a stale one would point the wrong way.
+        # display -- a pair prompt follows reference order, but the moment it
+        # is downgraded to a single image this label starts driving the camera,
+        # and a stale one would point the wrong way.
         if (len(incoming_ids) == 2 and row.photo_ids
                 and list(row.photo_ids) == list(reversed(incoming_ids))):
             row.move_label = reverse_label(row.move_label)

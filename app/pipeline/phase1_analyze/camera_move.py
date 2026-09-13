@@ -136,10 +136,10 @@ def required_headroom(move: CameraMove, shot_seconds: float) -> float:
 # physics, not a UI preference: if the camera travelled A -> B it now travels
 # B -> A, so a push in becomes a pull back and a rightward pan becomes leftward.
 #
-# It has to be applied to the stored move, not just the display. A pair carries
-# no direction into its prompt -- the two frames decide it -- but the moment a
-# pair is downgraded to a single image that label *does* drive the prompt, and a
-# stale one would direct the camera the wrong way.
+# It has to be applied to the stored move, not just the display. A pair's prompt
+# states first-frame to second-frame order, while the moment a pair is downgraded
+# to a single image this label drives the prompt and a stale one points the camera
+# the wrong way.
 _OPPOSITE_ATOM: dict[str, str] = {
     "push in": "pull out",
     "pull out": "push in",

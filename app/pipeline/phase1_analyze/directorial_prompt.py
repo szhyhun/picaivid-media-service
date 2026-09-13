@@ -193,28 +193,15 @@ def split_for_generation(shots, *, max_seconds: float = 30.0) -> list[list]:
 #
 # * **Never describe the room.** Describing a building the model can already see
 #   invites it to invent a different one. Motion instructions only.
-# * **Pairs name no direction.** With a start and an end frame the path is
-#   already decided; naming a direction on top asks the model to satisfy two
-#   constraints at once and it satisfies neither.
+# * **Pairs state direction by frame order.** The prompt says to travel from the
+#   first reference frame to the second; it does not invent a free-form
+#   left/right direction that the measured geometry may contradict.
 # * **Singles must name one**, because nothing else determines it.
 # * **Ask for a continuous slow move.** The editor takes a central beat-length
 #   window at native speed, rather than accelerating a full source clip.
 # * **Give the scene life.** Only 4% of reference shots hold still, and a frozen
 #   world under a moving camera reads as a slideshow -- the exact failure this
 #   product exists to avoid.
-
-# What the camera does, per shot class. Interiors name two axes because over
-# 80% of reference shots move on two or more; a single axis reads as a pan
-# across a photograph.
-_MOTION_BY_CLASS: dict[str, str] = {
-    "aerial": "pulling back and up to reveal the property and its setting",
-    "approach": "drifting forward with a gentle pan",
-    "threshold": "moving forward through the doorway",
-    "interior": "pushing in slowly with a slight pan and a gentle tilt",
-    "detail": "pushing in slowly toward the subject",
-    "outdoor": "drifting slowly across the space",
-    "closing": "pulling back slowly to leave the property",
-}
 
 # What moves besides the camera. Empty where invented movement would look wrong
 # -- nothing should stir in a bathroom, and an aerial is too far up to read it.
@@ -237,8 +224,9 @@ _OUTDOOR_TYPES = frozenset({"patio", "pool", "backyard", "exterior back"})
 # building must not change, only the camera looking at it.
 _INVARIANTS = (
     "Photorealistic. Static architecture, unchanged building geometry. "
-    "Constant speed, no acceleration, no easing. "
-    "No people, no text, no logos. No cuts, no dissolves."
+    "No acceleration, no easing, no speed changes. "
+    "No people. No cars moving. No text. No logos. "
+    "No cuts, no dissolves."
 )
 
 
@@ -264,8 +252,65 @@ def _speed_word(_squeeze_factor: float) -> str:
     return "Slow"
 
 
+_SINGLE_MOTION_PHRASES: dict[str, str] = {
+    "push in": "Slow, straight push in",
+    "pull out": "Slow, straight pull back",
+    "pan right": "Slow, straight horizontal pan to the right",
+    "pan left": "Slow, straight horizontal pan to the left",
+    "static hold": "Locked-off camera with only subtle natural movement",
+}
+
+
+def _shot_move_label(shot) -> str:
+    """Read the move from either an in-memory Shot or a stored timeline row."""
+    move = getattr(shot, "move", None)
+    if isinstance(move, str):
+        return move
+    label = getattr(move, "label", None)
+    if label:
+        return str(label)
+    return str(getattr(shot, "move_label", None) or "")
+
+
+def _single_motion_label(
+    shot,
+    cls: str,
+    *,
+    is_first: bool,
+    is_last: bool,
+) -> str:
+    """Reduce a compound move to one provider-safe camera axis.
+
+    The still-image path has no second camera pose to constrain the model. A
+    short vocabulary is intentional: compound pan/tilt/roll prompts are harder
+    to follow and harder to review. The 2D preview may retain the full measured
+    vector; this is the prompt contract sent to the video provider.
+    """
+    if cls == "detail":
+        return "push in"
+    if cls in {"aerial", "closing"} or is_last:
+        return "pull out"
+    if is_first or cls in {"approach", "threshold"}:
+        return "push in"
+
+    label = _shot_move_label(shot).lower()
+    if "static hold" in label:
+        return "static hold"
+    # choose_move writes the zoom atom first. Preserve that primary intent when
+    # a legacy compound label also contains a pan/tilt/roll atom.
+    if "push in" in label:
+        return "push in"
+    if "pull out" in label:
+        return "pull out"
+    if "pan right" in label:
+        return "pan right"
+    if "pan left" in label:
+        return "pan left"
+    return "push in"
+
+
 def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
-                      is_last: bool = False) -> str:
+                      is_first: bool = False, is_last: bool = False) -> str:
     """Write the motion direction for one generated clip.
 
     `shot` needs `room_type`, `kind`, `is_close_up`, `act` and `move`; both the
@@ -284,15 +329,22 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     speed = _speed_word(squeeze_factor)
 
     if kind == "pair_keyframes":
-        # Two real photographs already fix where the camera starts and ends.
-        # Only the character of the travel is still ours to specify.
-        motion = f"{speed}, continuous camera movement between the two views."
+        # The frameImages payload binds reference one to the start and reference
+        # two to the end. State that direction in the prompt as well, without
+        # inventing a textual left/right direction that geometry may contradict.
+        motion = (
+            f"{speed}, smooth, continuous camera movement from the first "
+            "reference frame to the second reference frame at constant speed. "
+            "Follow the spatial path and framing change between those two views."
+        )
     else:
-        motion = f"{speed} camera movement, {_MOTION_BY_CLASS[cls]}."
+        motion_label = _single_motion_label(
+            shot, cls, is_first=is_first, is_last=is_last)
+        motion = f"{_SINGLE_MOTION_PHRASES[motion_label]}."
 
     subject = getattr(shot, "detail_subject", None)
     if cls == "detail" and subject:
-        motion = f"{speed} camera movement, pushing in slowly toward the {subject.lower()}."
+        motion = f"Slow, straight push in toward the {subject.lower()}."
 
     parts = [motion, _SCENE_LIFE[cls], _INVARIANTS]
     return " ".join(p for p in parts if p)

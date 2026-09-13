@@ -49,6 +49,8 @@ class TimelineShot(BaseModel):
     source_size: Optional[list[int]] = None
     detail_subject: Optional[str] = None
     prompt_override: Optional[str] = None
+    # Exact prompt previewed before generation or sent for a ready clip.
+    generation_prompt: Optional[str] = None
 
     video_url: Optional[str] = None
     photos: list[TimelinePhoto] = []

@@ -32,17 +32,31 @@ class ShotClassTests(unittest.TestCase):
 
 
 class PromptTests(unittest.TestCase):
-    def test_a_pair_shot_is_never_given_a_direction(self):
-        # Two photographs already fix where the camera starts and ends. Naming
-        # a direction on top asks the model to satisfy two constraints at once.
+    def test_a_pair_shot_states_direction_by_reference_order(self):
+        # The frameImages payload binds reference one to the start and reference
+        # two to the end. The prompt must say the same thing without inventing
+        # a textual left/right direction that geometry may contradict.
         prompt = build_shot_prompt(_Shot(kind="pair_keyframes"))
-        for direction in ("pushing in", "pulling back", "drifting", "pan "):
-            self.assertNotIn(direction, prompt)
-        self.assertIn("between the two views", prompt)
+        self.assertIn(
+            "from the first reference frame to the second reference frame",
+            prompt,
+        )
+        self.assertIn("constant speed", prompt)
+        self.assertNotIn("pan right", prompt)
 
-    def test_a_single_shot_must_be_given_one(self):
-        # With one photograph nothing else determines where the camera goes.
-        self.assertIn("pushing in slowly", build_shot_prompt(_Shot()))
+    def test_a_single_shot_uses_one_simple_axis(self):
+        # With one photograph nothing else determines where the camera goes, so
+        # the provider gets a small, unambiguous motion vocabulary.
+        prompt = build_shot_prompt(_Shot(move="pan right"))
+        self.assertIn("straight horizontal pan to the right", prompt)
+        for banned in ("tilt", "roll", "orbit", "parallax"):
+            self.assertNotIn(banned, prompt.lower())
+
+    def test_opening_and_closing_single_shots_have_bookend_moves(self):
+        opening = build_shot_prompt(_Shot(move="pan left"), is_first=True)
+        closing = build_shot_prompt(_Shot(move="push in"), is_last=True)
+        self.assertIn("straight push in", opening)
+        self.assertIn("straight pull back", closing)
 
     def test_it_never_describes_the_room(self):
         # The model already has the pixels; describing the building invites it
@@ -53,15 +67,16 @@ class PromptTests(unittest.TestCase):
     def test_every_prompt_forbids_the_things_the_films_never_do(self):
         prompt = build_shot_prompt(_Shot())
         for rule in ("Static architecture", "no easing", "No people",
-                     "No cuts, no dissolves"):
+                     "No cars moving", "No text", "No logos",
+                     "No cuts, no dissolves", "no speed changes"):
             self.assertIn(rule, prompt)
 
-    def test_interiors_move_on_two_axes(self):
-        # Over 80% of reference shots move on two or more; one axis reads as a
-        # pan across a photograph.
-        prompt = build_shot_prompt(_Shot(room_type="living room"))
-        self.assertIn("pan", prompt)
-        self.assertIn("tilt", prompt)
+    def test_single_interior_prompt_does_not_request_angled_motion(self):
+        prompt = build_shot_prompt(
+            _Shot(room_type="living room", move="push in + pan right + tilt up"))
+        self.assertIn("straight push in", prompt)
+        self.assertNotIn("tilt", prompt.lower())
+        self.assertNotIn("roll", prompt.lower())
 
     def test_source_window_keeps_the_same_slow_prompt_at_native_speed(self):
         # The editor now trims a native-speed centre window; squeeze no longer

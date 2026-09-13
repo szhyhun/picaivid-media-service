@@ -108,9 +108,12 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
         return shot.clip
 
     ordered = timeline.ordered_clips()
+    first_uid = ordered[0].shot_uid if ordered else None
+    last_uid = ordered[-1].shot_uid if ordered else None
     prompt = build_shot_prompt(
         shot, squeeze_factor=1.0,
-        is_last=bool(ordered) and shot.shot_uid == ordered[-1].shot_uid)
+        is_first=bool(first_uid) and shot.shot_uid == first_uid,
+        is_last=bool(last_uid) and shot.shot_uid == last_uid)
 
     clip = shot.clip if shot.clip_id else None
     if clip is None:
