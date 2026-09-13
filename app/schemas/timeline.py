@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ShotState = Literal["planned", "generating", "ready", "failed"]
 ShotKind = Literal["pair_keyframes", "single_image"]
@@ -54,6 +54,30 @@ class TimelineShot(BaseModel):
     photos: list[TimelinePhoto] = []
 
 
+MusicSource = Literal["catalog", "upload"]
+
+
+class TimelineMusic(BaseModel):
+    """Public music metadata; storage/provider URIs never leave the service."""
+
+    source: MusicSource
+    title: str
+    bpm: float
+    beat_offset: float = 0.0
+    duration: Optional[float] = None
+
+
+class TimelineMusicRequest(BaseModel):
+    """A catalog track or an already-uploaded customer track."""
+
+    music_uri: str = Field(min_length=1, max_length=1000)
+    source: MusicSource = "catalog"
+    title: str = Field(default="Custom track", min_length=1, max_length=255)
+    bpm: Optional[float] = Field(default=None, gt=20, lt=300)
+    beat_offset: Optional[float] = Field(default=None, ge=0)
+    duration: Optional[float] = Field(default=None, gt=0)
+
+
 class TimelineResponse(BaseModel):
     project_id: str
     timeline_id: Optional[int] = None
@@ -65,6 +89,7 @@ class TimelineResponse(BaseModel):
     source_seconds: float = 3.0
     duration: float = 0.0
     shots: list[TimelineShot] = []
+    music: Optional[TimelineMusic] = None
     detail: str = ""
 
 

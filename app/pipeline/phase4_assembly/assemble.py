@@ -96,7 +96,8 @@ def render_shot(src: str | Path, dest: str | Path, *, source_seconds: float,
 
 
 def concat(parts: list[Path], dest: str | Path,
-           audio_path: str | Path | None = None) -> Path:
+           audio_path: str | Path | None = None,
+           audio_offset: float = 0.0) -> Path:
     """Join the slots with hard cuts, and lay the music under them."""
     if not parts:
         raise AssemblyError("Nothing to assemble.")
@@ -108,8 +109,14 @@ def concat(parts: list[Path], dest: str | Path,
 
     args = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listing]
     if audio_path:
-        # -shortest so a long track is cut to the film, never the other way.
-        args += ["-i", str(audio_path), "-map", "0:v", "-map", "1:a",
+        # Loop a short track so it cannot truncate the film; -shortest then
+        # ends at the video, never at the audio file's duration.
+        args += ["-stream_loop", "-1"]
+        if audio_offset > 0:
+            # The first detected beat becomes time zero for the first shot.
+            args += ["-ss", f"{audio_offset:.3f}"]
+        args += ["-i", str(audio_path),
+                 "-map", "0:v", "-map", "1:a",
                  "-c:a", "aac", "-shortest"]
     args += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", str(dest)]
     try:
@@ -122,6 +129,7 @@ def concat(parts: list[Path], dest: str | Path,
 def assemble_film(shots: list[dict], dest: str | Path, *,
                   source_seconds: float = 3.0,
                   audio_path: str | Path | None = None,
+                  audio_offset: float = 0.0,
                   blend: int = BLEND_FRAMES, fps: int = OUTPUT_FPS) -> dict:
     """Render every shot into its slot and join them.
 
@@ -138,7 +146,7 @@ def assemble_film(shots: list[dict], dest: str | Path, *,
                         trim_start=float(shot.get("trim_start") or 0.0),
                         duration=float(shot["duration"]), blend=blend, fps=fps)
             parts.append(part)
-        concat(parts, dest, audio_path=audio_path)
+        concat(parts, dest, audio_path=audio_path, audio_offset=audio_offset)
 
     info = probe(dest)
     logger.info("FILM_ASSEMBLED shots=%s duration=%.2fs fps=%s",

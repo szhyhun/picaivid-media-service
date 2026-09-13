@@ -1,5 +1,8 @@
 """Cutting generated clips into beat slots."""
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from app.pipeline.phase4_assembly.assemble import BLEND_FRAMES, shot_filter
 
@@ -32,6 +35,26 @@ class ShotFilterTests(unittest.TestCase):
     def test_a_trim_past_the_end_cannot_divide_by_zero(self):
         chain = shot_filter(source_seconds=3.0, trim_start=3.0, duration=1.2)
         self.assertIn("setpts=24.0000*PTS", chain)
+
+
+class AudioAssemblyTests(unittest.TestCase):
+    def test_short_music_loops_and_starts_at_the_detected_beat(self):
+        from app.pipeline.phase4_assembly.assemble import concat
+
+        with TemporaryDirectory() as work:
+            part = Path(work) / "part.mp4"
+            audio = Path(work) / "music.mp3"
+            part.touch()
+            audio.touch()
+            with patch("app.pipeline.phase4_assembly.assemble._run") as run:
+                concat([part], Path(work) / "film.mp4", audio_path=audio,
+                       audio_offset=0.375)
+
+        args = run.call_args.args[0]
+        self.assertIn("-stream_loop", args)
+        self.assertIn("-ss", args)
+        self.assertIn("0.375", args)
+        self.assertIn("-shortest", args)
 
 
 if __name__ == "__main__":

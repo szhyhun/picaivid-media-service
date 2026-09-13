@@ -3,6 +3,7 @@ from datetime import datetime
 import uuid
 import logging
 from typing import Dict
+from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from pydantic import BaseModel
@@ -38,6 +39,7 @@ from app.db.models.timeline import TimelineClip
 from app.pipeline.phase1_analyze.camera_move import reverse_label, reverse_vector
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase4_assembly.render import assemble_timeline_film
+from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music_uri
 from app.pipeline.phase3_timeline.generate import (
     generate_timeline_clips,
     pending_shots,
@@ -53,6 +55,8 @@ from app.schemas.timeline import (
     CandidateListResponse,
     CandidatePhoto,
     TimelinePhoto,
+    TimelineMusic,
+    TimelineMusicRequest,
     TimelineResponse,
     TimelineShot,
     TimelineUpdateRequest,
@@ -780,6 +784,18 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
                              position=row.position, room_label=row.room_label)
 
     grid = timeline.grid_seconds
+    music_meta = (timeline.beat_grid or {}).get("music")
+    music = None
+    if isinstance(music_meta, dict):
+        source = music_meta.get("source")
+        if source in {"catalog", "upload"}:
+            music = TimelineMusic(
+                source=source,
+                title=str(music_meta.get("title") or "Custom track"),
+                bpm=timeline.bpm,
+                beat_offset=float((timeline.beat_grid or {}).get("beat_offset") or 0.0),
+                duration=_safe_float(music_meta.get("duration")),
+            )
     shots = [
         TimelineShot(
             shot_uid=c.shot_uid, order_index=c.order_index, state=c.state,
@@ -802,7 +818,7 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
         status=timeline.status or "draft", bpm=timeline.bpm,
         beats_per_shot=timeline.beats_per_shot, shot_seconds=grid,
         source_seconds=TL_SOURCE_SECONDS, duration=timeline.total_duration or 0.0,
-        shots=shots,
+        shots=shots, music=music,
     )
 
 
@@ -906,6 +922,87 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
 
     db.flush()
     db.expire(timeline, ["timeline_clips"])
+    timeline.retime()
+    db.commit()
+    db.refresh(timeline)
+    return _timeline_payload(db, project_id, timeline)
+
+
+def _valid_music_uri(uri: str) -> bool:
+    parsed = urlparse(uri)
+    if parsed.scheme == "s3":
+        return bool(parsed.netloc and parsed.path.strip("/"))
+    if parsed.scheme == "https":
+        return bool(parsed.netloc)
+    return parsed.scheme == "http" and settings.ENVIRONMENT == "development" and bool(parsed.netloc)
+
+
+def _center_trim_for(clip: TimelineClip, grid_seconds: float) -> float:
+    """Return the stable middle start for the current beat-length window."""
+    wanted = float(clip.duration_override or grid_seconds)
+    wanted = max(0.1, min(wanted, TL_SOURCE_SECONDS))
+    return max(0.0, (TL_SOURCE_SECONDS - wanted) / 2.0)
+
+
+@app.put("/api/projects/{project_id}/timeline/music", response_model=TimelineResponse)
+async def update_timeline_music(project_id: str, payload: TimelineMusicRequest,
+                                db: Session = Depends(get_db)):
+    """Select a catalog/uploaded track and retime the editable timeline."""
+    if not _valid_music_uri(payload.music_uri):
+        raise HTTPException(
+            status_code=422,
+            detail="music_uri must be an s3:// URI, an https:// URL, or local http:// URL.",
+        )
+
+    job_id = _latest_job_id(db, project_id)
+    timeline = latest_timeline(db, job_id) if job_id else None
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="No timeline to update.")
+    job = db.get(Job, job_id)
+
+    old_grid = timeline.grid_seconds
+    centered = {
+        clip.id: abs((clip.trim_start or 0.0) - _center_trim_for(clip, old_grid)) <= 0.025
+        for clip in timeline.ordered_clips()
+    }
+    if payload.bpm is None:
+        try:
+            analysis = analyze_music_uri(payload.music_uri)
+        except MusicAnalysisError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        bpm = analysis.bpm
+        beat_offset = analysis.beat_offset
+        duration = analysis.duration
+    else:
+        bpm = float(payload.bpm)
+        beat_offset = float(payload.beat_offset or 0.0)
+        duration = payload.duration
+    if payload.beat_offset is not None:
+        beat_offset = float(payload.beat_offset)
+
+    title = " ".join(payload.title.split()) or "Custom track"
+    grid = dict(timeline.beat_grid or {})
+    grid.update({
+        "bpm": bpm,
+        "beat_offset": beat_offset,
+        "music": {
+            "source": payload.source,
+            "title": title,
+            "duration": duration,
+        },
+    })
+    timeline.beat_grid = grid
+    if job is not None:
+        job.music_uri = payload.music_uri
+        job.bpm = int(round(bpm))
+        job.beat_offset = beat_offset
+
+    new_grid = timeline.grid_seconds
+    for clip in timeline.ordered_clips():
+        # Selecting music should keep the automatic middle window centred, but
+        # never erase a trim the editor deliberately moved.
+        if centered.get(clip.id):
+            clip.trim_start = _center_trim_for(clip, new_grid)
     timeline.retime()
     db.commit()
     db.refresh(timeline)
@@ -1059,11 +1156,15 @@ async def assemble_timeline(project_id: str, background: BackgroundTasks,
              "trim_start": c.trim_start or 0.0, "duration": c.duration_for(grid)}
             for c in clips]
     total = round(sum(p["duration"] for p in plan), 2)
+    job = db.get(Job, job_id)
+    music_uri = job.music_uri if job is not None else None
+    music_offset = float(job.beat_offset or 0.0) if job is not None else 0.0
 
     def run() -> None:
         session = SessionLocal()
         try:
-            assemble_timeline_film(session, job_id, plan)
+            assemble_timeline_film(session, job_id, plan, music_uri=music_uri,
+                                   music_offset=music_offset)
         except Exception:                       # noqa: BLE001 - logged, not raised
             logger.exception("TIMELINE_ASSEMBLY_FAILED project_id=%s", project_id)
         finally:
