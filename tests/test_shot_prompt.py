@@ -49,7 +49,8 @@ class PromptTests(unittest.TestCase):
         # the provider gets a small, unambiguous motion vocabulary.
         prompt = build_shot_prompt(_Shot(move="pan right"))
         self.assertIn("straight horizontal pan to the right", prompt)
-        for banned in ("tilt", "roll", "orbit", "parallax"):
+        for banned in ("tilt the camera", "roll the camera", "orbit the camera",
+                      "parallax move"):
             self.assertNotIn(banned, prompt.lower())
 
     def test_opening_and_closing_single_shots_have_bookend_moves(self):
@@ -66,17 +67,27 @@ class PromptTests(unittest.TestCase):
 
     def test_every_prompt_forbids_the_things_the_films_never_do(self):
         prompt = build_shot_prompt(_Shot())
-        for rule in ("Static architecture", "no easing", "No people",
+        for rule in ("stabilized gimbal camera", "level frame",
+                     "straight verticals", "No handheld shake", "jitter",
+                     "wobble", "flicker", "warping", "morphing",
+                     "no easing", "No people",
                      "No cars moving", "No text", "No logos",
                      "No cuts, no dissolves", "no speed changes"):
             self.assertIn(rule, prompt)
+
+    def test_pair_prompt_requests_stabilized_motion_without_changing_the_path(self):
+        prompt = build_shot_prompt(_Shot(kind="pair_keyframes"))
+        self.assertIn("from the first reference frame to the second reference frame", prompt)
+        self.assertIn("constant speed", prompt)
+        self.assertIn("stabilized gimbal camera", prompt)
+        self.assertIn("fixed object placement", prompt)
 
     def test_single_interior_prompt_does_not_request_angled_motion(self):
         prompt = build_shot_prompt(
             _Shot(room_type="living room", move="push in + pan right + tilt up"))
         self.assertIn("straight push in", prompt)
-        self.assertNotIn("tilt", prompt.lower())
-        self.assertNotIn("roll", prompt.lower())
+        self.assertNotIn("tilt the camera", prompt.lower())
+        self.assertNotIn("roll the camera", prompt.lower())
 
     def test_source_window_keeps_the_same_slow_prompt_at_native_speed(self):
         # The editor now trims a native-speed centre window; squeeze no longer
@@ -86,21 +97,24 @@ class PromptTests(unittest.TestCase):
         self.assertTrue(fast.startswith("Slow"))
         self.assertEqual(fast, slow)
 
-    def test_outdoor_and_approach_shots_are_given_something_that_moves(self):
-        # Only 4% of reference shots hold still. A frozen world under a moving
-        # camera reads as a slideshow.
-        self.assertIn("breeze", build_shot_prompt(_Shot(room_type="backyard", act=3)))
-        self.assertIn("breeze", build_shot_prompt(_Shot(room_type="front yard", act=1)))
+    def test_scene_specific_motion_is_not_invented_from_room_labels(self):
+        # A room label does not prove that curtains, foliage, or any other
+        # moving subject exists in the source photo.
+        for room_type in ("living room", "backyard", "front yard", "aerial view"):
+            prompt = build_shot_prompt(_Shot(room_type=room_type, act=1))
+            self.assertNotIn("curtain", prompt.lower())
+            self.assertNotIn("breeze", prompt.lower())
 
     def test_a_close_up_names_its_subject(self):
         prompt = build_shot_prompt(
             _Shot(is_close_up=True, detail_subject="Fireplace"))
         self.assertIn("fireplace", prompt)
 
-    def test_an_author_override_wins_outright(self):
-        self.assertEqual(
-            build_shot_prompt(_Shot(prompt_override="  my own words  ")),
-            "my own words")
+    def test_an_author_override_keeps_custom_text_and_safety_contract(self):
+        prompt = build_shot_prompt(_Shot(prompt_override="  my own words  "))
+        self.assertTrue(prompt.startswith("my own words "))
+        self.assertIn("stabilized gimbal camera", prompt)
+        self.assertIn("No handheld shake", prompt)
 
 
 if __name__ == "__main__":

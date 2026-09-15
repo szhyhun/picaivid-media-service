@@ -199,34 +199,22 @@ def split_for_generation(shots, *, max_seconds: float = 30.0) -> list[list]:
 # * **Singles must name one**, because nothing else determines it.
 # * **Ask for a continuous slow move.** The editor takes a central beat-length
 #   window at native speed, rather than accelerating a full source clip.
-# * **Give the scene life.** Only 4% of reference shots hold still, and a frozen
-#   world under a moving camera reads as a slideshow -- the exact failure this
-#   product exists to avoid.
-
-# What moves besides the camera. Empty where invented movement would look wrong
-# -- nothing should stir in a bathroom, and an aerial is too far up to read it.
-_SCENE_LIFE: dict[str, str] = {
-    "aerial": "",
-    "approach": "Leaves and grasses move gently in a light breeze.",
-    "threshold": "",
-    "interior": "Soft daylight, curtains settling gently.",
-    "detail": "",
-    "outdoor": "Foliage moving gently in a light breeze.",
-    "closing": "Leaves moving gently in a light breeze.",
-}
+# * **Do not invent scene motion.** Ambient motion may be added only when a
+#   grounded source signal supplies it; a room label alone is not evidence.
 
 _AERIAL_TYPES = frozenset({"aerial view"})
 _APPROACH_TYPES = frozenset({"front yard", "exterior front", "building exterior"})
 _THRESHOLD_TYPES = frozenset({"entrance", "hallway"})
 _OUTDOOR_TYPES = frozenset({"patio", "pool", "backyard", "exterior back"})
 
-# Applies to every shot. "Static architecture" is the load-bearing phrase: the
-# building must not change, only the camera looking at it.
+# Applies to every shot. The building and visible objects must not change; only
+# the camera is allowed to move.
 _INVARIANTS = (
-    "Photorealistic. Static architecture, unchanged building geometry. "
-    "No acceleration, no easing, no speed changes. "
-    "No people. No cars moving. No text. No logos. "
-    "No cuts, no dissolves."
+    "Photorealistic, stabilized gimbal camera with a level frame and straight "
+    "verticals. Rigid architecture, fixed object placement, unchanged geometry "
+    "and proportions. No handheld shake, jitter, wobble, camera roll, flicker, "
+    "warping, or morphing. No acceleration, no easing, no speed changes. "
+    "No people. No cars moving. No text. No logos. No cuts, no dissolves."
 )
 
 
@@ -318,7 +306,9 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     """
     override = getattr(shot, "prompt_override", None)
     if override and override.strip():
-        return override.strip()
+        # Custom motion text may replace the default direction, but never the
+        # provider-safety contract shared by every shot.
+        return f"{override.strip()} {_INVARIANTS}"
 
     room_type = getattr(shot, "room_type", None)
     is_close_up = bool(getattr(shot, "is_close_up", False))
@@ -346,5 +336,4 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     if cls == "detail" and subject:
         motion = f"Slow, straight push in toward the {subject.lower()}."
 
-    parts = [motion, _SCENE_LIFE[cls], _INVARIANTS]
-    return " ".join(p for p in parts if p)
+    return f"{motion} {_INVARIANTS}"
