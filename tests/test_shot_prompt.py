@@ -65,22 +65,20 @@ class PromptTests(unittest.TestCase):
         prompt = build_shot_prompt(_Shot(room_type="kitchen")).lower()
         self.assertNotIn("kitchen", prompt)
 
-    def test_every_prompt_forbids_the_things_the_films_never_do(self):
+    def test_every_prompt_uses_positive_stability_language(self):
         prompt = build_shot_prompt(_Shot())
-        for rule in ("stabilized gimbal camera", "level frame",
-                     "straight verticals", "No handheld shake", "jitter",
-                     "wobble", "flicker", "warping", "morphing",
-                     "no easing", "No people",
-                     "No cars moving", "No text", "No logos",
-                     "No cuts, no dissolves", "no speed changes"):
+        for rule in ("Perfectly stabilized motorized camera rig", "level frame",
+                     "straight verticals", "Preserve exact architecture",
+                     "object placement", "controlled", "constant speed"):
             self.assertIn(rule, prompt)
+        self.assertNotIn("No ", prompt)
 
     def test_pair_prompt_requests_stabilized_motion_without_changing_the_path(self):
         prompt = build_shot_prompt(_Shot(kind="pair_keyframes"))
         self.assertIn("from the first reference frame to the second reference frame", prompt)
         self.assertIn("constant speed", prompt)
-        self.assertIn("stabilized gimbal camera", prompt)
-        self.assertIn("fixed object placement", prompt)
+        self.assertIn("Perfectly stabilized motorized camera rig", prompt)
+        self.assertIn("object placement", prompt)
 
     def test_single_interior_prompt_does_not_request_angled_motion(self):
         prompt = build_shot_prompt(
@@ -113,8 +111,7 @@ class PromptTests(unittest.TestCase):
     def test_an_author_override_keeps_custom_text_and_safety_contract(self):
         prompt = build_shot_prompt(_Shot(prompt_override="  my own words  "))
         self.assertTrue(prompt.startswith("my own words "))
-        self.assertIn("stabilized gimbal camera", prompt)
-        self.assertIn("No handheld shake", prompt)
+        self.assertIn("Perfectly stabilized motorized camera rig", prompt)
 
 
 if __name__ == "__main__":

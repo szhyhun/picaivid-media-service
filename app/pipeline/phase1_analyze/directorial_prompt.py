@@ -210,11 +210,10 @@ _OUTDOOR_TYPES = frozenset({"patio", "pool", "backyard", "exterior back"})
 # Applies to every shot. The building and visible objects must not change; only
 # the camera is allowed to move.
 _INVARIANTS = (
-    "Photorealistic, stabilized gimbal camera with a level frame and straight "
-    "verticals. Rigid architecture, fixed object placement, unchanged geometry "
-    "and proportions. No handheld shake, jitter, wobble, camera roll, flicker, "
-    "warping, or morphing. No acceleration, no easing, no speed changes. "
-    "No people. No cars moving. No text. No logos. No cuts, no dissolves."
+    "Photorealistic. Perfectly stabilized motorized camera rig with a level "
+    "frame and straight verticals. Preserve exact architecture, geometry, "
+    "proportions, object placement, and lighting throughout. Use one "
+    "continuous, controlled move at constant speed."
 )
 
 
@@ -323,8 +322,8 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
         # two to the end. State that direction in the prompt as well, without
         # inventing a textual left/right direction that geometry may contradict.
         motion = (
-            f"{speed}, smooth, continuous camera movement from the first "
-            "reference frame to the second reference frame at constant speed. "
+            f"{speed}, smooth camera movement from the first reference frame "
+            "to the second reference frame. "
             "Follow the spatial path and framing change between those two views."
         )
     else:

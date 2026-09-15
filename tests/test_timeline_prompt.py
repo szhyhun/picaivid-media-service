@@ -23,7 +23,8 @@ class TimelinePromptTests(unittest.TestCase):
     def test_planned_shot_exposes_current_resolved_prompt(self):
         prompt = _timeline_generation_prompt(self._clip(), 0, 1)
         self.assertIn("straight pull back", prompt)
-        self.assertIn("No logos", prompt)
+        self.assertIn("Perfectly stabilized motorized camera rig", prompt)
+        self.assertNotIn("No ", prompt)
 
     def test_ready_shot_exposes_immutable_prompt_that_was_sent(self):
         actual = "provider prompt from the completed request"
