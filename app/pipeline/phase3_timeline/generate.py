@@ -32,7 +32,7 @@ from app.db.models import Clip, JobPhoto
 from app.db.models.timeline import SOURCE_SECONDS, Timeline, TimelineClip
 from app.pipeline.phase1_analyze.directorial_prompt import build_shot_prompt
 from app.pipeline.progress import NullProgress
-from app.services.runware.client import RunwareError, generate_video
+from app.services.runware.client import RunwareError, generate_video, resolve_video_options
 from app.services.storage.s3_client import s3_client
 
 logger = logging.getLogger(__name__)
@@ -103,8 +103,13 @@ def queued_shots(timeline: Timeline) -> list[TimelineClip]:
 
 def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
     """Create or reuse the Clip row, with its task id, before any network call."""
+    options = resolve_video_options()
     if shot.clip_id and shot.clip and shot.clip.provider_task_uuid \
             and (shot.clip.status or "") not in {"failed"}:
+        if shot.clip.model_used != options.model:
+            raise RunwareError(
+                f"Cannot resume shot {shot.shot_uid} with model "
+                f"{shot.clip.model_used or '<unknown>'}; expected {options.model}.")
         return shot.clip
 
     ordered = timeline.ordered_clips()
@@ -125,9 +130,9 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
     clip.shot_uid = shot.shot_uid
     clip.provider = "runware"
     clip.provider_task_uuid = str(uuid.uuid4())
-    clip.model_used = settings.RUNWARE_MODEL
+    clip.model_used = options.model
     clip.prompt_used = prompt
-    clip.duration = float(settings.RUNWARE_DURATION_SECONDS)
+    clip.duration = float(options.duration)
     clip.source_photo_ids = list(shot.photo_ids or [])
     clip.motion_type = shot.move_label
     # Queued is visible to the studio before the HTTP response returns. The
@@ -166,6 +171,7 @@ def queue_timeline_clips(db: Session, timeline: Timeline, *,
     show that its shots are in flight. It also means a second click cannot order
     the same generation while the first request is still being scheduled.
     """
+    options = resolve_video_options(resolution=resolution)
     wanted = set(shot_uids or [])
     shots = [
         shot for shot in pending_shots(timeline)
@@ -175,7 +181,11 @@ def queue_timeline_clips(db: Session, timeline: Timeline, *,
         clip = _prepare(db, timeline, shot)
         clip.render_metadata = {
             **(clip.render_metadata or {}),
-            "resolution": resolution or settings.RUNWARE_RESOLUTION,
+            "model": options.model,
+            "duration": options.duration,
+            "resolution": options.resolution,
+            "hdr": options.hdr,
+            "exr_export": options.exr_export,
         }
         clip.status = "queued"
     if shots:
@@ -188,6 +198,7 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
                             resolution: str | None = None) -> dict:
     """Generate persisted queued shots. Returns a summary of what happened."""
     progress = progress or NullProgress()
+    options = resolve_video_options(resolution=resolution)
 
     shots = queued_shots(timeline)
     if shot_uids:
@@ -217,10 +228,12 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
     if not jobs:
         return {"requested": len(shots), "succeeded": 0, "failed": len(shots)}
 
-    logger.info("RUNWARE_BATCH_START count=%s concurrency=%s resolution=%s",
+    logger.info("RUNWARE_BATCH_START model=%s count=%s concurrency=%s "
+                "duration=%ss resolution=%s hdr=%s",
+                options.model,
                 len(jobs), settings.RUNWARE_MAX_CONCURRENCY,
-                resolution or settings.RUNWARE_RESOLUTION)
-    results = asyncio.run(_generate_all(jobs, resolution, progress.heartbeat))
+                options.duration, options.resolution, options.hdr)
+    results = asyncio.run(_generate_all(jobs, options.resolution, progress.heartbeat))
 
     done = failed = 0
     for task_uuid, result in results.items():
@@ -241,9 +254,13 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
                 clip.seed = result.seed
                 clip.render_metadata = {
                     **(clip.render_metadata or {}),
+                    "model": options.model,
+                    "duration": options.duration,
                     "provider_video_uuid": result.video_uuid,
                     "provider_cost_usd": result.cost,
-                    "resolution": resolution or settings.RUNWARE_RESOLUTION,
+                    "resolution": options.resolution,
+                    "hdr": options.hdr,
+                    "exr_export": options.exr_export,
                 }
                 done += 1
             except Exception as exc:               # noqa: BLE001 - store and move on

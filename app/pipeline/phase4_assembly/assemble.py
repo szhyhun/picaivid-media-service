@@ -3,7 +3,7 @@
 Two things happen to every clip, and both come from measurement rather than
 taste.
 
-**Middle window.** We buy three seconds of source and show one beat-length
+**Middle window.** We buy five seconds of source and show one beat-length
 window from the stable centre -- about 1.2s at 100 BPM. Input anchoring and
 generation artefacts are most visible at the ends, so accelerating the full
 source would put the weakest material into the final cut.
@@ -25,6 +25,8 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
+
+from app.db.models.timeline import SOURCE_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +129,7 @@ def concat(parts: list[Path], dest: str | Path,
 
 
 def assemble_film(shots: list[dict], dest: str | Path, *,
-                  source_seconds: float = 3.0,
+                  source_seconds: float = SOURCE_SECONDS,
                   audio_path: str | Path | None = None,
                   audio_offset: float = 0.0,
                   blend: int = BLEND_FRAMES, fps: int = OUTPUT_FPS) -> dict:

@@ -39,7 +39,7 @@ class TimelineShot(BaseModel):
     in_time: float = 0.0
     duration: float = 0.0
     trim_start: float = 0.0
-    max_duration: float = 3.0
+    max_duration: float = 5.0
     duration_override: Optional[float] = None
 
     move: Optional[str] = None
@@ -88,7 +88,7 @@ class TimelineResponse(BaseModel):
     bpm: float = 100.0
     beats_per_shot: int = 2
     shot_seconds: float = 1.2
-    source_seconds: float = 3.0
+    source_seconds: float = 5.0
     duration: float = 0.0
     shots: list[TimelineShot] = []
     music: Optional[TimelineMusic] = None

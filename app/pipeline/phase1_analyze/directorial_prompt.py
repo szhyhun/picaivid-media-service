@@ -185,7 +185,7 @@ def split_for_generation(shots, *, max_seconds: float = 30.0) -> list[list]:
 # --- Per-shot prompts for clip-by-clip image-to-video generation -------------
 #
 # Everything above builds ONE prompt for a whole film, for models that generate
-# a multi-shot sequence in a single pass. Vidu Q3 Turbo works the other way:
+# a multi-shot sequence in a single pass. Ray3.2 works the other way:
 # one clip per shot, from one or two real photographs. That inverts the job.
 # The model already has the pixels, so the prompt's only work is motion.
 #

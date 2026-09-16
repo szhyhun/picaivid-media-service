@@ -246,12 +246,12 @@ class RhythmTests(unittest.TestCase):
         self.assertGreater(slow.shots[0].duration_seconds,
                            fast.shots[0].duration_seconds)
 
-    def test_every_shot_requests_three_seconds_of_source_footage(self):
+    def test_every_shot_requests_five_seconds_of_source_footage(self):
         """Generation length is deliberately independent of the music tempo."""
         for bpm in (80, 100, 120):
             line = build_shot_line(a_property(), target_seconds=45, bpm=bpm)
             self.assertTrue(all(
-                shot.generation_duration_seconds == 3.0
+                shot.generation_duration_seconds == 5.0
                 for shot in line.shots
             ))
 

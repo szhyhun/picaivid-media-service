@@ -21,7 +21,7 @@ def a_timeline(bpm=100.0, shots=4):
 
 class GridTests(unittest.TestCase):
     def test_shot_length_is_two_beats_at_the_films_tempo(self):
-        # Measured in 3/3 reference films, and it never varies within a film.
+        # Measured in reference films, and it never varies within a film.
         self.assertAlmostEqual(a_timeline(bpm=100).grid_seconds, 1.2)
         self.assertAlmostEqual(a_timeline(bpm=90).grid_seconds, 1.3333, places=3)
         self.assertAlmostEqual(a_timeline(bpm=113).grid_seconds, 1.0619, places=3)
@@ -56,14 +56,14 @@ class RetimeTests(unittest.TestCase):
 
 
 class TrimTests(unittest.TestCase):
-    def test_a_three_second_source_has_headroom_for_a_central_two_beat_window(self):
+    def test_a_five_second_source_has_headroom_for_a_central_two_beat_window(self):
         trim_start = (SOURCE_SECONDS - 1.2) / 2.0
-        self.assertAlmostEqual(trim_start, 0.9)
+        self.assertAlmostEqual(trim_start, 1.9)
         clip = TimelineClip(order_index=0, trim_start=trim_start)
         self.assertAlmostEqual(clip.duration_for(1.2), 1.2)
 
     def test_duration_is_clamped_to_the_source_we_actually_bought(self):
-        clip = TimelineClip(order_index=0, trim_start=2.5)
+        clip = TimelineClip(order_index=0, trim_start=4.5)
         self.assertAlmostEqual(clip.max_duration(), 0.5)
         self.assertAlmostEqual(clip.duration_for(1.2), 0.5)
 

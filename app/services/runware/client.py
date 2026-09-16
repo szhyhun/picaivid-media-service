@@ -1,4 +1,4 @@
-"""Runware client for Vidu Q3 Turbo image-to-video generation.
+"""Runware client for Luma Ray3.2 image-to-video generation.
 
 Runware takes one HTTP endpoint and a list of task objects. Video inference is
 asynchronous: you submit a task with a `taskUUID` you choose, then poll
@@ -8,14 +8,10 @@ Choosing the id ourselves is what makes retries safe. We write it to the `clips`
 row *before* awaiting, so a worker that dies mid-generation resumes the existing
 task on restart instead of submitting a second one and paying twice.
 
-Two things about Vidu that cost money if missed:
-
-* **Audio defaults to on.** We lay our own music on a beat grid and discard the
-  generated track entirely, so leaving it on is paying for output that goes
-  straight in the bin.
-* **Duration is billed from a 1-second floor**, not a 5-second one. That is why
-  this model is worth four times less per shot than the alternatives, and why
-  we can afford to buy 3s of source for a 1.2s cut.
+Ray3.2's frame-to-frame mode is deliberately validated here instead of relying
+on an environment value being correct: it requires a 5-second duration, and
+HDR is available only at 720p or 1080p. A malformed combination must fail
+before a paid request is sent.
 """
 from __future__ import annotations
 
@@ -31,8 +27,8 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 16:9 at each tier Vidu offers. Cost scales with pixels, so development runs
-# at the bottom of this table and production at the top.
+# 16:9 presets accepted by Runware. Cost scales with pixels, so the endpoint
+# validates the selected tier before a paid request.
 RESOLUTIONS: dict[str, tuple[int, int]] = {
     "540p": (960, 540),
     "720p": (1280, 720),
@@ -63,16 +59,77 @@ class VideoResult:
         return bool(self.video_url)
 
 
+@dataclass(frozen=True)
+class VideoOptions:
+    """Validated options for the one supported Runware video model."""
+
+    model: str
+    duration: int
+    resolution: str
+    hdr: bool
+    exr_export: bool
+    output_quality: int
+
+
+RAY_MODEL_ID = "luma:ray@3.2"
+RAY_FRAME_DURATION_SECONDS = 5
+HDR_RESOLUTIONS = frozenset({"720p", "1080p"})
+
+
 def resolution_size(name: str | None = None) -> tuple[int, int]:
-    key = (name or settings.RUNWARE_RESOLUTION or "540p").lower()
+    key = (name or settings.RUNWARE_RESOLUTION or "720p").lower()
     if key not in RESOLUTIONS:
         raise RunwareError(
             f"Unknown resolution {key!r}; expected one of {sorted(RESOLUTIONS)}")
     return RESOLUTIONS[key]
 
 
-def build_frame_images(photo_urls: list[str]) -> list[Any]:
-    """Map our two shot kinds onto Vidu's `frameImages`.
+def runware_model_id(model: str | None = None) -> str:
+    """Return the configured model, refusing silent fallback to another model."""
+    configured = (model or settings.RUNWARE_MODEL or "").strip()
+    if configured != RAY_MODEL_ID:
+        raise RunwareError(
+            f"Runware model must be {RAY_MODEL_ID!r}; got {configured or '<empty>'!r}")
+    return configured
+
+
+def resolve_video_options(*, model: str | None = None,
+                          duration: int | None = None,
+                          resolution: str | None = None,
+                          hdr: bool | None = None,
+                          exr_export: bool | None = None,
+                          output_quality: int | None = None) -> VideoOptions:
+    """Resolve and validate the exact Ray3.2 options before submission."""
+    model_id = runware_model_id(model)
+    resolution_name = (resolution or settings.RUNWARE_RESOLUTION or "720p").lower()
+    resolution_size(resolution_name)
+    duration_seconds = int(
+        settings.RUNWARE_DURATION_SECONDS if duration is None else duration)
+    hdr_enabled = settings.RUNWARE_HDR if hdr is None else bool(hdr)
+    exr_enabled = (
+        settings.RUNWARE_EXR_EXPORT if exr_export is None else bool(exr_export))
+    quality = int(
+        settings.RUNWARE_OUTPUT_QUALITY
+        if output_quality is None else output_quality)
+
+    if duration_seconds != RAY_FRAME_DURATION_SECONDS:
+        raise RunwareError(
+            f"Ray3.2 frameImages generation requires duration={RAY_FRAME_DURATION_SECONDS}; "
+            f"got {duration_seconds}")
+    if hdr_enabled and resolution_name not in HDR_RESOLUTIONS:
+        raise RunwareError(
+            "Ray3.2 HDR requires resolution=720p or resolution=1080p.")
+    if exr_enabled and not hdr_enabled:
+        raise RunwareError("Ray3.2 exrExport requires HDR to be enabled.")
+    if not 20 <= quality <= 99:
+        raise RunwareError("Runware outputQuality must be between 20 and 99.")
+
+    return VideoOptions(model_id, duration_seconds, resolution_name,
+                        hdr_enabled, exr_enabled, quality)
+
+
+def build_frame_images(photo_urls: list[str]) -> list[dict[str, str]]:
+    """Map our one- and two-photo shots onto Ray3.2's `frameImages`.
 
     One photograph is a start frame and the model invents everything the camera
     reveals. Two photographs pin both ends, so it only has to invent the middle
@@ -81,34 +138,50 @@ def build_frame_images(photo_urls: list[str]) -> list[Any]:
     if not photo_urls:
         raise RunwareError("A shot needs at least one photograph.")
     if len(photo_urls) == 1:
-        return [photo_urls[0]]
-    return [photo_urls[0], {"image": photo_urls[1], "frame": "last"}]
+        return [{"image": photo_urls[0], "frame": "first"}]
+    if len(photo_urls) > 2:
+        raise RunwareError("A Ray3.2 shot accepts at most two photographs.")
+    return [
+        {"image": photo_urls[0], "frame": "first"},
+        {"image": photo_urls[1], "frame": "last"},
+    ]
 
 
 def build_video_task(*, prompt: str, photo_urls: list[str],
                      task_uuid: str | None = None,
                      duration: int | None = None,
                      resolution: str | None = None,
-                     model: str | None = None) -> dict[str, Any]:
+                     model: str | None = None,
+                     hdr: bool | None = None,
+                     exr_export: bool | None = None,
+                     output_quality: int | None = None) -> dict[str, Any]:
     """The exact request body Runware expects. Pure, so it can be tested."""
-    width, height = resolution_size(resolution)
+    options = resolve_video_options(
+        model=model,
+        duration=duration,
+        resolution=resolution,
+        hdr=hdr,
+        exr_export=exr_export,
+        output_quality=output_quality,
+    )
     return {
-        "taskType": "videoInference",
-        "taskUUID": task_uuid or str(uuid.uuid4()),
-        "model": model or settings.RUNWARE_MODEL,
+        "model": options.model,
+        "inputs": {"frameImages": build_frame_images(photo_urls)},
         "positivePrompt": prompt,
-        "width": width,
-        "height": height,
-        "duration": int(duration or settings.RUNWARE_DURATION_SECONDS),
+        "duration": options.duration,
+        "settings": {
+            "hdr": options.hdr,
+            "exrExport": options.exr_export,
+        },
+        "taskType": "videoInference",
+        "numberResults": 1,
         "outputType": "URL",
         "outputFormat": "MP4",
+        "outputQuality": options.output_quality,
         "deliveryMethod": "async",
-        # Internal billing metadata is retained on the clip record. It is
-        # deliberately not exposed in the customer-facing studio.
-        "includeCost": True,
-        # Never on. See the module docstring.
-        "providerSettings": {"vidu": {"audio": False}},
-        "inputs": {"frameImages": build_frame_images(photo_urls)},
+        "includeCost": settings.RUNWARE_INCLUDE_COST,
+        "resolution": options.resolution,
+        "taskUUID": task_uuid or str(uuid.uuid4()),
     }
 
 

@@ -34,7 +34,8 @@ class QueueTests(unittest.TestCase):
         prepare.assert_called_once()
         self.assertEqual(second_clip.status, "queued")
         self.assertEqual(second_clip.render_metadata,
-                         {"old": True, "resolution": "1080p"})
+                         {"old": True, "model": "luma:ray@3.2", "duration": 5,
+                          "resolution": "1080p", "hdr": True, "exr_export": False})
         db.commit.assert_called_once()
 
     def test_background_runner_only_claims_persisted_queue_entries(self):

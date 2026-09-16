@@ -7,15 +7,21 @@ from app.services.runware import client as rw
 
 
 class FrameImageTests(unittest.TestCase):
-    def test_one_photo_becomes_a_plain_start_frame(self):
-        self.assertEqual(rw.build_frame_images(["a.jpg"]), ["a.jpg"])
+    def test_one_photo_becomes_a_first_frame(self):
+        self.assertEqual(
+            rw.build_frame_images(["a.jpg"]),
+            [{"image": "a.jpg", "frame": "first"}],
+        )
 
     def test_two_photos_pin_both_ends_of_the_generated_move(self):
         # This is the whole point of the pairing geometry: with a real
         # photograph at each end the model only invents the middle.
         self.assertEqual(
             rw.build_frame_images(["a.jpg", "b.jpg"]),
-            ["a.jpg", {"image": "b.jpg", "frame": "last"}],
+            [
+                {"image": "a.jpg", "frame": "first"},
+                {"image": "b.jpg", "frame": "last"},
+            ],
         )
 
     def test_a_shot_with_no_photograph_is_refused(self):
@@ -25,23 +31,60 @@ class FrameImageTests(unittest.TestCase):
 
 class VideoTaskTests(unittest.TestCase):
     def task(self, **kw):
-        return rw.build_video_task(prompt="p", photo_urls=["a.jpg"], **kw)
+        return rw.build_video_task(
+            prompt=kw.pop("prompt", "p"),
+            photo_urls=kw.pop("photo_urls", ["a.jpg"]),
+            **kw,
+        )
 
-    def test_it_never_pays_for_audio_it_throws_away(self):
-        # Vidu defaults audio ON. We lay our own music on a beat grid and
-        # discard the generated track, so leaving this on is pure waste.
-        self.assertIs(self.task()["providerSettings"]["vidu"]["audio"], False)
+    def test_it_targets_ray32_with_five_second_hdr_output(self):
+        task = self.task()
+        self.assertEqual(task["model"], "luma:ray@3.2")
+        self.assertEqual(task["duration"], 5)
+        self.assertEqual(task["resolution"], "720p")
+        self.assertEqual(task["settings"], {"hdr": True, "exrExport": False})
+        self.assertEqual(task["numberResults"], 1)
+        self.assertEqual(task["outputQuality"], 95)
+        self.assertEqual(task["deliveryMethod"], "async")
 
-    def test_it_records_provider_cost_without_exposing_it_to_the_prompt(self):
-        self.assertIs(self.task()["includeCost"], True)
+    def test_it_does_not_request_provider_cost_by_default(self):
+        self.assertIs(self.task()["includeCost"], False)
 
-    def test_it_asks_for_more_source_than_the_edit_shows(self):
-        # The surplus is what makes trimming and retiming free.
-        self.assertGreaterEqual(self.task()["duration"], 3)
+    def test_it_uses_explicit_ray_keyframe_objects(self):
+        self.assertEqual(
+            self.task(photo_urls=["a.jpg", "b.jpg"])["inputs"]["frameImages"],
+            [
+                {"image": "a.jpg", "frame": "first"},
+                {"image": "b.jpg", "frame": "last"},
+            ],
+        )
 
-    def test_resolution_defaults_to_the_cheapest_tier(self):
+    def test_it_does_not_send_vidu_or_dimensions_to_ray(self):
+        task = self.task()
+        self.assertNotIn("providerSettings", task)
+        self.assertNotIn("width", task)
+        self.assertNotIn("height", task)
+
+    def test_resolution_is_a_ray_preset(self):
         self.assertEqual(rw.resolution_size("540p"), (960, 540))
-        self.assertEqual(self.task(resolution="1080p")["width"], 1920)
+        self.assertEqual(self.task(resolution="1080p")["resolution"], "1080p")
+
+    def test_hdr_rejects_540p_before_submission(self):
+        with self.assertRaises(rw.RunwareError):
+            self.task(resolution="540p")
+
+    def test_frame_generation_requires_five_seconds(self):
+        with self.assertRaises(rw.RunwareError):
+            self.task(duration=3)
+
+    def test_wrong_model_is_rejected_before_submission(self):
+        with self.assertRaises(rw.RunwareError):
+            self.task(model="vidu:4@2")
+
+    def test_wrong_configured_model_is_rejected_before_submission(self):
+        with patch.object(rw.settings, "RUNWARE_MODEL", "vidu:4@2"):
+            with self.assertRaises(rw.RunwareError):
+                self.task()
 
     def test_an_unknown_resolution_fails_loudly(self):
         with self.assertRaises(rw.RunwareError):

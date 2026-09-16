@@ -2,7 +2,7 @@
 
 One `TimelineClip` row is one shot, and it serves both editing stages. In the
 storyboard a shot is a *plan* -- photos, kind, camera move, and no duration at
-all, because a photograph has none. In the timeline it is a *clip*: three
+all, because a photograph has none. In the timeline it is a *clip*: five
 generated seconds you can cut anywhere inside.
 
 Keeping both in one row is deliberate. A shot must hold one identity across the
@@ -17,7 +17,7 @@ from app.db.base import Base
 
 # What we buy from the video provider per shot. Bigger than any beat length we
 # will ever cut, which is what makes trimming and retiming free.
-SOURCE_SECONDS = 3.0
+SOURCE_SECONDS = 5.0
 
 
 class Timeline(Base):

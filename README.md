@@ -34,6 +34,24 @@ Worker:
 WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.worker
 ```
 
+### Runware credentials
+
+For local testing, put the key in the untracked `picaivid-media-service/.env`:
+
+```dotenv
+RUNWARE_API_KEY=your-runware-key
+RUNWARE_MODEL=luma:ray@3.2
+RUNWARE_DURATION_SECONDS=5
+RUNWARE_RESOLUTION=720p
+RUNWARE_HDR=true
+```
+
+Never put this key in the React `.env.local`, source control, or a prompt. On
+AWS, set the same values in `/etc/picaivid/media-worker.env` (and
+`media-api.env` if the media API handles generation), then restart the service.
+The client rejects any model other than `luma:ray@3.2` and rejects invalid HDR,
+resolution, or duration combinations before submitting a paid task.
+
 The full current manual startup order is documented in the workspace
 [`LOCAL_RUN.md`](../LOCAL_RUN.md).
 

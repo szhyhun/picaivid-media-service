@@ -1109,13 +1109,14 @@ async def generate_timeline(project_id: str, payload: GenerateRequest,
                 "detail": "Every shot already has video."}
 
     resolution = payload.resolution or settings.RUNWARE_RESOLUTION
-    # Validate before accepting a paid background job. The value is also passed
-    # through to the provider; it is not merely a display value in the response.
-    from app.services.runware.client import RunwareError, resolution_size
+    # Validate the provider model and all Ray3.2 dependencies before accepting
+    # a paid background job. These are not merely display values.
+    from app.services.runware.client import RunwareError, resolve_video_options
     try:
-        resolution_size(resolution)
+        options = resolve_video_options(resolution=resolution)
     except RunwareError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    resolution = options.resolution
     uids = queue_timeline_clips(
         db, timeline,
         shot_uids=[str(c.shot_uid) for c in pending],

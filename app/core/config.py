@@ -67,22 +67,22 @@ class Settings(BaseSettings):
     DETAIL_DETECTOR_MIN_SCORE: float = 0.35
     DETAIL_DETECTOR_BATCH_SIZE: int = 4
 
-    # Video generation (Runware -> Vidu Q3 Turbo).
+    # Video generation (Runware -> Luma Ray3.2).
     #
-    # Every shot buys RUNWARE_DURATION_SECONDS of source and the editor cuts a
-    # beat-length slice out of the middle. Buying 3s costs a little more than
-    # the ~1.2s we show, and it is what makes retiming and trimming free: any
-    # tempo above 40 BPM fits inside it, so changing the music never
-    # regenerates a clip.
-    #
-    # RESOLUTION defaults to the cheapest tier on purpose. Generation costs real
-    # money per shot, so raising it is an explicit act, not a default anyone
-    # inherits by forgetting.
+    # Every shot buys five seconds of source and the editor cuts a beat-length
+    # slice out of the middle. Ray3.2 requires five seconds when frameImages
+    # are supplied, and the extra headroom keeps retiming and trimming free.
+    # HDR is intentionally on for the first real output. Ray3.2 limits HDR to
+    # 720p or 1080p, so invalid combinations fail before a paid task is queued.
     RUNWARE_API_KEY: str | None = None
     RUNWARE_API_URL: str = "https://api.runware.ai/v1"
-    RUNWARE_MODEL: str = "vidu:4@2"
-    RUNWARE_DURATION_SECONDS: int = 3
-    RUNWARE_RESOLUTION: str = "540p"          # 720p for test, 1080p for production
+    RUNWARE_MODEL: str = "luma:ray@3.2"
+    RUNWARE_DURATION_SECONDS: int = 5
+    RUNWARE_RESOLUTION: str = "720p"
+    RUNWARE_HDR: bool = True
+    RUNWARE_EXR_EXPORT: bool = False
+    RUNWARE_OUTPUT_QUALITY: int = 95
+    RUNWARE_INCLUDE_COST: bool = False
     # `url` passes a presigned S3 URL. `data_uri` sends the image with the
     # request. `auto` uses URLs in production but switches to data URIs for
     # a private local MinIO endpoint that Runware cannot reach.

@@ -290,7 +290,7 @@ class RoomCandidate:
 
 @dataclass
 class Shot:
-    """One two-beat final edit, with its fixed three-second source request."""
+    """One two-beat final edit, with its fixed five-second source request."""
 
     index: int
     room_id: str
