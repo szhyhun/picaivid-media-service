@@ -54,9 +54,12 @@ class PromptTests(unittest.TestCase):
             self.assertNotIn(banned, prompt.lower())
 
     def test_opening_and_closing_single_shots_have_bookend_moves(self):
+        # Position owns the zoom axis only. The measured pan survives it, so an
+        # opening shot pushes in *and* keeps drifting the way it was measured.
         opening = build_shot_prompt(_Shot(move="pan left"), is_first=True)
         closing = build_shot_prompt(_Shot(move="push in"), is_last=True)
-        self.assertIn("straight push in", opening)
+        self.assertIn("Slow push in", opening)
+        self.assertIn("drifting gently to the left", opening)
         self.assertIn("straight pull back", closing)
 
     def test_it_never_describes_the_room(self):
@@ -80,12 +83,32 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Perfectly stabilized motorized camera rig", prompt)
         self.assertIn("object placement", prompt)
 
-    def test_single_interior_prompt_does_not_request_angled_motion(self):
+    def test_a_compound_move_names_every_axis_it_was_measured_with(self):
+        # 87% of the singles in a real listing move on two or three axes, and
+        # naming only the dominant one threw the rest away.
         prompt = build_shot_prompt(
             _Shot(room_type="living room", move="push in + pan right + tilt up"))
+        self.assertIn("Slow push in", prompt)
+        self.assertIn("drifting gently to the right", prompt)
+        self.assertIn("rising gently", prompt)
+
+    def test_a_single_axis_move_is_still_asked_for_straight(self):
+        # With nothing else on the move, "straight" suppresses drift the model
+        # would otherwise invent.
+        prompt = build_shot_prompt(_Shot(room_type="living room", move="push in"))
         self.assertIn("straight push in", prompt)
-        self.assertNotIn("tilt the camera", prompt.lower())
-        self.assertNotIn("roll the camera", prompt.lower())
+
+    def test_no_prompt_ever_asks_the_camera_to_tilt_or_roll(self):
+        # A pitch and a slanted horizon share the word "tilt", and a slanted
+        # horizon is exactly what the stability invariants exist to prevent.
+        for move in ("push in + pan right + tilt up", "pull out + tilt down",
+                     "tilt up", "push in"):
+            prompt = build_shot_prompt(
+                _Shot(room_type="living room", move=move)).lower()
+            self.assertNotIn("tilt", prompt)
+            # "controlled" contains the substring, so match the word itself.
+            self.assertNotIn("roll ", prompt)
+            self.assertNotIn("rolling", prompt)
 
     def test_source_window_keeps_the_same_slow_prompt_at_native_speed(self):
         # The editor now trims a native-speed centre window; squeeze no longer

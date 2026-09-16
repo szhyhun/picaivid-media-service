@@ -123,58 +123,52 @@ class ReverseTests(unittest.TestCase):
                          {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": 0.0})
 
 
-class SelectableMoveTests(unittest.TestCase):
-    """The moves a customer can choose, and what choosing one does."""
 
-    def test_choosing_a_move_keeps_the_axes_it_did_not_touch(self):
-        # Over 80% of reference shots move on two or more axes, so collapsing a
-        # choice down to one would make the film flatter than its source.
+
+class ComposedMoveTests(unittest.TestCase):
+    """Moves are built from independent axes, not picked from a flat list."""
+
+    def test_it_splits_a_compound_label_into_axes(self):
         self.assertEqual(
-            camera_move.with_primary("push in + pan right + tilt up", "pull out"),
-            "pull out + pan right + tilt up",
+            camera_move.axes_of("push in + pan right + tilt up"),
+            {"zoom": "push in", "pan": "pan right", "tilt": "tilt up"},
         )
 
-    def test_choosing_a_move_replaces_only_its_own_axis(self):
+    def test_removing_an_axis_leaves_the_others_intact(self):
+        axes = camera_move.axes_of("push in + pan right + tilt up")
+        axes["pan"] = None
+        self.assertEqual(camera_move.compose_label(axes), "push in + tilt up")
+
+    def test_it_always_composes_in_zoom_pan_tilt_order(self):
+        # Order is how the prompt decides its lead clause, so it cannot depend
+        # on the order a customer happened to click the buttons in.
         self.assertEqual(
-            camera_move.with_primary("push in + pan right", "pan left"),
-            "pan left + push in",
+            camera_move.compose_label(
+                {"tilt": "tilt up", "pan": "pan left", "zoom": "pull out"}),
+            "pull out + pan left + tilt up",
         )
 
-    def test_a_chosen_move_outranks_the_zoom_first_reading(self):
-        # The select's whole purpose is overriding what was measured. Reading
-        # a chosen "pan left" back as the shot's old "pull out" would make the
-        # control appear to do nothing.
-        label = camera_move.with_primary("pull out + pan right", "pan left")
-        self.assertEqual(camera_move.primary_of(label, chosen=True), "pan left")
-        self.assertEqual(camera_move.primary_of(label), "pull out")
-
-    def test_holding_still_clears_everything(self):
-        # A hold is the absence of movement; it cannot keep a pan.
+    def test_removing_every_axis_is_a_hold(self):
         self.assertEqual(
-            camera_move.with_primary("pan right + tilt up", "static hold"),
+            camera_move.compose_label({"zoom": None, "pan": None, "tilt": None}),
             "static hold",
         )
 
-    def test_it_reads_the_primary_axis_back_out_of_a_compound_label(self):
-        self.assertEqual(camera_move.primary_of("push in + pan right"), "push in")
-        self.assertEqual(camera_move.primary_of("pan left + tilt down"), "pan left")
-        self.assertEqual(camera_move.primary_of("static hold"), "static hold")
-        self.assertEqual(camera_move.primary_of(None), "static hold")
-
-    def test_a_chosen_move_produces_a_vector_at_the_measured_rates(self):
-        # A chosen move has no seed behind it, and the renderer reads the
-        # vector rather than the words.
-        vector = camera_move.vector_from_label("pull out + pan left")
-        self.assertAlmostEqual(vector["zoom"], -camera_move.ZOOM_OUT_RATE)
-        self.assertAlmostEqual(vector["pan"], -camera_move.PAN_RATE)
-        self.assertAlmostEqual(vector["tilt"], 0.0)
-
-    def test_a_hold_has_no_motion_on_any_axis(self):
+    def test_unknown_atoms_are_dropped_rather_than_raising(self):
+        # Labels are persisted data; a vocabulary change must not make an old
+        # row unreadable.
         self.assertEqual(
-            camera_move.vector_from_label("static hold"),
-            {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": 0.0},
+            camera_move.axes_of("push in + dolly zoom"),
+            {"zoom": "push in", "pan": None, "tilt": None},
         )
 
-    def test_roll_is_carried_through_rather_than_invented(self):
-        self.assertAlmostEqual(
-            camera_move.vector_from_label("push in", roll_deg=1.36)["roll_deg"], 1.36)
+    def test_an_echoed_move_normalises_to_the_same_label(self):
+        # The editor sends every shot's move back on any edit -- a drag, a
+        # trim, a delete. If a re-sent move did not compare equal to the one
+        # the shot already had, a single drag would lock every move on the
+        # timeline and freeze the planner out of the whole film.
+        for echoed in ("pull out + pan right", "pan right + pull out"):
+            self.assertEqual(
+                camera_move.compose_label(camera_move.axes_of(echoed)),
+                "pull out + pan right",
+            )

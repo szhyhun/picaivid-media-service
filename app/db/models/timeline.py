@@ -114,6 +114,9 @@ class TimelineClip(Base):
     # True once a customer picks a move. The positional defaults are a grammar,
     # not a rule: they should stop applying the moment someone disagrees.
     move_locked = Column(Boolean, default=False)
+    # The customer's composed move. `move_label` stays as measured, so the
+    # planner's own choice survives an override and reset has a target.
+    move_chosen = Column(String(120))
 
     # --- Edit: how the generated source is cut into the film ---
     trim_start = Column(Float, default=0.0)

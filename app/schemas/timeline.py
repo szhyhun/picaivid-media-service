@@ -51,9 +51,8 @@ class TimelineShot(BaseModel):
     prompt_override: Optional[str] = None
     # The customer's optional note, appended to our prompt -- never replacing it.
     prompt_note: Optional[str] = None
-    # The move axis the select shows: derived from `move` unless the customer
-    # has chosen one, in which case `move_locked` keeps the planner off it.
-    move_primary: Optional[str] = None
+    # True once a customer composed this move, which keeps the positional
+    # default from overruling it.
     move_locked: bool = False
     # Exact prompt previewed before generation or sent for a ready clip.
     generation_prompt: Optional[str] = None
@@ -114,9 +113,8 @@ class TimelineShotUpdate(BaseModel):
     duration_override: Optional[float] = None
     prompt_override: Optional[str] = None
     prompt_note: Optional[str] = None
-    # The primary axis the customer picked. Applied to the stored label,
-    # keeping whatever secondary axes the shot already had.
-    move_primary: Optional[str] = None
+    # The composed move, e.g. "push in + pan right + tilt up". Locks the shot
+    # only when it differs from the move the shot would have generated anyway.
     move: Optional[str] = None
 
 

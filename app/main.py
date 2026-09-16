@@ -37,15 +37,15 @@ from app.schemas.job_progress import (
 from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
 from app.db.models.timeline import TimelineClip
 from app.pipeline.phase1_analyze.camera_move import (
-    primary_of,
+    axes_of,
+    compose_label,
     reverse_label,
     reverse_vector,
     vector_from_label,
-    with_primary,
 )
 from app.pipeline.phase1_analyze.directorial_prompt import (
     build_shot_prompt,
-    effective_move_primary,
+    effective_move_label,
 )
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music_uri
@@ -850,15 +850,16 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             in_time=c.in_time or 0.0, duration=c.duration_for(grid),
             trim_start=c.trim_start or 0.0, max_duration=c.max_duration(),
             duration_override=c.duration_override,
-            move=c.move_label, move_vector=c.move_vector,
+            # The move the prompt will actually use, not the raw stored label:
+            # for an unlocked single, position still decides the push or pull.
+            move=(effective_move_label(c, is_first=index == 0,
+                                       is_last=index == len(clips) - 1)
+                  if c.kind != "pair_keyframes" else c.move_label),
+            move_vector=c.move_vector,
             crop_box=c.crop_box, subject_box=c.subject_box,
             source_size=c.source_size, detail_subject=c.detail_subject,
             prompt_override=c.prompt_override,
             prompt_note=c.prompt_note,
-            move_primary=(
-                effective_move_primary(c, is_first=index == 0,
-                                       is_last=index == len(clips) - 1)
-                if c.kind != "pair_keyframes" else primary_of(c.move_label)),
             move_locked=bool(c.move_locked),
             generation_prompt=generation_prompt,
             video_url=_signed_url(c.clip.s3_uri) if c.clip else None,
@@ -979,17 +980,28 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
         row.duration_override = incoming.duration_override
         row.prompt_override = incoming.prompt_override
         row.prompt_note = incoming.prompt_note
-        # A customer picking a move changes the stored label and the vector the
-        # renderer reads. Only the primary axis moves; the secondary ones the
-        # shot already carries are kept, because over 80% of reference shots
-        # move on more than one.
-        if incoming.move_primary:
-            row.move_locked = True
-            row.move_label = with_primary(row.move_label, incoming.move_primary)
-            row.move_vector = vector_from_label(
-                row.move_label,
-                float((row.move_vector or {}).get("roll_deg") or 0.0),
-            )
+        # A customer composing a move changes the stored label and the vector the
+        # renderer reads. The editor is sent the *effective* move, so a save that
+        # echoes it back is not a choice and must not lock the shot -- otherwise
+        # merely dragging a clip would freeze every move on the timeline.
+        roll = float((row.move_vector or {}).get("roll_deg") or 0.0)
+        if incoming.move is None and row.move_locked:
+            # An explicit clear is the way back to the planner's own choice.
+            # Without it a composed move is a one-way door, and the customer
+            # who overrode one shot can never see what we would have done.
+            row.move_locked = False
+            row.move_chosen = None
+            row.move_vector = vector_from_label(row.move_label, roll)
+        elif incoming.move and incoming.kind != "pair_keyframes":
+            chosen = compose_label(axes_of(incoming.move))
+            effective = effective_move_label(
+                row, is_first=index == 0, is_last=index == len(payload.shots) - 1)
+            if chosen != effective:
+                # `move_label` keeps the measured move on purpose. Overwriting
+                # it would destroy the only thing a reset could restore.
+                row.move_locked = True
+                row.move_chosen = chosen
+                row.move_vector = vector_from_label(chosen, roll)
         keep.add(row.shot_uid)
 
     for uid, row in existing.items():

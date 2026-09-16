@@ -11,6 +11,7 @@ import unittest
 from app.pipeline.phase1_analyze.directorial_prompt import (
     build_script,
     build_shot_prompt,
+    effective_move_label,
     split_for_generation,
 )
 from app.pipeline.phase1_analyze.shot_line import build_shot_line
@@ -107,10 +108,46 @@ class ChosenMovePromptTests(unittest.TestCase):
 
     def test_a_locked_move_drives_the_prompt(self):
         shot = self._Shot("pan left + pull out", True)
-        self.assertIn("pan to the left",
-                      build_shot_prompt(shot))
+        prompt = build_shot_prompt(shot)
+        self.assertIn("Slow pull back", prompt)
+        self.assertIn("drifting gently to the left", prompt)
 
     def test_an_unlocked_shot_still_follows_the_positional_grammar(self):
-        shot = self._Shot("pan left + pull out", False)
-        self.assertIn("pull back",
-                      build_shot_prompt(shot, is_last=True))
+        # Position sets the zoom; the measured pan is not collateral damage.
+        shot = self._Shot("pan left + push in", False)
+        prompt = build_shot_prompt(shot, is_last=True)
+        self.assertIn("Slow pull back", prompt)
+        self.assertIn("drifting gently to the left", prompt)
+
+
+class ComposedMovePromptTests(unittest.TestCase):
+    """A composed move must survive into the prompt, and be undoable."""
+
+    class _Shot:
+        room_type = "living_room"
+        kind = "single_image"
+        is_close_up = False
+        act = 2
+        prompt_override = None
+        prompt_note = None
+        move_chosen = None
+
+        def __init__(self, measured, chosen=None):
+            self.move = measured
+            self.move_chosen = chosen
+            self.move_locked = chosen is not None
+
+    def test_the_measured_move_survives_an_override(self):
+        # move_label is never overwritten, so clearing the choice restores it.
+        shot = self._Shot("push in + pan right + tilt up", chosen="static hold")
+        self.assertEqual(effective_move_label(shot), "static hold")
+        shot.move_locked = False
+        self.assertEqual(
+            effective_move_label(shot), "push in + pan right + tilt up")
+
+    def test_position_only_owns_the_zoom_axis(self):
+        shot = self._Shot("push in + pan left + tilt down")
+        self.assertEqual(
+            effective_move_label(shot, is_last=True),
+            "pull out + pan left + tilt down",
+        )

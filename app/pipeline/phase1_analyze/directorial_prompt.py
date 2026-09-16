@@ -23,7 +23,7 @@ Two things this cannot express, and they are the honest limits:
 """
 from __future__ import annotations
 
-from app.pipeline.phase1_analyze.camera_move import primary_of
+from app.pipeline.phase1_analyze.camera_move import axes_of, compose_label
 
 from dataclasses import dataclass
 
@@ -241,13 +241,52 @@ def _speed_word(_squeeze_factor: float) -> str:
     return "Slow"
 
 
+# The lead clause, chosen by the move's dominant axis.
 _SINGLE_MOTION_PHRASES: dict[str, str] = {
-    "push in": "Slow, straight push in",
-    "pull out": "Slow, straight pull back",
-    "pan right": "Slow, straight horizontal pan to the right",
-    "pan left": "Slow, straight horizontal pan to the left",
+    "push in": "Slow push in",
+    "pull out": "Slow pull back",
+    "pan right": "Slow horizontal pan to the right",
+    "pan left": "Slow horizontal pan to the left",
+    "tilt up": "Slow upward vertical reframe",
+    "tilt down": "Slow downward vertical reframe",
     "static hold": "Locked-off camera with only subtle natural movement",
 }
+
+# What a secondary axis adds on top of the lead clause. 87% of the singles in
+# a real listing move on two or three axes, matching the reference films, so
+# naming only the dominant one throws away most of the measured movement --
+# and the word "straight" it used to carry actively told the model not to drift.
+#
+# The vertical axis is never called a "tilt". In photography a tilt is a pitch,
+# but the word also names a slanted horizon, and that ambiguity is the one thing
+# the invariants ("level frame", "straight verticals") exist to prevent. A
+# reframe is unambiguous: the camera rises, the horizon stays level.
+_SECONDARY_MOTION_PHRASES: dict[str, str] = {
+    "pan right": "drifting gently to the right",
+    "pan left": "drifting gently to the left",
+    "tilt up": "rising gently",
+    "tilt down": "lowering gently",
+}
+
+
+def _motion_sentence(label: str) -> str:
+    """Render a compound move as one direction the provider can follow."""
+    if label == "static hold":
+        return f"{_SINGLE_MOTION_PHRASES['static hold']}."
+
+    atoms = [a for a in (axes_of(label).values()) if a]
+    if not atoms:
+        return f"{_SINGLE_MOTION_PHRASES['static hold']}."
+
+    lead, rest = atoms[0], [a for a in atoms[1:] if a in _SECONDARY_MOTION_PHRASES]
+    if not rest:
+        # A single axis genuinely is straight, and saying so suppresses the
+        # drift the model would otherwise invent.
+        return f"{_SINGLE_MOTION_PHRASES[lead].replace('Slow ', 'Slow, straight ')}."
+
+    clauses = [_SECONDARY_MOTION_PHRASES[a] for a in rest]
+    joined = clauses[0] if len(clauses) == 1 else f"{clauses[0]} and {clauses[1]}"
+    return f"{_SINGLE_MOTION_PHRASES[lead]}, {joined}."
 
 
 def _shot_move_label(shot) -> str:
@@ -272,60 +311,53 @@ def _with_note(shot, prompt: str) -> str:
     return f"{prompt} {note}" if note else prompt
 
 
-def _single_motion_label(
+def _effective_move_label(
     shot,
     cls: str,
     *,
     is_first: bool,
     is_last: bool,
 ) -> str:
-    """Reduce a compound move to one provider-safe camera axis.
+    """The compound move this shot will actually be generated with.
 
-    The still-image path has no second camera pose to constrain the model. A
-    short vocabulary is intentional: compound pan/tilt/roll prompts are harder
-    to follow and harder to review. The 2D preview may retain the full measured
-    vector; this is the prompt contract sent to the video provider.
+    Position decides whether the camera pushes or pulls -- that is a fact about
+    where the shot sits in the film, not about its geometry. The pan and tilt
+    the shot was measured with survive it, because they are what makes the move
+    read as a camera rather than a zoom control, and 87% of real singles carry
+    at least one of them.
+
+    A customer's pick outranks all of it. The positional defaults describe what
+    listing films usually do, which is a reason to start there and not a reason
+    to overrule someone who looked at the shot.
     """
-    label = _shot_move_label(shot).lower()
-
-    # A customer's pick outranks the measured grammar below. Those defaults
-    # describe what listing films usually do, which is a reason to start there
-    # and not a reason to overrule someone who looked at the shot.
     if getattr(shot, "move_locked", False):
-        # `with_primary` writes the pick first, so the leading atom is it. The
-        # zoom-first reading further down would otherwise hand a chosen "pan
-        # left" back as the "pull out" the shot was measured at.
-        return primary_of(label, chosen=True)
+        # The composed move is stored separately, so the measured one below
+        # stays intact and a reset has something to go back to.
+        chosen = getattr(shot, "move_chosen", None)
+        if chosen:
+            return compose_label(axes_of(str(chosen).lower()))
+
+    axes = axes_of(_shot_move_label(shot).lower())
+
+    if getattr(shot, "move_locked", False):
+        return compose_label(axes)
 
     if cls == "detail":
-        return "push in"
-    if cls in {"aerial", "closing"} or is_last:
-        return "pull out"
-    if is_first or cls in {"approach", "threshold"}:
-        return "push in"
+        axes["zoom"] = "push in"
+    elif cls in {"aerial", "closing"} or is_last:
+        axes["zoom"] = "pull out"
+    elif is_first or cls in {"approach", "threshold"}:
+        axes["zoom"] = "push in"
 
-    if "static hold" in label:
-        return "static hold"
-    # choose_move writes the zoom atom first. Preserve that primary intent when
-    # a legacy compound label also contains a pan/tilt/roll atom.
-    if "push in" in label:
-        return "push in"
-    if "pull out" in label:
-        return "pull out"
-    if "pan right" in label:
-        return "pan right"
-    if "pan left" in label:
-        return "pan left"
-    return "push in"
+    return compose_label(axes)
 
 
-def effective_move_primary(shot, *, is_first: bool = False,
-                           is_last: bool = False) -> str:
-    """The single axis this shot's prompt will actually ask the provider for.
+def effective_move_label(shot, *, is_first: bool = False,
+                         is_last: bool = False) -> str:
+    """The move this shot's prompt will actually ask the provider for.
 
-    The editor's move select must show this, not the raw measured label: for an
-    unlocked shot the positional grammar below overrides what was measured, and
-    a select that disagrees with the prompt it controls is worse than no select.
+    The editor must show this, not the raw stored label: a control that
+    disagrees with the prompt it drives is worse than no control.
     """
     cls = shot_class(
         getattr(shot, "room_type", None),
@@ -333,7 +365,7 @@ def effective_move_primary(shot, *, is_first: bool = False,
         act=getattr(shot, "act", None),
         is_last=is_last,
     )
-    return _single_motion_label(shot, cls, is_first=is_first, is_last=is_last)
+    return _effective_move_label(shot, cls, is_first=is_first, is_last=is_last)
 
 
 def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
@@ -367,9 +399,8 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
             "Follow the spatial path and framing change between those two views."
         )
     else:
-        motion_label = _single_motion_label(
-            shot, cls, is_first=is_first, is_last=is_last)
-        motion = f"{_SINGLE_MOTION_PHRASES[motion_label]}."
+        motion = _motion_sentence(
+            _effective_move_label(shot, cls, is_first=is_first, is_last=is_last))
 
     subject = getattr(shot, "detail_subject", None)
     if cls == "detail" and subject:

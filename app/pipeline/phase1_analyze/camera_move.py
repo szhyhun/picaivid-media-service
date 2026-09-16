@@ -181,13 +181,18 @@ def reverse_vector(vector: dict | None) -> dict:
 # second camera pose to constrain the model, so the prompt vocabulary is kept
 # short -- and offering a tilt here would have fallen through to "push in",
 # showing the customer one thing and sending the model another.
-SELECTABLE_MOVES: tuple[tuple[str, str], ...] = (
-    ("push in", "Push in"),
-    ("pull out", "Pull back"),
-    ("pan right", "Pan right"),
-    ("pan left", "Pan left"),
-    ("static hold", "Hold still"),
+# The axes a customer can compose a move out of, in the order a move reads:
+# zoom first, then the drift laid over it. Each axis is optional -- dropping
+# all three is a hold -- which is what makes a move addable and removable
+# rather than a single choice from a flat list.
+MOVE_AXES: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
+    ("zoom", "Zoom", (("push in", "Push in"), ("pull out", "Pull back"))),
+    ("pan", "Pan", (("pan right", "Right"), ("pan left", "Left"))),
+    ("tilt", "Tilt", (("tilt up", "Up"), ("tilt down", "Down"))),
 )
+
+_AXIS_ORDER = tuple(axis for axis, _, _ in MOVE_AXES)
+
 
 _PRIMARY_GROUP = {
     "push in": "zoom", "pull out": "zoom",
@@ -205,40 +210,32 @@ _ATOM_VECTOR: dict[str, dict[str, float]] = {
 }
 
 
-def with_primary(label: str | None, primary: str) -> str:
-    """Set the primary axis of a move, keeping the others it already has.
+def axes_of(label: str | None) -> dict[str, str | None]:
+    """Split a move label into its per-axis atoms.
 
-    "Hold still" is the exception: it is the absence of movement, so it cannot
-    keep a pan it was compounded with.
+    Unknown atoms are dropped rather than raising: labels are persisted data,
+    and a vocabulary change should not make an old row unreadable.
     """
-    if primary == "static hold":
-        return "static hold"
-    atoms = [a.strip() for a in (label or "").split("+") if a.strip()]
-    group = _PRIMARY_GROUP.get(primary)
-    kept = [a for a in atoms
-            if a != "static hold" and _PRIMARY_GROUP.get(a) != group]
-    return " + ".join([primary, *kept])
+    found: dict[str, str | None] = {axis: None for axis in _AXIS_ORDER}
+    for atom in (a.strip() for a in (label or "").split("+")):
+        axis = _PRIMARY_GROUP.get(atom)
+        if axis and found.get(axis) is None:
+            found[axis] = atom
+    return found
 
 
-def primary_of(label: str | None, *, chosen: bool = False) -> str:
-    """Which selectable move this label reads as. Zoom wins, then pan, then tilt.
+def compose_label(axes: dict[str, str | None]) -> str:
+    """Build a move label from per-axis atoms, in zoom/pan/tilt order.
 
-    `chosen` says a customer picked this move, in which case the leading atom is
-    their pick -- `with_primary` writes it first -- and it outranks the tier
-    order. Without that, choosing "pan left" on a shot measured as "pull out"
-    reads back as "pull out", and the select silently loses to the value it
-    exists to override.
+    No axes means no movement, which is a hold -- the one move that cannot be
+    compounded with anything, since it is the absence of the others.
     """
-    atoms = [a.strip() for a in (label or "").split("+") if a.strip()]
-    if not atoms or atoms == ["static hold"]:
-        return "static hold"
-    if chosen and atoms[0] in {value for value, _ in SELECTABLE_MOVES}:
-        return atoms[0]
-    for group in ("zoom", "pan", "tilt"):
-        for atom in atoms:
-            if _PRIMARY_GROUP.get(atom) == group:
-                return atom
-    return "push in"
+    atoms = []
+    for axis in _AXIS_ORDER:
+        atom = axes.get(axis)
+        if atom and _PRIMARY_GROUP.get(atom) == axis:
+            atoms.append(atom)
+    return " + ".join(atoms) if atoms else "static hold"
 
 
 def vector_from_label(label: str | None, roll_deg: float = 0.0) -> dict[str, float]:
