@@ -12,7 +12,7 @@ class _Shot:
         self.__dict__.update({
             "room_type": "living room", "kind": "single_image",
             "is_close_up": False, "act": 2, "move": "push in",
-            "detail_subject": None, "prompt_override": None, **kw})
+            "detail_subject": None, "prompt_override": None, "prompt_note": None, **kw})
 
 
 class ShotClassTests(unittest.TestCase):
@@ -116,3 +116,29 @@ class PromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptNoteTests(unittest.TestCase):
+    """A customer's note is added to our direction, never a replacement for it."""
+
+    def test_the_note_is_appended_after_our_direction(self):
+        prompt = build_shot_prompt(
+            _Shot(prompt_note='Keep the pool in frame.'))
+        self.assertTrue(prompt.endswith('Keep the pool in frame.'))
+        # Everything we decided is still in there.
+        self.assertIn('Preserve exact architecture', prompt)
+        self.assertIn('push in', prompt.lower())
+
+    def test_an_empty_note_adds_nothing(self):
+        self.assertEqual(
+            build_shot_prompt(_Shot(prompt_note='   ')),
+            build_shot_prompt(_Shot()),
+        )
+
+    def test_an_override_still_wins_outright(self):
+        # The override is the development tool; the note is the customer's.
+        prompt = build_shot_prompt(_Shot(prompt_override='mine', prompt_note='theirs'))
+        self.assertTrue(prompt.startswith('mine'))
+        # The safety contract survives an override, and the note still follows.
+        self.assertIn('Preserve exact architecture', prompt)
+        self.assertTrue(prompt.endswith('theirs'))

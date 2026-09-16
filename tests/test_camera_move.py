@@ -4,6 +4,8 @@ from __future__ import annotations
 import collections
 import unittest
 
+import app.pipeline.phase1_analyze.camera_move as camera_move
+
 from app.pipeline.phase1_analyze.camera_move import (
     FREQ_PAN,
     FREQ_STATIC,
@@ -119,3 +121,52 @@ class ReverseTests(unittest.TestCase):
     def test_a_missing_vector_reverses_to_zero_rather_than_failing(self):
         self.assertEqual(reverse_vector(None),
                          {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": 0.0})
+
+
+class SelectableMoveTests(unittest.TestCase):
+    """The moves a customer can choose, and what choosing one does."""
+
+    def test_choosing_a_move_keeps_the_axes_it_did_not_touch(self):
+        # Over 80% of reference shots move on two or more axes, so collapsing a
+        # choice down to one would make the film flatter than its source.
+        self.assertEqual(
+            camera_move.with_primary("push in + pan right + tilt up", "pull out"),
+            "pull out + pan right + tilt up",
+        )
+
+    def test_choosing_a_move_replaces_only_its_own_axis(self):
+        self.assertEqual(
+            camera_move.with_primary("push in + pan right", "pan left"),
+            "pan left + push in",
+        )
+
+    def test_holding_still_clears_everything(self):
+        # A hold is the absence of movement; it cannot keep a pan.
+        self.assertEqual(
+            camera_move.with_primary("pan right + tilt up", "static hold"),
+            "static hold",
+        )
+
+    def test_it_reads_the_primary_axis_back_out_of_a_compound_label(self):
+        self.assertEqual(camera_move.primary_of("push in + pan right"), "push in")
+        self.assertEqual(camera_move.primary_of("pan left + tilt down"), "pan left")
+        self.assertEqual(camera_move.primary_of("static hold"), "static hold")
+        self.assertEqual(camera_move.primary_of(None), "static hold")
+
+    def test_a_chosen_move_produces_a_vector_at_the_measured_rates(self):
+        # A chosen move has no seed behind it, and the renderer reads the
+        # vector rather than the words.
+        vector = camera_move.vector_from_label("pull out + pan left")
+        self.assertAlmostEqual(vector["zoom"], -camera_move.ZOOM_OUT_RATE)
+        self.assertAlmostEqual(vector["pan"], -camera_move.PAN_RATE)
+        self.assertAlmostEqual(vector["tilt"], 0.0)
+
+    def test_a_hold_has_no_motion_on_any_axis(self):
+        self.assertEqual(
+            camera_move.vector_from_label("static hold"),
+            {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": 0.0},
+        )
+
+    def test_roll_is_carried_through_rather_than_invented(self):
+        self.assertAlmostEqual(
+            camera_move.vector_from_label("push in", roll_deg=1.36)["roll_deg"], 1.36)

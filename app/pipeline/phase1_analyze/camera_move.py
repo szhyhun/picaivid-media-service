@@ -168,3 +168,81 @@ def reverse_vector(vector: dict | None) -> dict:
         "tilt": -float(v.get("tilt") or 0.0),
         "roll_deg": -float(v.get("roll_deg") or 0.0),
     }
+
+
+# The moves a customer can actually choose, as intents rather than raw axes.
+#
+# Each maps to a primary atom. The secondary axes a shot already carries are
+# kept: over 80% of reference shots move on two or more, so collapsing a choice
+# to one axis would make the film flatter than the thing it imitates. Picking
+# "push in" therefore sets the zoom and leaves the existing pan and tilt alone.
+# Exactly the moves `_SINGLE_MOTION_PHRASES` in directorial_prompt.py can
+# express. Tilt is deliberately absent there -- the still-image path has no
+# second camera pose to constrain the model, so the prompt vocabulary is kept
+# short -- and offering a tilt here would have fallen through to "push in",
+# showing the customer one thing and sending the model another.
+SELECTABLE_MOVES: tuple[tuple[str, str], ...] = (
+    ("push in", "Push in"),
+    ("pull out", "Pull back"),
+    ("pan right", "Pan right"),
+    ("pan left", "Pan left"),
+    ("static hold", "Hold still"),
+)
+
+_PRIMARY_GROUP = {
+    "push in": "zoom", "pull out": "zoom",
+    "pan right": "pan", "pan left": "pan",
+    "tilt up": "tilt", "tilt down": "tilt",
+}
+
+_ATOM_VECTOR: dict[str, dict[str, float]] = {
+    "push in": {"zoom": ZOOM_IN_RATE},
+    "pull out": {"zoom": -ZOOM_OUT_RATE},
+    "pan right": {"pan": PAN_RATE},
+    "pan left": {"pan": -PAN_RATE},
+    "tilt up": {"tilt": TILT_RATE},
+    "tilt down": {"tilt": -TILT_RATE},
+}
+
+
+def with_primary(label: str | None, primary: str) -> str:
+    """Set the primary axis of a move, keeping the others it already has.
+
+    "Hold still" is the exception: it is the absence of movement, so it cannot
+    keep a pan it was compounded with.
+    """
+    if primary == "static hold":
+        return "static hold"
+    atoms = [a.strip() for a in (label or "").split("+") if a.strip()]
+    group = _PRIMARY_GROUP.get(primary)
+    kept = [a for a in atoms
+            if a != "static hold" and _PRIMARY_GROUP.get(a) != group]
+    return " + ".join([primary, *kept])
+
+
+def primary_of(label: str | None) -> str:
+    """Which selectable move this label reads as. Zoom wins, then pan, then tilt."""
+    atoms = [a.strip() for a in (label or "").split("+") if a.strip()]
+    if not atoms or atoms == ["static hold"]:
+        return "static hold"
+    for group in ("zoom", "pan", "tilt"):
+        for atom in atoms:
+            if _PRIMARY_GROUP.get(atom) == group:
+                return atom
+    return "push in"
+
+
+def vector_from_label(label: str | None, roll_deg: float = 0.0) -> dict[str, float]:
+    """Build a move vector from a label, at the measured rates.
+
+    Needed because a chosen move has no seed behind it -- `choose_move` goes
+    the other way, from a seed to a label -- and the renderer reads the vector,
+    not the words.
+    """
+    vector = {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": float(roll_deg)}
+    for atom in [a.strip() for a in (label or "").split("+") if a.strip()]:
+        for axis, value in _ATOM_VECTOR.get(atom, {}).items():
+            vector[axis] = value
+    if (label or "").strip() == "static hold":
+        return {"zoom": 0.0, "pan": 0.0, "tilt": 0.0, "roll_deg": 0.0}
+    return vector

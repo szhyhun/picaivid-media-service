@@ -107,6 +107,13 @@ class TimelineClip(Base):
     source_size = Column(JSONB)
     detail_subject = Column(String(120))
     prompt_override = Column(Text)
+    # The customer's own words, appended to the prompt we build rather than
+    # replacing it: their direction is an addition to the measured decisions,
+    # not a reason to discard them.
+    prompt_note = Column(Text)
+    # True once a customer picks a move. The positional defaults are a grammar,
+    # not a rule: they should stop applying the moment someone disagrees.
+    move_locked = Column(Boolean, default=False)
 
     # --- Edit: how the generated source is cut into the film ---
     trim_start = Column(Float, default=0.0)

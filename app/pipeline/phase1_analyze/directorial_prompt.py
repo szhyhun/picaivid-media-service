@@ -259,6 +259,17 @@ def _shot_move_label(shot) -> str:
     return str(getattr(shot, "move_label", None) or "")
 
 
+def _with_note(shot, prompt: str) -> str:
+    """Append the customer's own words.
+
+    Appended rather than substituted: `prompt_override` is the tool for
+    replacing the whole direction and it belongs to development, not to a
+    listing agent who wants one more thing mentioned.
+    """
+    note = (getattr(shot, "prompt_note", None) or "").strip()
+    return f"{prompt} {note}" if note else prompt
+
+
 def _single_motion_label(
     shot,
     cls: str,
@@ -273,14 +284,19 @@ def _single_motion_label(
     to follow and harder to review. The 2D preview may retain the full measured
     vector; this is the prompt contract sent to the video provider.
     """
-    if cls == "detail":
-        return "push in"
-    if cls in {"aerial", "closing"} or is_last:
-        return "pull out"
-    if is_first or cls in {"approach", "threshold"}:
-        return "push in"
-
     label = _shot_move_label(shot).lower()
+
+    # A customer's pick outranks the measured grammar below. Those defaults
+    # describe what listing films usually do, which is a reason to start there
+    # and not a reason to overrule someone who looked at the shot.
+    if not getattr(shot, "move_locked", False):
+        if cls == "detail":
+            return "push in"
+        if cls in {"aerial", "closing"} or is_last:
+            return "pull out"
+        if is_first or cls in {"approach", "threshold"}:
+            return "push in"
+
     if "static hold" in label:
         return "static hold"
     # choose_move writes the zoom atom first. Preserve that primary intent when
@@ -307,7 +323,7 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     if override and override.strip():
         # Custom motion text may replace the default direction, but never the
         # provider-safety contract shared by every shot.
-        return f"{override.strip()} {_INVARIANTS}"
+        return _with_note(shot, f"{override.strip()} {_INVARIANTS}")
 
     room_type = getattr(shot, "room_type", None)
     is_close_up = bool(getattr(shot, "is_close_up", False))
@@ -335,4 +351,4 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     if cls == "detail" and subject:
         motion = f"Slow, straight push in toward the {subject.lower()}."
 
-    return f"{motion} {_INVARIANTS}"
+    return _with_note(shot, f"{motion} {_INVARIANTS}")

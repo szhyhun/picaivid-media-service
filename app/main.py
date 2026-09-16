@@ -36,7 +36,13 @@ from app.schemas.job_progress import (
 )
 from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
 from app.db.models.timeline import TimelineClip
-from app.pipeline.phase1_analyze.camera_move import reverse_label, reverse_vector
+from app.pipeline.phase1_analyze.camera_move import (
+    primary_of,
+    reverse_label,
+    reverse_vector,
+    vector_from_label,
+    with_primary,
+)
 from app.pipeline.phase1_analyze.directorial_prompt import build_shot_prompt
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music_uri
@@ -845,6 +851,9 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             crop_box=c.crop_box, subject_box=c.subject_box,
             source_size=c.source_size, detail_subject=c.detail_subject,
             prompt_override=c.prompt_override,
+            prompt_note=c.prompt_note,
+            move_primary=primary_of(c.move_label),
+            move_locked=bool(c.move_locked),
             generation_prompt=generation_prompt,
             video_url=_signed_url(c.clip.s3_uri) if c.clip else None,
             photos=[photo(pid) for pid in (c.photo_ids or [])],
@@ -963,6 +972,18 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
         row.trim_start = max(0.0, float(incoming.trim_start or 0.0))
         row.duration_override = incoming.duration_override
         row.prompt_override = incoming.prompt_override
+        row.prompt_note = incoming.prompt_note
+        # A customer picking a move changes the stored label and the vector the
+        # renderer reads. Only the primary axis moves; the secondary ones the
+        # shot already carries are kept, because over 80% of reference shots
+        # move on more than one.
+        if incoming.move_primary:
+            row.move_locked = True
+            row.move_label = with_primary(row.move_label, incoming.move_primary)
+            row.move_vector = vector_from_label(
+                row.move_label,
+                float((row.move_vector or {}).get("roll_deg") or 0.0),
+            )
         keep.add(row.shot_uid)
 
     for uid, row in existing.items():

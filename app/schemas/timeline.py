@@ -107,6 +107,10 @@ class TimelineShotUpdate(BaseModel):
     trim_start: float = 0.0
     duration_override: Optional[float] = None
     prompt_override: Optional[str] = None
+    prompt_note: Optional[str] = None
+    # The primary axis the customer picked. Applied to the stored label,
+    # keeping whatever secondary axes the shot already had.
+    move_primary: Optional[str] = None
     move: Optional[str] = None
 
 
