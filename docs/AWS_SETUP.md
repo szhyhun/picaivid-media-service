@@ -10,9 +10,11 @@ VGGT is the core direction. A possible future `tour_3d` or splat-delivery produc
 - app host: `picaivid-app`
 - db: `picaivid-db`
 - queue: `picaivid-jobs`
+- CPU queue: `picaivid-cpu-jobs`
 - media bucket: `picaivid-prod-media`
 - app domain: `picaivid.com`
 - GPU worker: one `g6.xlarge` Spot for first validation, then scale up if needed
+- CPU worker: a small general-purpose instance for Runware polling and FFmpeg
 
 ## Current state
 
@@ -28,6 +30,7 @@ Already done:
 Still pending:
 
 - GPU worker launch
+- CPU worker launch
 - first real VGGT CUDA validation
 - first CUDA-backed worker validation
 - GitHub Actions deploy automation
@@ -88,6 +91,12 @@ They assume:
 - `GPU_INSTANCE_ID` is set
 - `AWS_PROFILE` and `AWS_REGION` are set if needed
 
+The GPU and CPU workers use the same repository but separate entrypoints,
+systemd units, environment files, and queues. GPU runs
+`app.workers.gpu` and consumes `picaivid-jobs`; CPU runs `app.workers.cpu` and
+consumes `picaivid-cpu-jobs`. The CPU worker does not load VGGT and the GPU
+worker does not claim timeline commands.
+
 Example:
 
 ```bash
@@ -105,17 +114,19 @@ export GPU_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx
 - `DATABASE_URL`
 - `AWS_REGION`
 - `S3_BUCKET`
-- `SQS_QUEUE_URL`
+- `SQS_QUEUE_URL` on the GPU host
+- `SQS_CPU_QUEUE_URL` on the CPU host
 - `RAILS_WEBHOOK_URL`
-- `RUNWARE_API_KEY`
-- `RUNWARE_MODEL=luma:ray@3.2`
-- `RUNWARE_DURATION_SECONDS=5`
-- `RUNWARE_RESOLUTION=720p` or `1080p`
-- `RUNWARE_HDR=true`
-- `WORKER_TYPE=gpu`
-- `ANALYSIS_MATCH_ENGINE=vggt_scene_graph`
-- `VGGT_REPO_DIR`
-- `VGGT_MODEL_CHECKPOINT`
+- `MEDIA_SERVICE_WEBHOOK_KEY`
+- `WORKER_TYPE=gpu` on the GPU host, or `WORKER_TYPE=cpu` on the CPU host
+- `RUNWARE_API_KEY`, `RUNWARE_MODEL=luma:ray@3.2`, duration/resolution/HDR
+  settings on the CPU host only
+- `ANALYSIS_MATCH_ENGINE=vggt_scene_graph`, `VGGT_REPO_DIR`, and
+  `VGGT_MODEL_CHECKPOINT` on the GPU host only
+
+The optional media API, when enabled for Rails' private proxy, also requires
+`MEDIA_SERVICE_API_KEY`. It does not need `RUNWARE_API_KEY`; only the worker
+that consumes generation commands should receive the Runware secret.
 
 Optional S3 hydration:
 

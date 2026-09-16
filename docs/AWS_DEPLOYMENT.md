@@ -6,10 +6,11 @@ Operational order for the workspace:
 2. validate migrations and debug APIs locally
 3. finish app-host deployment (`picaivid-app`, Rails, React, nginx, TLS)
 4. launch the GPU worker
-5. hydrate VGGT repo/checkpoint to local disk
-6. start `picaivid-media-worker`
-7. run one small reconstruction job
-8. add GitHub Actions OIDC + SSM deploy automation
+5. launch the CPU worker
+6. hydrate VGGT repo/checkpoint to local disk
+7. start the worker units
+8. run one small reconstruction and timeline job
+9. add GitHub Actions OIDC + SSM deploy automation
 
 ## Current status
 
@@ -29,12 +30,15 @@ Completed:
 Pending:
 
 - launch the GPU worker
+- launch the CPU worker
 - run the first real CUDA-backed end-to-end job
 - add GitHub Actions OIDC + SSM deploy automation
 
 ## App host
 
-The app host serves Rails + React and can optionally run the media API for scene/relation debug. Media-to-Rails traffic should stay inside the VPC once the GPU worker exists.
+The app host serves Rails + React and can optionally run the media API for
+scene/relation debug. The media API is bound to loopback and Rails is its only
+caller. The media worker is a separate SQS consumer with no HTTP listener.
 
 Current public entrypoints:
 
@@ -75,6 +79,16 @@ cd /srv/picaivid/picaivid-media-service
 ./scripts/aws/bootstrap-ec2.sh --repo-dir /srv/picaivid/picaivid-media-service --enable-api 0
 ```
 
+On the CPU host, use the same repository with the CPU role. This installs FFmpeg and the
+CPU-specific systemd unit and environment template:
+
+```bash
+./scripts/aws/bootstrap-ec2.sh \
+  --repo-dir /srv/picaivid/picaivid-media-service \
+  --worker-type cpu \
+  --install-cuda-torch 0
+```
+
 Hydrate assets:
 
 ```bash
@@ -90,6 +104,8 @@ sudo systemctl restart picaivid-media-worker
 sudo systemctl status picaivid-media-worker
 journalctl -u picaivid-media-worker -f
 ```
+
+On the CPU host, use `picaivid-media-cpu-worker` for the same commands.
 
 Validate:
 

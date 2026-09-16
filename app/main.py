@@ -2,14 +2,14 @@
 from datetime import datetime
 import uuid
 import logging
+from secrets import compare_digest
 from typing import Dict
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.logging import setup_logging
@@ -39,19 +39,11 @@ from app.db.models.timeline import TimelineClip
 from app.pipeline.phase1_analyze.camera_move import reverse_label, reverse_vector
 from app.pipeline.phase1_analyze.directorial_prompt import build_shot_prompt
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
-from app.pipeline.phase4_assembly.render import assemble_timeline_film
 from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music_uri
-from app.pipeline.phase3_timeline.generate import (
-    generate_timeline_clips,
-    pending_shots,
-    queue_timeline_clips,
-)
 from app.pipeline.phase3_timeline.materialize import (
     latest_timeline,
     materialize_timeline,
 )
-from app.pipeline.progress import JobProgress
-from app.db.session import SessionLocal
 from app.schemas.timeline import (
     CandidateListResponse,
     CandidatePhoto,
@@ -101,20 +93,49 @@ app = FastAPI(
 )
 
 
+def _internal_service_key() -> str:
+    return (settings.MEDIA_SERVICE_API_KEY or settings.API_KEY or "").strip()
+
+
+def _valid_internal_service_key(supplied: str) -> bool:
+    expected = _internal_service_key()
+    return bool(
+        expected
+        and supplied
+        and len(supplied) == len(expected)
+        and compare_digest(supplied, expected)
+    )
+
+
+@app.middleware("http")
+async def require_rails_service_key(request: Request, call_next):
+    """Keep the media HTTP surface private to Rails.
+
+    The worker itself consumes SQS and has no HTTP listener. This middleware
+    protects the optional media API used by Rails for timeline reads, edits and
+    diagnostics; a browser request cannot bypass Rails authentication.
+    """
+    if request.url.path.startswith(("/api/", "/internal/")):
+        supplied = request.headers.get("X-Internal-Service-Key", "").strip()
+        if not _internal_service_key():
+            logger.error("MEDIA_SERVICE_API_KEY is not configured")
+            return JSONResponse(
+                {"detail": "Media service internal authentication is not configured."},
+                status_code=503,
+            )
+        if not _valid_internal_service_key(supplied):
+            return JSONResponse(
+                {"detail": "Media service accepts requests from Rails only."},
+                status_code=401,
+            )
+    return await call_next(request)
+
+
 @app.on_event("startup")
 async def startup_warm_models() -> None:
     # Inference belongs to the worker. Keeping the API lightweight avoids loading
     # a second multi-gigabyte model beside the local MPS worker.
     warmup_core_models(context="api", include_vggt=False, include_legacy=False)
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 def _safe_float(value: object) -> float | None:
@@ -1072,123 +1093,22 @@ async def get_timeline_candidates(project_id: str, db: Session = Depends(get_db)
     )
 
 
-class GenerateRequest(BaseModel):
-    """Which shots to generate. Empty means every shot that still needs one."""
-
-    shot_uids: list[str] = []
-    resolution: str | None = None
-
-
 @app.post("/api/projects/{project_id}/timeline/generate")
-async def generate_timeline(project_id: str, payload: GenerateRequest,
-                            background: BackgroundTasks,
-                            db: Session = Depends(get_db)):
-    """Generate video for the timeline's pending shots.
-
-    Returns immediately with what it is about to do; the work runs in the
-    background and reports through the normal job progress endpoint, because a
-    thirty-shot listing takes minutes and no browser should hold a request open
-    for that.
-
-    Generation costs real money per shot, so the response states the count and
-    the resolution it is spending at rather than leaving that implicit.
-    """
-    job_id = _latest_job_id(db, project_id)
-    timeline = latest_timeline(db, job_id) if job_id else None
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="No timeline to generate.")
-    if not settings.RUNWARE_API_KEY:
-        raise HTTPException(status_code=503,
-                            detail="RUNWARE_API_KEY is not configured.")
-
-    wanted = set(payload.shot_uids or [])
-    pending = [c for c in pending_shots(timeline)
-               if not wanted or c.shot_uid in wanted]
-    if not pending:
-        return {"project_id": project_id, "requested": 0,
-                "detail": "Every shot already has video."}
-
-    resolution = payload.resolution or settings.RUNWARE_RESOLUTION
-    # Validate the provider model and all Ray3.2 dependencies before accepting
-    # a paid background job. These are not merely display values.
-    from app.services.runware.client import RunwareError, resolve_video_options
-    try:
-        options = resolve_video_options(resolution=resolution)
-    except RunwareError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    resolution = options.resolution
-    uids = queue_timeline_clips(
-        db, timeline,
-        shot_uids=[str(c.shot_uid) for c in pending],
-        resolution=resolution,
+async def generate_timeline(project_id: str):
+    """Generation is dispatched by Rails through SQS, never from this API."""
+    raise HTTPException(
+        status_code=410,
+        detail="Timeline generation must be queued by Rails.",
     )
-
-    def run() -> None:
-        session = SessionLocal()
-        try:
-            tl = latest_timeline(session, job_id)
-            generate_timeline_clips(
-                session, tl, progress=JobProgress(job_id), shot_uids=uids,
-                resolution=resolution)
-        except Exception:                       # noqa: BLE001 - logged, not raised
-            logger.exception("TIMELINE_GENERATION_FAILED project_id=%s", project_id)
-        finally:
-            session.close()
-
-    background.add_task(run)
-    logger.info("TIMELINE_GENERATION_QUEUED project_id=%s shots=%s resolution=%s",
-                project_id, len(pending), resolution)
-    return {"project_id": project_id, "requested": len(pending),
-            "resolution": resolution, "shot_uids": uids,
-            "detail": f"Generating {len(pending)} shot(s) at {resolution}."}
 
 
 @app.post("/api/projects/{project_id}/timeline/assemble")
-async def assemble_timeline(project_id: str, background: BackgroundTasks,
-                            db: Session = Depends(get_db)):
-    """Cut the generated clips into the finished film.
-
-    Refuses while any shot is still planned, generating or failed. Silently
-    holding a freeze-frame where a clip should be would be worse than saying
-    which shots are outstanding.
-    """
-    job_id = _latest_job_id(db, project_id)
-    timeline = latest_timeline(db, job_id) if job_id else None
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="No timeline to assemble.")
-
-    clips = timeline.ordered_clips()
-    if not clips:
-        raise HTTPException(status_code=409, detail="The timeline is empty.")
-
-    outstanding = [c.shot_uid for c in clips if c.state != "ready"]
-    if outstanding:
-        raise HTTPException(
-            status_code=409,
-            detail=f"{len(outstanding)} shot(s) have no video yet.")
-
-    grid = timeline.grid_seconds
-    plan = [{"shot_uid": c.shot_uid, "s3_uri": c.clip.s3_uri,
-             "trim_start": c.trim_start or 0.0, "duration": c.duration_for(grid)}
-            for c in clips]
-    total = round(sum(p["duration"] for p in plan), 2)
-    job = db.get(Job, job_id)
-    music_uri = job.music_uri if job is not None else None
-    music_offset = float(job.beat_offset or 0.0) if job is not None else 0.0
-
-    def run() -> None:
-        session = SessionLocal()
-        try:
-            assemble_timeline_film(session, job_id, plan, music_uri=music_uri,
-                                   music_offset=music_offset)
-        except Exception:                       # noqa: BLE001 - logged, not raised
-            logger.exception("TIMELINE_ASSEMBLY_FAILED project_id=%s", project_id)
-        finally:
-            session.close()
-
-    background.add_task(run)
-    return {"project_id": project_id, "shots": len(plan), "duration": total,
-            "detail": f"Assembling {len(plan)} shots into {total}s."}
+async def assemble_timeline(project_id: str):
+    """Assembly is dispatched by Rails through SQS, never from this API."""
+    raise HTTPException(
+        status_code=410,
+        detail="Timeline assembly must be queued by Rails.",
+    )
 
 
 @app.get("/api/projects/{project_id}/scenes/debug", response_model=SceneDebugResponse)

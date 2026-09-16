@@ -25,20 +25,35 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --host 127.0.0.1 --reload --port 8000
 ```
+
+The HTTP process is an internal Rails-facing API, not a browser API. Production
+workers are separate SQS processes: `python -m app.workers.gpu` for VGGT and
+GPU clip work, and `python -m app.workers.cpu` for Runware and FFmpeg. Neither
+worker has an HTTP listener.
 
 Worker:
 
 ```bash
-WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.worker
+WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.workers.gpu
 ```
 
-### Runware credentials
+The CPU worker uses the same codebase with `WORKER_TYPE=cpu` and consumes
+`SQS_CPU_QUEUE_URL` for timeline generation and FFmpeg assembly. GPU and CPU
+workers are separate entrypoints and deployments; they share only the common
+database, storage, queue, and webhook modules. Neither worker is a
+browser-facing app.
 
-For local testing, put the key in the untracked `picaivid-media-service/.env`:
+### Internal service and Runware credentials
+
+Rails is the only caller of the optional media API. For local testing, put the
+internal service keys and the Runware key in the untracked
+`picaivid-media-service/.env`:
 
 ```dotenv
+MEDIA_SERVICE_API_KEY=dev-secret-key
+MEDIA_SERVICE_WEBHOOK_KEY=dev-webhook-key
 RUNWARE_API_KEY=your-runware-key
 RUNWARE_MODEL=luma:ray@3.2
 RUNWARE_DURATION_SECONDS=5
@@ -46,9 +61,12 @@ RUNWARE_RESOLUTION=720p
 RUNWARE_HDR=true
 ```
 
-Never put this key in the React `.env.local`, source control, or a prompt. On
-AWS, set the same values in `/etc/picaivid/media-worker.env` (and
-`media-api.env` if the media API handles generation), then restart the service.
+Never put the Runware key in the React `.env.local`, source control, an SQS
+message, or a prompt. On AWS, put `MEDIA_SERVICE_API_KEY` in
+`/etc/picaivid/media-api.env`, and put `MEDIA_SERVICE_WEBHOOK_KEY` plus
+`RUNWARE_API_KEY` in `/etc/picaivid/media-cpu-worker.env`. The API does not
+perform paid generation; the CPU worker consumes Rails SQS commands and calls
+Runware.
 The client rejects any model other than `luma:ray@3.2` and rejects invalid HDR,
 resolution, or duration combinations before submitting a paid task.
 

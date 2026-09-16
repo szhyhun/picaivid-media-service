@@ -7,7 +7,9 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/srv/picaivid/picaivid-media-service
 EnvironmentFile=/etc/picaivid/media-api.env
-ExecStart=/usr/bin/bash -lc 'source venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}'
+# Rails is the only caller. Keep the optional API on the host loopback; the
+# worker itself is a separate SQS consumer and has no listening socket.
+ExecStart=/usr/bin/bash -lc 'source venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port ${PORT:-8000}'
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

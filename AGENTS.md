@@ -25,7 +25,7 @@ If you change these assumptions, update:
 ## Code Areas
 
 - API server: `app/main.py`
-- Worker entrypoint: `app/worker.py`
+- Worker entrypoints: `app/workers/gpu.py` and `app/workers/cpu.py`
 - Pipeline orchestration: `app/pipeline/orchestrator.py`
 - Phase 1 clustering/matching: `app/pipeline/phase1_analyze/`
 - Phase 2 render logic: `app/pipeline/phase2_render/`

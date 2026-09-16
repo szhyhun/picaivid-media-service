@@ -14,12 +14,18 @@ uvicorn app.main:app --reload --port 8000
 Worker:
 
 ```bash
-WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.worker
+WORKER_TYPE=gpu WORKER_PHASES=1 ./venv/bin/python -m app.workers.gpu
+```
+
+CPU worker for timeline generation and assembly:
+
+```bash
+WORKER_TYPE=cpu SQS_CPU_QUEUE_URL=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/picaivid-cpu-jobs ./venv/bin/python -m app.workers.cpu
 ```
 
 On Apple Silicon, `WORKER_TYPE=gpu` selects the Phase 1-capable worker while
 `VGGT_DEVICE=auto` resolves inference to MPS. Use `WORKER_PHASES=1` until local video rendering
-is intentionally enabled. Do not run a CPU worker against the same queue.
+is intentionally enabled. GPU and CPU workers consume separate queues.
 
 ## Apple Silicon VGGT validation
 

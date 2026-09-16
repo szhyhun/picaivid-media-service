@@ -1,5 +1,4 @@
 """Application configuration loaded from environment variables."""
-from typing import List
 
 from pydantic_settings import BaseSettings
 
@@ -10,8 +9,11 @@ class Settings(BaseSettings):
     DEBUG: bool = True
 
     # API
-    API_KEY: str = "dev-api-key"
-    CORS_ORIGINS: List[str] = ["http://localhost:3001", "http://localhost:3003"]
+    # Internal Rails-to-media authentication. The worker does not expose an
+    # HTTP API, but the optional media API accepts calls from Rails only.
+    API_KEY: str | None = None
+    MEDIA_SERVICE_API_KEY: str | None = None
+    MEDIA_SERVICE_WEBHOOK_KEY: str | None = None
 
     # Database (Postgres is system of record)
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/picaivid_development"
@@ -26,6 +28,9 @@ class Settings(BaseSettings):
     # AWS SQS (set endpoint explicitly for local LocalStack; omit for AWS)
     SQS_ENDPOINT: str | None = None
     SQS_QUEUE_URL: str = "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/picaivid-jobs"
+    # CPU-only timeline/assembly commands use a separate queue when supplied;
+    # the fallback keeps older local stacks and deployments compatible.
+    SQS_CPU_QUEUE_URL: str | None = None
 
     # Rails webhook URL for status updates
     RAILS_WEBHOOK_URL: str | None = "http://localhost:3000"
