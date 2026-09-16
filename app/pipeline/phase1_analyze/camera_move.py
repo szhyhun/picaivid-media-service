@@ -187,7 +187,7 @@ def reverse_vector(vector: dict | None) -> dict:
 # rather than a single choice from a flat list.
 MOVE_AXES: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
     ("zoom", "Zoom", (("push in", "Push in"), ("pull out", "Pull back"))),
-    ("pan", "Pan", (("pan right", "Right"), ("pan left", "Left"))),
+    ("pan", "Pan", (("pan left", "Left"), ("pan right", "Right"))),
     ("tilt", "Tilt", (("tilt up", "Up"), ("tilt down", "Down"))),
 )
 
