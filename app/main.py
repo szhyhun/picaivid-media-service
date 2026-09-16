@@ -925,14 +925,27 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
             # A photo dropped onto the timeline. It is a real row immediately --
             # duration comes from the beat grid, not from a video that does not
             # exist yet, so the schedule is correct before generation finishes.
+            restored_clip = None
+            shot_uid = incoming.shot_uid or str(uuid.uuid4())
+            if incoming.shot_uid:
+                # Undo can send back a shot_uid whose TimelineClip row was
+                # removed. Keep the identity stable and reuse the rendered
+                # Clip row when one exists, instead of turning the undo into a
+                # silent regeneration.
+                restored_clip = (db.query(Clip)
+                                 .filter(Clip.job_id == job_id,
+                                         Clip.shot_uid == incoming.shot_uid)
+                                 .order_by(Clip.id.desc()).first())
             row = TimelineClip(timeline_id=timeline.id,
-                               shot_uid=str(uuid.uuid4()),
+                               shot_uid=shot_uid,
                                transition_type="cut")
             db.add(row)
             row.room_id = incoming.room_id
             row.room_type = incoming.room_type
             row.act = incoming.act
             row.move_label = incoming.move or "push in + pan right"
+            if restored_clip is not None:
+                row.clip_id = restored_clip.id
         row.order_index = index
         incoming_ids = list(incoming.photo_ids)
         # Reversing the frames reverses the move. Detected here rather than
