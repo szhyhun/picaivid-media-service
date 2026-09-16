@@ -49,6 +49,12 @@ class TimelineShot(BaseModel):
     source_size: Optional[list[int]] = None
     detail_subject: Optional[str] = None
     prompt_override: Optional[str] = None
+    # The customer's optional note, appended to our prompt -- never replacing it.
+    prompt_note: Optional[str] = None
+    # The move axis the select shows: derived from `move` unless the customer
+    # has chosen one, in which case `move_locked` keeps the planner off it.
+    move_primary: Optional[str] = None
+    move_locked: bool = False
     # Exact prompt previewed before generation or sent for a ready clip.
     generation_prompt: Optional[str] = None
 

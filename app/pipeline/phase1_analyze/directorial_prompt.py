@@ -23,6 +23,8 @@ Two things this cannot express, and they are the honest limits:
 """
 from __future__ import annotations
 
+from app.pipeline.phase1_analyze.camera_move import primary_of
+
 from dataclasses import dataclass
 
 # How a measured camera move reads as direction. The reference films' vocabulary
@@ -289,13 +291,18 @@ def _single_motion_label(
     # A customer's pick outranks the measured grammar below. Those defaults
     # describe what listing films usually do, which is a reason to start there
     # and not a reason to overrule someone who looked at the shot.
-    if not getattr(shot, "move_locked", False):
-        if cls == "detail":
-            return "push in"
-        if cls in {"aerial", "closing"} or is_last:
-            return "pull out"
-        if is_first or cls in {"approach", "threshold"}:
-            return "push in"
+    if getattr(shot, "move_locked", False):
+        # `with_primary` writes the pick first, so the leading atom is it. The
+        # zoom-first reading further down would otherwise hand a chosen "pan
+        # left" back as the "pull out" the shot was measured at.
+        return primary_of(label, chosen=True)
+
+    if cls == "detail":
+        return "push in"
+    if cls in {"aerial", "closing"} or is_last:
+        return "pull out"
+    if is_first or cls in {"approach", "threshold"}:
+        return "push in"
 
     if "static hold" in label:
         return "static hold"
@@ -310,6 +317,23 @@ def _single_motion_label(
     if "pan left" in label:
         return "pan left"
     return "push in"
+
+
+def effective_move_primary(shot, *, is_first: bool = False,
+                           is_last: bool = False) -> str:
+    """The single axis this shot's prompt will actually ask the provider for.
+
+    The editor's move select must show this, not the raw measured label: for an
+    unlocked shot the positional grammar below overrides what was measured, and
+    a select that disagrees with the prompt it controls is worse than no select.
+    """
+    cls = shot_class(
+        getattr(shot, "room_type", None),
+        is_close_up=bool(getattr(shot, "is_close_up", False)),
+        act=getattr(shot, "act", None),
+        is_last=is_last,
+    )
+    return _single_motion_label(shot, cls, is_first=is_first, is_last=is_last)
 
 
 def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,

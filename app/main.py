@@ -43,7 +43,10 @@ from app.pipeline.phase1_analyze.camera_move import (
     vector_from_label,
     with_primary,
 )
-from app.pipeline.phase1_analyze.directorial_prompt import build_shot_prompt
+from app.pipeline.phase1_analyze.directorial_prompt import (
+    build_shot_prompt,
+    effective_move_primary,
+)
 from app.pipeline.phase1_analyze.pairing import persisted_pair_score
 from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music_uri
 from app.pipeline.phase3_timeline.materialize import (
@@ -852,7 +855,10 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             source_size=c.source_size, detail_subject=c.detail_subject,
             prompt_override=c.prompt_override,
             prompt_note=c.prompt_note,
-            move_primary=primary_of(c.move_label),
+            move_primary=(
+                effective_move_primary(c, is_first=index == 0,
+                                       is_last=index == len(clips) - 1)
+                if c.kind != "pair_keyframes" else primary_of(c.move_label)),
             move_locked=bool(c.move_locked),
             generation_prompt=generation_prompt,
             video_url=_signed_url(c.clip.s3_uri) if c.clip else None,

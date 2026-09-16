@@ -220,11 +220,20 @@ def with_primary(label: str | None, primary: str) -> str:
     return " + ".join([primary, *kept])
 
 
-def primary_of(label: str | None) -> str:
-    """Which selectable move this label reads as. Zoom wins, then pan, then tilt."""
+def primary_of(label: str | None, *, chosen: bool = False) -> str:
+    """Which selectable move this label reads as. Zoom wins, then pan, then tilt.
+
+    `chosen` says a customer picked this move, in which case the leading atom is
+    their pick -- `with_primary` writes it first -- and it outranks the tier
+    order. Without that, choosing "pan left" on a shot measured as "pull out"
+    reads back as "pull out", and the select silently loses to the value it
+    exists to override.
+    """
     atoms = [a.strip() for a in (label or "").split("+") if a.strip()]
     if not atoms or atoms == ["static hold"]:
         return "static hold"
+    if chosen and atoms[0] in {value for value, _ in SELECTABLE_MOVES}:
+        return atoms[0]
     for group in ("zoom", "pan", "tilt"):
         for atom in atoms:
             if _PRIMARY_GROUP.get(atom) == group:

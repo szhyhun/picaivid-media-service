@@ -140,6 +140,14 @@ class SelectableMoveTests(unittest.TestCase):
             "pan left + push in",
         )
 
+    def test_a_chosen_move_outranks_the_zoom_first_reading(self):
+        # The select's whole purpose is overriding what was measured. Reading
+        # a chosen "pan left" back as the shot's old "pull out" would make the
+        # control appear to do nothing.
+        label = camera_move.with_primary("pull out + pan right", "pan left")
+        self.assertEqual(camera_move.primary_of(label, chosen=True), "pan left")
+        self.assertEqual(camera_move.primary_of(label), "pull out")
+
     def test_holding_still_clears_everything(self):
         # A hold is the absence of movement; it cannot keep a pan.
         self.assertEqual(

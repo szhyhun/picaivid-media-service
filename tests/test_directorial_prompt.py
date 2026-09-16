@@ -10,6 +10,7 @@ import unittest
 
 from app.pipeline.phase1_analyze.directorial_prompt import (
     build_script,
+    build_shot_prompt,
     split_for_generation,
 )
 from app.pipeline.phase1_analyze.shot_line import build_shot_line
@@ -87,3 +88,29 @@ class SplitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChosenMovePromptTests(unittest.TestCase):
+    """A customer's pick must reach the provider, not just the select."""
+
+    class _Shot:
+        room_type = "living_room"
+        kind = "single_image"
+        is_close_up = False
+        act = 2
+        prompt_override = None
+        prompt_note = None
+
+        def __init__(self, move, locked):
+            self.move = move
+            self.move_locked = locked
+
+    def test_a_locked_move_drives_the_prompt(self):
+        shot = self._Shot("pan left + pull out", True)
+        self.assertIn("pan to the left",
+                      build_shot_prompt(shot))
+
+    def test_an_unlocked_shot_still_follows_the_positional_grammar(self):
+        shot = self._Shot("pan left + pull out", False)
+        self.assertIn("pull back",
+                      build_shot_prompt(shot, is_last=True))
