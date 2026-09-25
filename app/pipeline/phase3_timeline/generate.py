@@ -88,6 +88,15 @@ def _photo_inputs(db: Session, photo_ids: list[int]) -> list[str]:
     return inputs
 
 
+def _download_video(url: str) -> bytes:
+    """Download one provider result and reject HTTP or empty responses."""
+    response = httpx.get(url, timeout=120.0)
+    response.raise_for_status()
+    if not response.content:
+        raise RunwareError("Runware returned an empty video file.")
+    return response.content
+
+
 def pending_shots(timeline: Timeline) -> list[TimelineClip]:
     """Shots with no usable video yet: never generated, or generated and failed."""
     return [c for c in timeline.ordered_clips() if c.state in {"planned", "failed"}]
@@ -115,10 +124,15 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
     ordered = timeline.ordered_clips()
     first_uid = ordered[0].shot_uid if ordered else None
     last_uid = ordered[-1].shot_uid if ordered else None
+    paired_room_ids = {
+        candidate.room_id for candidate in ordered
+        if candidate.room_id and candidate.kind == "pair_keyframes"
+    }
     prompt = build_shot_prompt(
         shot, squeeze_factor=1.0,
         is_first=bool(first_uid) and shot.shot_uid == first_uid,
-        is_last=bool(last_uid) and shot.shot_uid == last_uid)
+        is_last=bool(last_uid) and shot.shot_uid == last_uid,
+        room_has_pair=shot.room_id in paired_room_ids)
 
     clip = shot.clip if shot.clip_id else None
     if clip is None:
@@ -207,9 +221,11 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
     if not shots:
         return {"requested": 0, "succeeded": 0, "failed": 0}
 
-    progress.start_phase("Generating clips", len(shots))
+    total_requested = len(shots)
+    progress.start_phase("Generating clips", total_requested)
 
     jobs, by_task = [], {}
+    failed = 0
     for shot in shots:
         progress.raise_if_cancelled()
         try:
@@ -222,20 +238,36 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
             logger.warning("SHOT_PREPARE_FAILED shot=%s error=%s", shot.shot_uid, exc)
             if shot.clip:
                 shot.clip.status = "failed"
-                shot.clip.render_metadata = {"error": str(exc)}
+                shot.clip.render_metadata = {
+                    **(shot.clip.render_metadata or {}),
+                    "error": f"input preparation failed: {exc}",
+                }
                 db.commit()
+            failed += 1
 
     if not jobs:
-        return {"requested": len(shots), "succeeded": 0, "failed": len(shots)}
+        progress.update(failed, total_requested, "Generating clips")
+        return {"requested": total_requested, "succeeded": 0, "failed": failed}
 
     logger.info("RUNWARE_BATCH_START model=%s count=%s concurrency=%s "
                 "duration=%ss resolution=%s hdr=%s",
                 options.model,
                 len(jobs), settings.RUNWARE_MAX_CONCURRENCY,
                 options.duration, options.resolution, options.hdr)
-    results = asyncio.run(_generate_all(jobs, options.resolution, progress.heartbeat))
+    try:
+        results = asyncio.run(_generate_all(jobs, options.resolution, progress.heartbeat))
+    except Exception as exc:  # noqa: BLE001 - persist every shot as failed
+        reason = f"generation batch failed: {exc}"
+        logger.exception("RUNWARE_BATCH_FAILED count=%s", len(jobs))
+        for clip in by_task.values():
+            clip.status = "failed"
+            clip.render_metadata = {**(clip.render_metadata or {}), "error": reason}
+        db.commit()
+        failed += len(jobs)
+        progress.update(failed, total_requested, "Generating clips")
+        return {"requested": total_requested, "succeeded": 0, "failed": failed}
 
-    done = failed = 0
+    done = 0
     for task_uuid, result in results.items():
         clip = by_task[task_uuid]
         if isinstance(result, Exception) or not getattr(result, "ok", False):
@@ -247,7 +279,7 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
         else:
             try:
                 # Runware's URLs expire; the clip has to live in our bucket.
-                data = httpx.get(result.video_url, timeout=120.0).content
+                data = _download_video(result.video_url)
                 key = f"jobs/{timeline.job_id}/clips/{clip.shot_uid}.mp4"
                 clip.s3_uri = s3_client.upload_bytes(key, data, "video/mp4")
                 clip.status = "complete"
@@ -266,10 +298,10 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
             except Exception as exc:               # noqa: BLE001 - store and move on
                 clip.status = "failed"
                 clip.render_metadata = {**(clip.render_metadata or {}),
-                                        "error": f"download failed: {exc}"}
+                                        "error": f"result download failed: {exc}"}
                 failed += 1
         db.commit()
-        progress.update(done + failed, len(jobs), "Generating clips")
+        progress.update(done + failed, total_requested, "Generating clips")
 
     logger.info("RUNWARE_BATCH_DONE succeeded=%s failed=%s", done, failed)
-    return {"requested": len(shots), "succeeded": done, "failed": failed}
+    return {"requested": total_requested, "succeeded": done, "failed": failed}

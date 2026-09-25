@@ -6,6 +6,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.db.models import Job
+from app.db.models.timeline import Timeline
 from app.pipeline.phase3_timeline.generate import (
     generate_timeline_clips,
     pending_shots,
@@ -36,16 +37,31 @@ def _latest_job(db: Session, project_id: str) -> Job:
     return job
 
 
+def _job_and_timeline(db: Session, project_id: str, timeline_id: int | None):
+    if timeline_id is not None:
+        timeline = (db.query(Timeline)
+                    .join(Job, Timeline.job_id == Job.id)
+                    .filter(Timeline.id == int(timeline_id),
+                            Job.project_id == project_id)
+                    .first())
+        if timeline is None:
+            raise RuntimeError(f"Timeline {timeline_id} does not belong to project {project_id}.")
+        return timeline.job, timeline
+
+    job = _latest_job(db, project_id)
+    return job, latest_timeline(db, int(job.id))
+
+
 def run_timeline_generation(
     db: Session,
     project_id: str,
     *,
     shot_uids: list[str] | None = None,
     resolution: str | None = None,
+    timeline_id: int | None = None,
 ) -> dict:
     """Generate queued timeline shots without an HTTP/background-task path."""
-    job = _latest_job(db, project_id)
-    timeline = latest_timeline(db, int(job.id))
+    job, timeline = _job_and_timeline(db, project_id, timeline_id)
     if timeline is None:
         raise RuntimeError(f"No timeline exists for project {project_id}.")
 
@@ -103,10 +119,9 @@ def run_timeline_generation(
     return result
 
 
-def run_timeline_assembly(db: Session, project_id: str) -> dict:
+def run_timeline_assembly(db: Session, project_id: str, *, timeline_id: int | None = None) -> dict:
     """Assemble the editor-approved timeline on the CPU worker."""
-    job = _latest_job(db, project_id)
-    timeline = latest_timeline(db, int(job.id))
+    job, timeline = _job_and_timeline(db, project_id, timeline_id)
     if timeline is None:
         raise RuntimeError(f"No timeline exists for project {project_id}.")
 

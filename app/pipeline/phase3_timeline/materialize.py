@@ -77,7 +77,8 @@ def latest_timeline(db: Session, job_id: int) -> Timeline | None:
 
 def materialize_timeline(db: Session, job_id: int, rooms, *,
                          target_seconds: float, bpm: float,
-                         beats_per_shot: int = 2) -> Timeline:
+                         beats_per_shot: int = 2,
+                         name: str | None = None) -> Timeline:
     """Write the computed shot line as a new timeline version."""
     line = build_line(db, rooms, target_seconds=target_seconds, bpm=bpm)
 
@@ -90,6 +91,7 @@ def materialize_timeline(db: Session, job_id: int, rooms, *,
             "bpm": bpm,
             "beats_per_shot": beats_per_shot,
             "target_seconds": target_seconds,
+            "name": name or f"Video {(previous.version + 1) if previous else 1}",
         },
     )
     db.add(timeline)

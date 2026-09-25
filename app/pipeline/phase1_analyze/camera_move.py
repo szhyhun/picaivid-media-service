@@ -52,6 +52,10 @@ ROLL_RATE_DEG = 1.36
 # Rightward pans outnumbered leftward 86 to 35.
 PAN_RIGHT_SHARE = 0.71
 
+# Threshold rooms are navigational reveals. A single frame cannot justify a
+# lateral or vertical camera path there, so keep the default move straight.
+STRAIGHT_SINGLE_ROOM_TYPES = frozenset({"entrance", "hallway"})
+
 
 @dataclass(frozen=True)
 class CameraMove:
@@ -77,12 +81,20 @@ def _unit(seed: str, salt: str) -> float:
     return int.from_bytes(digest[:4], "big") / 2**32
 
 
-def choose_move(seed: str, *, is_establishing: bool = False) -> CameraMove:
+def choose_move(
+    seed: str,
+    *,
+    is_establishing: bool = False,
+    allow_pan: bool = True,
+    allow_tilt: bool = True,
+) -> CameraMove:
     """Pick a move for one shot, matching the measured distribution.
 
     `is_establishing` flips the zoom preference: in the reference films the pull
     out is reserved for exteriors and aerials, where opening the frame reveals
-    the setting rather than drawing attention into it.
+    the setting rather than drawing attention into it. Pan and tilt are policy
+    gates: the planner can keep a room's single-frame move straight when its
+    references already provide a path or the room is a threshold.
     """
     r_static = _unit(seed, "static")
     if r_static < FREQ_STATIC:
@@ -99,12 +111,12 @@ def choose_move(seed: str, *, is_establishing: bool = False) -> CameraMove:
         zoom_label = "pull out"
 
     pan = 0.0
-    if _unit(seed, "pan") < FREQ_PAN:
+    if allow_pan and _unit(seed, "pan") < FREQ_PAN:
         rightward = _unit(seed, "pandir") < PAN_RIGHT_SHARE
         pan = PAN_RATE if rightward else -PAN_RATE
 
     tilt = 0.0
-    if _unit(seed, "tilt") < FREQ_TILT:
+    if allow_tilt and _unit(seed, "tilt") < FREQ_TILT:
         tilt = TILT_RATE if _unit(seed, "tiltdir") < 0.5 else -TILT_RATE
 
     roll = 0.0

@@ -124,6 +124,22 @@ class PollingTests(unittest.TestCase):
         self.assertEqual(result.seed, 42)
         self.assertAlmostEqual(result.cost or 0, 0.12)
 
+    def test_polling_has_a_wall_clock_deadline(self):
+        async def run():
+            async def response(*_args, **_kwargs):
+                return {"data": [{"status": "processing"}]}
+
+            with patch.object(rw, "_post", side_effect=response), \
+                 patch.object(rw.time, "monotonic", side_effect=[0.0, 0.0, 2.0]):
+                return await rw.poll_video(
+                    object(), "task", interval=1, max_attempts=99,
+                    max_wait_seconds=1,
+                )
+
+        result = asyncio.run(run())
+        self.assertFalse(result.ok)
+        self.assertIn("Timed out after 1s", result.error or "")
+
 
 class CredentialTests(unittest.TestCase):
     def test_a_missing_api_key_is_refused_before_any_request(self):

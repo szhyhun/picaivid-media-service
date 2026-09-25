@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -257,13 +258,21 @@ async def submit_video(client: httpx.AsyncClient, task: dict[str, Any]) -> str:
 async def poll_video(client: httpx.AsyncClient, task_uuid: str, *,
                      interval: float | None = None,
                      max_attempts: int | None = None,
+                     max_wait_seconds: float | None = None,
                      on_tick=None) -> VideoResult:
-    """Wait for one video. `on_tick` keeps the job heartbeat fresh while we wait."""
-    interval = interval or settings.RUNWARE_POLL_INTERVAL_SECONDS
-    attempts = max_attempts or settings.RUNWARE_MAX_POLL_ATTEMPTS
+    """Wait for one video without allowing a provider task to hang forever."""
+    interval = (settings.RUNWARE_POLL_INTERVAL_SECONDS
+                if interval is None else interval)
+    attempts = (settings.RUNWARE_MAX_POLL_ATTEMPTS
+                if max_attempts is None else max_attempts)
+    max_wait = (settings.RUNWARE_MAX_WAIT_SECONDS
+                if max_wait_seconds is None else max_wait_seconds)
 
     delay = max(1.0, float(interval))
-    for _ in range(attempts):
+    deadline = time.monotonic() + max(1.0, float(max_wait))
+    polls = 0
+    while polls < max(1, int(attempts)) and time.monotonic() < deadline:
+        polls += 1
         payload = await _post(client, [{"taskType": "getResponse",
                                         "taskUUID": task_uuid}])
         row = _first_result(payload) or {}
@@ -279,16 +288,19 @@ async def poll_video(client: httpx.AsyncClient, task_uuid: str, *,
         # getResponse reports terminal failures through `errors` with
         # status=error. Do not mistake a normal processing acknowledgement for
         # a failed generation merely because it has an informational message.
-        if str(row.get("status") or "").lower() == "error":
+        if str(row.get("status") or "").lower() in {"error", "failed"}:
             return VideoResult(task_uuid=task_uuid, video_url=None,
                                error=_error_message(row) or "Runware rejected the task.")
         if on_tick:
             on_tick()
-        await asyncio.sleep(delay)
+        remaining = deadline - time.monotonic()
+        if polls >= max(1, int(attempts)) or remaining <= 0:
+            break
+        await asyncio.sleep(min(delay, remaining))
         delay = min(delay * 1.5, 20.0)
 
     return VideoResult(task_uuid=task_uuid, video_url=None,
-                       error=f"Timed out after {attempts} polls.")
+                       error=(f"Timed out after {max_wait:g}s and {polls} polls."))
 
 
 async def generate_video(client: httpx.AsyncClient, *, prompt: str,

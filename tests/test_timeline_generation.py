@@ -17,6 +17,20 @@ class InputTransportTests(unittest.TestCase):
              patch.object(generate.settings, "S3_ENDPOINT", "http://localhost:9000"):
             self.assertTrue(generate._uses_inline_media())
 
+    def test_provider_result_download_checks_http_status_and_bytes(self):
+        response = MagicMock(content=b"mp4")
+        with patch.object(generate.httpx, "get", return_value=response) as get:
+            self.assertEqual(
+                generate._download_video("https://example.test/v.mp4"), b"mp4")
+        get.assert_called_once_with("https://example.test/v.mp4", timeout=120.0)
+        response.raise_for_status.assert_called_once_with()
+
+    def test_empty_provider_result_is_rejected(self):
+        response = MagicMock(content=b"")
+        with patch.object(generate.httpx, "get", return_value=response):
+            with self.assertRaises(generate.RunwareError):
+                generate._download_video("https://example.test/v.mp4")
+
 
 class QueueTests(unittest.TestCase):
     def test_queue_persists_shots_before_background_work_starts(self):
@@ -44,6 +58,25 @@ class QueueTests(unittest.TestCase):
         planned = SimpleNamespace(clip=None)
         timeline = SimpleNamespace(ordered_clips=lambda: [queued, active, planned])
         self.assertEqual(generate.queued_shots(timeline), [queued])
+
+    def test_input_failures_are_counted_and_reported(self):
+        clips = [
+            SimpleNamespace(status="queued", render_metadata={}),
+            SimpleNamespace(status="queued", render_metadata={}),
+        ]
+        shots = [
+            SimpleNamespace(shot_uid="a", clip=clips[0], photo_ids=[]),
+            SimpleNamespace(shot_uid="b", clip=clips[1], photo_ids=[]),
+        ]
+        progress = MagicMock()
+        with patch.object(generate, "queued_shots", return_value=shots), \
+             patch.object(generate, "_prepare", side_effect=generate.RunwareError("bad input")):
+            result = generate.generate_timeline_clips(
+                MagicMock(), object(), progress=progress)
+
+        self.assertEqual(result, {"requested": 2, "succeeded": 0, "failed": 2})
+        self.assertTrue(all(clip.status == "failed" for clip in clips))
+        progress.update.assert_called_with(2, 2, "Generating clips")
 
     def test_explicit_mode_overrides_endpoint_detection(self):
         with patch.object(generate.settings, "RUNWARE_INPUT_MODE", "url"), \

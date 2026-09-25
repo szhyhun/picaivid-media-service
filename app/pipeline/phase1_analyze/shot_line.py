@@ -37,7 +37,11 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field, replace
 
-from app.pipeline.phase1_analyze.camera_move import CameraMove, choose_move
+from app.pipeline.phase1_analyze.camera_move import (
+    STRAIGHT_SINGLE_ROOM_TYPES,
+    CameraMove,
+    choose_move,
+)
 from app.pipeline.phase1_analyze.detail_crop import ResolvedDetail, is_detail_eligible
 from app.pipeline.phase1_analyze.editorial import (
     MIN_SHOTS,
@@ -93,10 +97,15 @@ MAX_SERVICE_SHOTS = 1
 MAX_ACT1_SHOTS = 5
 MAX_ACT1_AERIAL_SHOTS = 2
 MAX_ACT1_APPROACH_SHOTS = 3
-# The reference film averaged 2.2 shots per room. Letting one room take three
-# while another takes one produces a film that keeps returning to the same
-# kitchen instead of showing the house.
+# The reference film averaged 2.2 shots per ordinary room. Social rooms are the
+# deliberate exception: they are the property's strongest shared space, and a
+# well-photographed one can support several distinct looks without repeating a
+# frame.
 MAX_SHOTS_PER_ROOM = 2
+MAX_SOCIAL_SHOTS_PER_ROOM = 4
+# The social block should feel substantial without becoming the whole film.
+# This is an aggregate ceiling across the main house and any later social unit.
+MAX_SOCIAL_SHOTS = 12
 # A house with four bathrooms should not spend a quarter of the film in them.
 # The reference film gave bathrooms 13% of runtime across the whole property,
 # not per room. Show the best instances of a type and drop the rest.
@@ -121,12 +130,16 @@ PAIR_ONLY_ROOM_TYPES = frozenset({"bathroom"})
 # geometry or membership evidence.
 SECONDARY_SOCIAL_GAP = 8
 SECONDARY_UNIT_POSITION = 0.68
+SOCIAL_ROOM_TYPES = ("living room", "dining room", "kitchen")
+# Kitchen and living-room capture runs can identify a distinct suite; dining
+# runs are commonly split by an open-plan component gap and should stay in the
+# main social block rather than being mistaken for another unit.
 PRIMARY_SOCIAL_ROOM_TYPES = ("kitchen", "living room")
 
 # Selection and story order are separate decisions. These are the main-house
 # social spaces that earn one protected beat when present; additional coverage
 # still comes from the ordinary evidence and dwell-weight allocation below.
-CORE_SOCIAL_TYPES = ("living room", "dining room", "kitchen")
+CORE_SOCIAL_TYPES = SOCIAL_ROOM_TYPES
 
 # Close-ups, measured by scoring every shot in the three reference films against
 # the wide-room centroid and taking each film's top quartile:
@@ -387,8 +400,8 @@ def _disjoint_pair_capacity(room: RoomCandidate) -> int:
 def _room_shot_capacity(room: RoomCandidate, hero_id: str | None) -> int:
     """Maximum distinct cinematic beats this room can supply."""
     cap = MAX_HERO_SHOTS if room.room_id == hero_id else MAX_SHOTS_PER_ROOM
-    if room.room_type in PRIMARY_SOCIAL_ROOM_TYPES and not is_secondary(room):
-        cap = 3
+    if room.room_type in SOCIAL_ROOM_TYPES and not is_secondary(room):
+        cap = max(cap, MAX_SOCIAL_SHOTS_PER_ROOM)
     pairs = _disjoint_pair_capacity(room)
     if room.room_type in PAIR_ONLY_ROOM_TYPES:
         return min(cap, pairs)
@@ -483,6 +496,22 @@ def _act_of(room: RoomCandidate) -> int:
 
 def _rank_in_act(room: RoomCandidate) -> int:
     return int(story_position(room) * 1000)
+
+
+def _tour_order_key(room: RoomCandidate) -> tuple[int, int, int, float, str]:
+    """Keep the main social rooms together in their deliberate tour order."""
+    if not is_secondary(room) and room.room_type in SOCIAL_ROOM_TYPES:
+        return (
+            0,
+            SOCIAL_ROOM_TYPES.index(room.room_type),
+            _room_start(room),
+            -room.quality,
+            room.room_id,
+        )
+    if is_secondary(room):
+        # A secondary unit remains one late block, after the main house.
+        return (2, _room_start(room), _room_start(room), -room.quality, room.room_id)
+    return (1, _rank_in_act(room), _room_start(room), -room.quality, room.room_id)
 
 
 def _room_start(room: RoomCandidate) -> int:
@@ -808,42 +837,80 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
 
     # A property film must establish its principal social spaces before it
     # spends coverage on optional bathrooms or a later secondary unit. Reserve
-    # the best main-house instance of each; this does not grant extra repeats.
+    # the social block explicitly instead of letting room weights scatter it.
     # A very short cut can reserve only what fits after the approach and close.
     close_reserve = int(_closing_room(eligible) is not None)
     core_capacity = max(0, budget - sum(opening_counts.values()) - close_reserve)
-    core_social = _core_social_coverage(eligible)[:core_capacity]
-    core_social_ids = {room.room_id for room in core_social}
-    for room in core_social:
-        alloc[room.room_id] = max(alloc.get(room.room_id, 0), 1)
-
-    # Reserve two main-room beats across component boundaries, with a combined
-    # ceiling of three per type. Pair capacity already accounts for used photos.
     social_pools = {
         kind: sorted(
-            (room for room in eligible
-             if room.room_type == kind and not is_secondary(room)),
-            key=lambda room: (-len(room.pairs), -room.quality, _room_start(room), room.room_id),
-        ) for kind in PRIMARY_SOCIAL_ROOM_TYPES
+            (room for room in eligible if room.room_type == kind),
+            key=lambda room: (
+                is_secondary(room),
+                -len(room.pairs),
+                -len(room.photo_ids),
+                -room.quality,
+                _room_start(room),
+                room.room_id,
+            ),
+        )
+        for kind in SOCIAL_ROOM_TYPES
     }
-    floors = {room_id: 1 for room_id in core_social_ids}
-    for pool in social_pools.values():
-        for room in reversed(pool):
-            while sum(alloc.get(r.room_id, 0) for r in pool) > 3 and alloc.get(room.room_id, 0) > 0:
-                alloc[room.room_id] -= 1
-        remaining = max(0, core_capacity - sum(floors.values()))
-        protected = sum(floors.get(r.room_id, 0) for r in pool)
-        for room in pool:
-            already = floors.get(room.room_id, 0)
-            extra = min(_room_shot_capacity(room, hero_id) - already,
-                        2 - protected, remaining)
-            reserve = already + max(0, extra)
-            if reserve:
-                alloc[room.room_id] = max(alloc.get(room.room_id, 0), reserve)
-                core_social_ids.add(room.room_id)
-                floors[room.room_id] = reserve
-                remaining -= max(0, extra)
-                protected += max(0, extra)
+    primary_social_pools = {
+        kind: [room for room in pool if not is_secondary(room)]
+        for kind, pool in social_pools.items()
+    }
+    secondary_social_pools = {
+        kind: [room for room in pool if is_secondary(room)]
+        for kind, pool in social_pools.items()
+    }
+    social_rooms = [room for pool in social_pools.values() for room in pool]
+    primary_social_rooms = [
+        room for pool in primary_social_pools.values() for room in pool
+    ]
+
+    # Rebuild social allocation from zero so the aggregate quota is deliberate.
+    # This also makes a seventh kitchen frame compete with other social rooms
+    # rather than winning only because its component has the highest weight.
+    for room in social_rooms:
+        alloc[room.room_id] = 0
+
+    social_capacity = sum(
+        _room_shot_capacity(room, hero_id) for room in social_rooms
+    )
+    social_target = min(MAX_SOCIAL_SHOTS, core_capacity, social_capacity)
+
+    def fill_social(pools: dict[str, list[RoomCandidate]], limit: int) -> int:
+        """Fill one social look per room type per pass until the limit is met."""
+        added = 0
+        while added < limit:
+            progressed = False
+            for room_type in SOCIAL_ROOM_TYPES:
+                for room in pools[room_type]:
+                    if alloc.get(room.room_id, 0) >= _room_shot_capacity(room, hero_id):
+                        continue
+                    alloc[room.room_id] = alloc.get(room.room_id, 0) + 1
+                    added += 1
+                    progressed = True
+                    break
+                if added >= limit:
+                    break
+            if not progressed:
+                break
+        return added
+
+    social_total = fill_social(primary_social_pools, social_target)
+    social_total += fill_social(
+        secondary_social_pools,
+        social_target - social_total,
+    )
+    # Protect only the main-house social run from later budget trimming. A
+    # secondary-unit look can still give way when an otherwise empty property
+    # needs a closing exterior or another primary room.
+    core_social_ids = {
+        room.room_id
+        for room in primary_social_rooms
+        if alloc.get(room.room_id, 0) > 0
+    }
 
     # Reserving an absent facade or entry can add shots that generic weighted
     # allocation had already dropped in a short edit. Make room in the body now
@@ -875,13 +942,14 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         while shortfall > 0 and takers and i < len(takers) * 6:
             room = takers[i % len(takers)]
             cap = _room_shot_capacity(room, hero_id)
-            pool = social_pools.get(room.room_type, [])
-            if room in pool and sum(alloc.get(r.room_id, 0) for r in pool) >= 3:
+            if room.room_type in SOCIAL_ROOM_TYPES and social_total >= social_target:
                 i += 1
                 continue
             if alloc.get(room.room_id, 0) < cap:
                 alloc[room.room_id] = alloc.get(room.room_id, 0) + 1
                 shortfall -= 1
+                if room.room_type in SOCIAL_ROOM_TYPES:
+                    social_total += 1
             i += 1
 
     per_shot = shot_seconds(bpm)
@@ -895,16 +963,15 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
         if alloc.get(room.room_id, 0):
             ordered.append((1, room))
     for act in (2, 3):
-        members = sorted((r for r in eligible
-                          if _act_of(r) == act and r.room_id not in opening_ids),
-                         key=lambda r: (
-                             is_secondary(r),
-                             _room_start(r) if is_secondary(r) else _rank_in_act(r),
-                             -r.quality,
-                         ))
-        # Every shot of a room runs consecutively. Cutting away to a bedroom in
-        # the middle of the living room and back again reads as a shuffle, not a
-        # tour: you look at a room, then you move on.
+        members = sorted(
+            (r for r in eligible
+             if _act_of(r) == act and r.room_id not in opening_ids),
+            key=_tour_order_key,
+        )
+        # The main social block is intentional: enter, see the living room, move
+        # through dining, then land in the kitchen before private rooms. Every
+        # shot of one room still runs consecutively; cutting away and back reads
+        # as a shuffle, not a tour.
         for room in members:
             for _ in range(alloc.get(room.room_id, 0)):
                 ordered.append((act, room))
@@ -968,7 +1035,17 @@ def build_shot_line(rooms: list[RoomCandidate], *, target_seconds: float,
             kind = "single_image"
         establishing = room.room_type in ("aerial view", "exterior front",
                                           "front yard", "building exterior")
-        move = choose_move(f"{room.room_id}:{i}", is_establishing=establishing)
+        # Threshold shots are straight reveals. When a room has verified pairs,
+        # those pairs provide the visual path, so fallback singles do not invent
+        # a random vertical move. Other rooms retain the subtle measured drift
+        # distribution from the reference films.
+        straight_room = room.room_type in STRAIGHT_SINGLE_ROOM_TYPES
+        move = choose_move(
+            f"{room.room_id}:{i}",
+            is_establishing=establishing,
+            allow_pan=not straight_room,
+            allow_tilt=not straight_room and not room.pairs,
+        )
         shots.append(Shot(
             index=i, room_id=room.room_id, room_type=room.room_type,
             photo_ids=photo_ids, kind=kind, act=act,
@@ -1063,6 +1140,11 @@ def _insert_close_ups(
         detail = chosen.get(i)
         if i not in chosen:
             continue
+        room_has_pair = any(
+            candidate.room_id == shot.room_id and candidate.uses_keyframes
+            for candidate in shots
+        )
+        straight_room = shot.room_type in STRAIGHT_SINGLE_ROOM_TYPES
         out.append(Shot(
             index=-1,
             room_id=shot.room_id,
@@ -1073,7 +1155,11 @@ def _insert_close_ups(
             start_seconds=0.0,
             duration_seconds=shot.duration_seconds,
             generation_duration_seconds=shot.generation_duration_seconds,
-            move=choose_move(f"{shot.room_id}:closeup:{i}"),
+            move=choose_move(
+                f"{shot.room_id}:closeup:{i}",
+                allow_pan=not straight_room,
+                allow_tilt=not straight_room and not room_has_pair,
+            ),
             is_hero=shot.is_hero,
             is_close_up=True,
             crop_box=detail.crop.box if detail.crop else None,

@@ -19,6 +19,7 @@ class JobMessage(BaseModel):
     # authenticated timeline. They contain no provider credentials.
     shot_uids: list[str] = Field(default_factory=list)
     resolution: Optional[str] = None
+    timeline_id: Optional[int] = None
 
     # Optional: resume from specific phase
     start_phase: Optional[int] = None

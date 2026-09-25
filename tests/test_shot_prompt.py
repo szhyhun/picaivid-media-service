@@ -70,10 +70,21 @@ class PromptTests(unittest.TestCase):
 
     def test_every_prompt_uses_positive_stability_language(self):
         prompt = build_shot_prompt(_Shot())
-        for rule in ("Perfectly stabilized motorized camera rig", "level frame",
-                     "straight verticals", "Preserve exact architecture",
-                     "object placement", "controlled", "constant speed"):
+        for rule in (
+            "complete visual source of truth",
+            "same scene identity and exact architecture",
+            "every visible furnishing, fixture, surface, opening",
+            "empty area",
+            "Perfectly stabilized motorized camera rig",
+            "level frame",
+            "straight verticals",
+            "object placement",
+            "controlled",
+            "constant speed",
+        ):
             self.assertIn(rule, prompt)
+        self.assertEqual(prompt.count("architecture"), 1)
+        self.assertEqual(prompt.count("object placement"), 1)
         self.assertNotIn("No ", prompt)
 
     def test_pair_prompt_requests_stabilized_motion_without_changing_the_path(self):
@@ -97,6 +108,21 @@ class PromptTests(unittest.TestCase):
         # would otherwise invent.
         prompt = build_shot_prompt(_Shot(room_type="living room", move="push in"))
         self.assertIn("straight push in", prompt)
+
+    def test_entrance_strips_an_old_persisted_drift(self):
+        prompt = build_shot_prompt(
+            _Shot(room_type="entrance", move="push in + pan right + tilt up"))
+        self.assertIn("Slow, straight push in", prompt)
+        self.assertNotIn("drifting", prompt)
+        self.assertNotIn("rising", prompt)
+
+    def test_paired_room_single_keeps_pan_but_strips_tilt(self):
+        prompt = build_shot_prompt(
+            _Shot(room_type="kitchen", move="push in + pan right + tilt up"),
+            room_has_pair=True,
+        )
+        self.assertIn("drifting gently to the right", prompt)
+        self.assertNotIn("rising", prompt)
 
     def test_no_prompt_ever_asks_the_camera_to_tilt_or_roll(self):
         # A pitch and a slanted horizon share the word "tilt", and a slanted
@@ -149,7 +175,7 @@ class PromptNoteTests(unittest.TestCase):
             _Shot(prompt_note='Keep the pool in frame.'))
         self.assertTrue(prompt.endswith('Keep the pool in frame.'))
         # Everything we decided is still in there.
-        self.assertIn('Preserve exact architecture', prompt)
+        self.assertIn('exact architecture', prompt)
         self.assertIn('push in', prompt.lower())
 
     def test_an_empty_note_adds_nothing(self):
@@ -163,5 +189,5 @@ class PromptNoteTests(unittest.TestCase):
         prompt = build_shot_prompt(_Shot(prompt_override='mine', prompt_note='theirs'))
         self.assertTrue(prompt.startswith('mine'))
         # The safety contract survives an override, and the note still follows.
-        self.assertIn('Preserve exact architecture', prompt)
+        self.assertIn('exact architecture', prompt)
         self.assertTrue(prompt.endswith('theirs'))

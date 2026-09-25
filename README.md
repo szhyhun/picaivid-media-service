@@ -59,6 +59,8 @@ RUNWARE_MODEL=luma:ray@3.2
 RUNWARE_DURATION_SECONDS=5
 RUNWARE_RESOLUTION=720p
 RUNWARE_HDR=true
+RUNWARE_MAX_CONCURRENCY=4
+RUNWARE_MAX_WAIT_SECONDS=1800
 ```
 
 Never put the Runware key in the React `.env.local`, source control, an SQS
@@ -93,6 +95,8 @@ pip install -r requirements.lock.txt
 - `GET /api/projects/{project_id}/scenes/debug`
 - `GET /api/projects/{project_id}/shot_plan`
 - `GET /api/projects/{project_id}/timeline`
+- `GET /api/projects/{project_id}/timelines`
+- `GET/PUT /api/projects/{project_id}/timeline?timeline_id=...`
 - `POST /api/projects/{project_id}/timeline/generate`
 - `PUT /api/projects/{project_id}/timeline/music`
 - `POST /api/projects/{project_id}/timeline/assemble`

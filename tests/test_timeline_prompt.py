@@ -32,6 +32,19 @@ class TimelinePromptTests(unittest.TestCase):
             self._clip(clip=SimpleNamespace(prompt_used=actual)), 0, 1)
         self.assertEqual(prompt, actual)
 
+    def test_existing_entrance_move_is_resolved_without_drift(self):
+        prompt = _timeline_generation_prompt(
+            self._clip(
+                room_type="entrance",
+                move_label="push in + pan right + tilt up",
+            ),
+            0,
+            2,
+        )
+        self.assertIn("Slow, straight push in", prompt)
+        self.assertNotIn("drifting", prompt)
+        self.assertNotIn("rising", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

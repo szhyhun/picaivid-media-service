@@ -21,14 +21,19 @@ def process_message(message: dict) -> None:
         job_message = JobMessage(**message)
         with get_db_context() as db:
             if action == "timeline_generate":
-                run_timeline_generation(
-                    db,
-                    job_message.project_id,
-                    shot_uids=job_message.shot_uids,
-                    resolution=job_message.resolution,
-                )
+                kwargs = {
+                    "shot_uids": job_message.shot_uids,
+                    "resolution": job_message.resolution,
+                }
+                if job_message.timeline_id is not None:
+                    kwargs["timeline_id"] = job_message.timeline_id
+                run_timeline_generation(db, job_message.project_id, **kwargs)
             else:
-                run_timeline_assembly(db, job_message.project_id)
+                if job_message.timeline_id is None:
+                    run_timeline_assembly(db, job_message.project_id)
+                else:
+                    run_timeline_assembly(
+                        db, job_message.project_id, timeline_id=job_message.timeline_id)
         return
 
     if action != "run":

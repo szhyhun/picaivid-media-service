@@ -35,7 +35,7 @@ from app.schemas.job_progress import (
     ProjectPurgeResponse,
 )
 from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
-from app.db.models.timeline import TimelineClip
+from app.db.models.timeline import Timeline, TimelineClip
 from app.pipeline.phase1_analyze.camera_move import (
     axes_of,
     compose_label,
@@ -59,6 +59,8 @@ from app.schemas.timeline import (
     TimelinePhoto,
     TimelineMusic,
     TimelineMusicRequest,
+    TimelineListResponse,
+    TimelineSummary,
     TimelineResponse,
     TimelineShot,
     TimelineUpdateRequest,
@@ -154,7 +156,13 @@ def _safe_float(value: object) -> float | None:
         return None
 
 
-def _timeline_generation_prompt(clip: TimelineClip, index: int, total: int) -> str:
+def _timeline_generation_prompt(
+    clip: TimelineClip,
+    index: int,
+    total: int,
+    *,
+    room_has_pair: bool = False,
+) -> str:
     """Return the prompt shown in Studio for one stored timeline shot."""
     if clip.clip is not None and clip.clip.prompt_used:
         return clip.clip.prompt_used
@@ -162,6 +170,7 @@ def _timeline_generation_prompt(clip: TimelineClip, index: int, total: int) -> s
         clip,
         is_first=index == 0,
         is_last=index == total - 1,
+        room_has_pair=room_has_pair,
     )
 
 
@@ -804,6 +813,36 @@ def _latest_job_id(db: Session, project_id: str) -> int | None:
     return int(row[0]) if row else None
 
 
+def _timeline_for_project(db: Session, project_id: str,
+                          timeline_id: int | None = None):
+    if timeline_id is not None:
+        timeline = (db.query(Timeline)
+                    .join(Job, Timeline.job_id == Job.id)
+                    .filter(Timeline.id == int(timeline_id),
+                            Job.project_id == project_id)
+                    .first())
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="Studio timeline not found.")
+        return timeline
+    job_id = _latest_job_id(db, project_id)
+    if job_id is None:
+        return None
+    return latest_timeline(db, job_id)
+
+
+def _timeline_summary(timeline) -> TimelineSummary:
+    grid = timeline.beat_grid or {}
+    return TimelineSummary(
+        id=int(timeline.id),
+        version=int(timeline.version or 1),
+        status=timeline.status or "draft",
+        name=str(grid.get("name") or f"Video {timeline.version or 1}"),
+        bpm=timeline.bpm,
+        duration=float(timeline.total_duration or 0.0),
+        target_seconds=_safe_float(grid.get("target_seconds")),
+    )
+
+
 def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineResponse:
     """Serialise a stored timeline. Timing is recomputed here, never trusted."""
     if timeline is None:
@@ -812,6 +851,10 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
 
     clips = timeline.ordered_clips()
     timeline.retime()
+    paired_room_ids = {
+        c.room_id for c in clips
+        if c.room_id and c.kind == "pair_keyframes"
+    }
 
     photo_ids = [pid for c in clips for pid in (c.photo_ids or [])]
     photo_rows = (db.query(JobPhoto).filter(JobPhoto.id.in_(photo_ids)).all()
@@ -842,7 +885,12 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
     for index, c in enumerate(clips):
         # Ready clips expose the immutable prompt that was paid for. Planned
         # clips expose the current prompt so the user can inspect it first.
-        generation_prompt = _timeline_generation_prompt(c, index, len(clips))
+        generation_prompt = _timeline_generation_prompt(
+            c,
+            index,
+            len(clips),
+            room_has_pair=c.room_id in paired_room_ids,
+        )
         shots.append(TimelineShot(
             shot_uid=c.shot_uid, order_index=c.order_index, state=c.state,
             room_id=c.room_id, room_type=c.room_type, act=c.act, kind=c.kind,
@@ -852,8 +900,12 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             duration_override=c.duration_override,
             # The move the prompt will actually use, not the raw stored label:
             # for an unlocked single, position still decides the push or pull.
-            move=(effective_move_label(c, is_first=index == 0,
-                                       is_last=index == len(clips) - 1)
+            move=(effective_move_label(
+                c,
+                is_first=index == 0,
+                is_last=index == len(clips) - 1,
+                room_has_pair=c.room_id in paired_room_ids,
+            )
                   if c.kind != "pair_keyframes" else c.move_label),
             move_vector=c.move_vector,
             crop_box=c.crop_box, subject_box=c.subject_box,
@@ -874,18 +926,34 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
     )
 
 
-@app.get("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
-async def get_timeline(project_id: str, db: Session = Depends(get_db)):
-    """The stored, editable timeline. Empty until one is materialised."""
+@app.get("/api/projects/{project_id}/timelines", response_model=TimelineListResponse)
+async def list_timelines(project_id: str, db: Session = Depends(get_db)):
+    """List every saved video cut for one listing."""
     job_id = _latest_job_id(db, project_id)
     if job_id is None:
+        return TimelineListResponse(project_id=project_id)
+    timelines = (db.query(Timeline).filter(Timeline.job_id == job_id)
+                 .order_by(Timeline.id.asc()).all())
+    return TimelineListResponse(
+        project_id=project_id,
+        timelines=[_timeline_summary(timeline) for timeline in timelines],
+    )
+
+
+@app.get("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
+async def get_timeline(project_id: str, timeline_id: int | None = None,
+                       db: Session = Depends(get_db)):
+    """The stored, editable timeline. Empty until one is materialised."""
+    timeline = _timeline_for_project(db, project_id, timeline_id)
+    if timeline is None:
         return TimelineResponse(project_id=project_id, detail="No job for this project.")
-    return _timeline_payload(db, project_id, latest_timeline(db, job_id))
+    return _timeline_payload(db, project_id, timeline)
 
 
 @app.post("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
 async def create_timeline(project_id: str, seconds: float = 45.0, bpm: float = 100.0,
-                          force: bool = False, db: Session = Depends(get_db)):
+                          force: bool = False, name: str | None = None,
+                          db: Session = Depends(get_db)):
     """Materialise the computed shot line into an editable timeline.
 
     Returns the existing one unless `force` -- re-materialising discards manual
@@ -906,12 +974,13 @@ async def create_timeline(project_id: str, seconds: float = 45.0, bpm: float = 1
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     timeline = materialize_timeline(db, job_id, rooms,
-                                    target_seconds=seconds, bpm=bpm)
+                                    target_seconds=seconds, bpm=bpm, name=name)
     return _timeline_payload(db, project_id, timeline)
 
 
 @app.put("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
 async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
+                          timeline_id: int | None = None,
                           db: Session = Depends(get_db)):
     """Replace the shot list with the order given.
 
@@ -920,7 +989,7 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
     Rows are matched by `shot_uid` so a generated clip survives being moved.
     """
     job_id = _latest_job_id(db, project_id)
-    timeline = latest_timeline(db, job_id) if job_id else None
+    timeline = _timeline_for_project(db, project_id, timeline_id) if job_id else None
     if timeline is None:
         raise HTTPException(status_code=404, detail="No timeline to update.")
 
@@ -1034,6 +1103,7 @@ def _center_trim_for(clip: TimelineClip, grid_seconds: float) -> float:
 
 @app.put("/api/projects/{project_id}/timeline/music", response_model=TimelineResponse)
 async def update_timeline_music(project_id: str, payload: TimelineMusicRequest,
+                                timeline_id: int | None = None,
                                 db: Session = Depends(get_db)):
     """Select a catalog/uploaded track and retime the editable timeline."""
     if not _valid_music_uri(payload.music_uri):
@@ -1043,7 +1113,7 @@ async def update_timeline_music(project_id: str, payload: TimelineMusicRequest,
         )
 
     job_id = _latest_job_id(db, project_id)
-    timeline = latest_timeline(db, job_id) if job_id else None
+    timeline = _timeline_for_project(db, project_id, timeline_id) if job_id else None
     if timeline is None:
         raise HTTPException(status_code=404, detail="No timeline to update.")
     job = db.get(Job, job_id)
@@ -1099,7 +1169,8 @@ async def update_timeline_music(project_id: str, payload: TimelineMusicRequest,
 
 @app.get("/api/projects/{project_id}/timeline/candidates",
          response_model=CandidateListResponse)
-async def get_timeline_candidates(project_id: str, db: Session = Depends(get_db)):
+async def get_timeline_candidates(project_id: str, timeline_id: int | None = None,
+                                  db: Session = Depends(get_db)):
     """Photos with no shot on the timeline, for the add-shot rail.
 
     Each carries the verified partner it could form a pair shot with, when one
@@ -1110,7 +1181,7 @@ async def get_timeline_candidates(project_id: str, db: Session = Depends(get_db)
     if job_id is None:
         return CandidateListResponse(project_id=project_id)
 
-    timeline = latest_timeline(db, job_id)
+    timeline = _timeline_for_project(db, project_id, timeline_id)
     used = {int(pid) for c in (timeline.timeline_clips if timeline else [])
             for pid in (c.photo_ids or [])}
 

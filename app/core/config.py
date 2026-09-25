@@ -96,7 +96,10 @@ class Settings(BaseSettings):
     # guidance is 2-4 concurrent for best throughput.
     RUNWARE_MAX_CONCURRENCY: int = 4
     RUNWARE_POLL_INTERVAL_SECONDS: float = 5.0
-    RUNWARE_MAX_POLL_ATTEMPTS: int = 240
+    # A provider task may take 1-20 minutes. The wall-clock limit is the real
+    # safety valve; attempts remain a second guard if the poll interval changes.
+    RUNWARE_MAX_WAIT_SECONDS: int = 1800
+    RUNWARE_MAX_POLL_ATTEMPTS: int = 360
     RUNWARE_SUBMIT_URL_EXPIRY_SECONDS: int = 21600   # 6h: a queued job fetches late
 
     # Logging

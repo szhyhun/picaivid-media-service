@@ -72,6 +72,23 @@ class EstablishingTests(unittest.TestCase):
                 self.assertLess(move.zoom, 0)
 
 
+class AxisPolicyTests(unittest.TestCase):
+    def test_pan_and_tilt_can_be_disabled_independently(self):
+        for i in range(100):
+            move = choose_move(
+                f"straight-{i}", allow_pan=False, allow_tilt=False)
+            self.assertEqual(move.pan, 0.0)
+            self.assertEqual(move.tilt, 0.0)
+            self.assertNotIn("pan ", move.label)
+            self.assertNotIn("tilt ", move.label)
+
+    def test_pair_room_policy_can_keep_pan_without_tilt(self):
+        for i in range(100):
+            move = choose_move(f"paired-room-{i}", allow_tilt=False)
+            self.assertEqual(move.tilt, 0.0)
+            self.assertNotIn("tilt ", move.label)
+
+
 class HeadroomTests(unittest.TestCase):
     def test_a_move_needs_more_pixels_than_the_output_frame(self):
         move = choose_move("x")

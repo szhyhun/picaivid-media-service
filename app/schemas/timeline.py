@@ -100,6 +100,21 @@ class TimelineResponse(BaseModel):
     detail: str = ""
 
 
+class TimelineSummary(BaseModel):
+    id: int
+    version: int = 1
+    status: str = "draft"
+    name: str = ""
+    bpm: float = 100.0
+    duration: float = 0.0
+    target_seconds: Optional[float] = None
+
+
+class TimelineListResponse(BaseModel):
+    project_id: str
+    timelines: list[TimelineSummary] = []
+
+
 class TimelineShotUpdate(BaseModel):
     """One shot as the editor wants it. Unknown uids are created as planned."""
 

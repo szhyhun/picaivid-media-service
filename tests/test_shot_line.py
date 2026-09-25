@@ -11,8 +11,11 @@ import unittest
 from app.pipeline.phase1_analyze.shot_line import (
     MAX_ACT1_SHOTS,
     MAX_HERO_SHOTS,
+    MAX_SOCIAL_SHOTS,
+    MAX_SOCIAL_SHOTS_PER_ROOM,
     MAX_SERVICE_SHOTS,
     RoomCandidate,
+    SOCIAL_ROOM_TYPES,
     Shot,
     _core_social_coverage,
     allocate_shots,
@@ -329,8 +332,86 @@ class KeyframeTests(unittest.TestCase):
         self.assertGreater(line.keyframe_fraction(), 0.0)
         self.assertLessEqual(line.keyframe_fraction(), 1.0)
 
+    def test_entrance_and_hallway_singles_are_straight(self):
+        rooms = [
+            room("entry", "entrance", 1, start=10),
+            room("hall", "hallway", 1, start=20),
+        ]
+        line = build_shot_line(rooms, target_seconds=30, bpm=100,
+                               include_close_ups=False)
+        threshold_shots = [shot for shot in line.shots
+                           if shot.room_type in {"entrance", "hallway"}]
+        self.assertTrue(threshold_shots)
+        self.assertTrue(all(shot.move.pan == 0 for shot in threshold_shots))
+        self.assertTrue(all(shot.move.tilt == 0 for shot in threshold_shots))
+
+    def test_single_fallback_in_a_paired_room_never_tilts(self):
+        kitchen = room("kitchen", "kitchen", 3, pairs=1, start=10)
+        line = build_shot_line([kitchen], target_seconds=30, bpm=100,
+                               include_close_ups=False)
+        singles = [shot for shot in line.shots
+                   if shot.room_type == "kitchen" and shot.kind == "single_image"]
+        self.assertTrue(singles)
+        self.assertTrue(all(shot.move.tilt == 0 for shot in singles))
+
 
 class SelectionTests(unittest.TestCase):
+    def test_social_block_can_use_four_distinct_beats_per_room(self):
+        rooms = [
+            room("front", "exterior front", 2, start=1),
+            room("entry", "entrance", 1, start=2),
+            room("living", "living room", 8, pairs=4, start=10),
+            room("dining", "dining room", 8, pairs=4, start=20),
+            room("kitchen", "kitchen", 8, pairs=4, start=30),
+            room("bedroom", "bedroom", 4, pairs=2, start=40),
+            room("patio", "patio", 4, pairs=2, start=60),
+        ]
+        line = build_shot_line(
+            rooms, target_seconds=45, bpm=100, include_close_ups=False)
+        social = [shot for shot in line.shots
+                  if shot.room_type in SOCIAL_ROOM_TYPES]
+
+        self.assertEqual(len(social), MAX_SOCIAL_SHOTS)
+        self.assertEqual(
+            [shot.room_type for shot in social],
+            (["living room"] * MAX_SOCIAL_SHOTS_PER_ROOM
+             + ["dining room"] * MAX_SOCIAL_SHOTS_PER_ROOM
+             + ["kitchen"] * MAX_SOCIAL_SHOTS_PER_ROOM),
+        )
+        self.assertTrue(all(shot.uses_keyframes for shot in social))
+        self.assertEqual(
+            [shot.index for shot in social],
+            list(range(social[0].index, social[-1].index + 1)),
+        )
+
+    def test_secondary_social_rooms_wait_until_main_social_quota_is_filled(self):
+        rooms = [
+            room("front", "exterior front", 2, start=1),
+            room("entry", "entrance", 1, start=2),
+            room("main-living", "living room", 8, pairs=4, start=10),
+            room("main-dining", "dining room", 8, pairs=4, start=20),
+            room("main-kitchen", "kitchen", 8, pairs=4, start=30),
+            room("bedroom", "bedroom", 4, pairs=2, start=40),
+            room("suite-living", "living room", 8, pairs=4, start=70),
+            room("suite-kitchen", "kitchen", 8, pairs=4, start=80),
+        ]
+        line = build_shot_line(
+            rooms, target_seconds=45, bpm=100, include_close_ups=False)
+        social = [shot for shot in line.shots
+                  if shot.room_type in SOCIAL_ROOM_TYPES]
+        main_social = [shot for shot in social
+                       if not shot.room_id.startswith("suite-")]
+
+        self.assertEqual(len(social), MAX_SOCIAL_SHOTS)
+        self.assertEqual(len(main_social), MAX_SOCIAL_SHOTS)
+        self.assertFalse(any(shot.room_id.startswith("suite-") for shot in social))
+        self.assertEqual(
+            [shot.room_type for shot in main_social],
+            (["living room"] * MAX_SOCIAL_SHOTS_PER_ROOM
+             + ["dining room"] * MAX_SOCIAL_SHOTS_PER_ROOM
+             + ["kitchen"] * MAX_SOCIAL_SHOTS_PER_ROOM),
+        )
+
     def test_main_social_coverage_spans_components_without_suite_consuming_slots(self):
         rooms = [
             room("living-a", "living room", 1, start=10),
@@ -344,10 +425,40 @@ class SelectionTests(unittest.TestCase):
         main_living = [s for s in line.shots if s.room_id in {"living-a", "living-b"}]
         main_kitchen = [s for s in line.shots if s.room_id in {"kitchen-a", "kitchen-b"}]
         self.assertEqual(len(main_living), 2)
-        self.assertGreaterEqual(len(main_kitchen), 2)
-        self.assertLessEqual(len(main_kitchen), 3)
+        self.assertEqual(len(main_kitchen), 6)
         self.assertLess(max(s.index for s in main_living),
                         min(s.index for s in line.shots if s.room_id == "suite-living"))
+
+    def test_social_close_ups_are_additive_and_stay_after_their_wide(self):
+        rooms = [
+            room("front", "exterior front", 2, start=1),
+            room("entry", "entrance", 1, start=2),
+            room("living", "living room", 8, pairs=4, start=10),
+            room("dining", "dining room", 8, pairs=4, start=20),
+            room("kitchen", "kitchen", 8, pairs=4, start=30),
+            room("bedroom", "bedroom", 4, pairs=2, start=40),
+            room("patio", "patio", 4, pairs=2, start=60),
+        ]
+        wides = build_shot_line(
+            rooms, target_seconds=45, bpm=100, include_close_ups=False)
+        scheduled = schedule_resolved_close_ups(wides.shots, resolved_details(wides.shots))
+        wide_sequence = [
+            (shot.room_id, shot.room_type)
+            for shot in scheduled if not shot.is_close_up
+        ]
+
+        self.assertEqual(
+            wide_sequence,
+            [(shot.room_id, shot.room_type) for shot in wides.shots],
+        )
+        self.assertEqual(
+            len([shot for shot in scheduled
+                 if not shot.is_close_up and shot.room_type in SOCIAL_ROOM_TYPES]),
+            MAX_SOCIAL_SHOTS,
+        )
+        for previous, shot in zip(scheduled, scheduled[1:]):
+            if shot.is_close_up:
+                self.assertEqual(shot.room_id, previous.room_id)
 
     def test_pair_consumes_one_budget_slot_and_remainder_goes_to_available_room(self):
         bedroom = room("bed", "bedroom", 2, pairs=1, start=10)

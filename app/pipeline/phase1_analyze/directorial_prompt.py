@@ -23,7 +23,11 @@ Two things this cannot express, and they are the honest limits:
 """
 from __future__ import annotations
 
-from app.pipeline.phase1_analyze.camera_move import axes_of, compose_label
+from app.pipeline.phase1_analyze.camera_move import (
+    STRAIGHT_SINGLE_ROOM_TYPES,
+    axes_of,
+    compose_label,
+)
 
 from dataclasses import dataclass
 
@@ -209,13 +213,17 @@ _APPROACH_TYPES = frozenset({"front yard", "exterior front", "building exterior"
 _THRESHOLD_TYPES = frozenset({"entrance", "hallway"})
 _OUTDOOR_TYPES = frozenset({"patio", "pool", "backyard", "exterior back"})
 
-# Applies to every shot. The building and visible objects must not change; only
-# the camera is allowed to move.
+# Applies to every shot. The reference pixels are the source of truth; the
+# camera path is the only intentional change. Keep this positive and concrete
+# rather than using a negative prompt, which some providers interpret poorly.
 _INVARIANTS = (
-    "Photorealistic. Perfectly stabilized motorized camera rig with a level "
-    "frame and straight verticals. Preserve exact architecture, geometry, "
-    "proportions, object placement, and lighting throughout. Use one "
-    "continuous, controlled move at constant speed."
+    "Treat the supplied reference frame or frames as the complete visual source "
+    "of truth. Preserve the same scene identity and exact architecture, geometry, "
+    "proportions, object placement, lighting, and every visible furnishing, "
+    "fixture, surface, opening, reflection, shadow, and empty area exactly as "
+    "shown. Photorealistic. Perfectly stabilized motorized camera rig with a "
+    "level frame and straight verticals. The camera path is the only intentional "
+    "change; use one continuous, controlled move at constant speed."
 )
 
 
@@ -317,6 +325,7 @@ def _effective_move_label(
     *,
     is_first: bool,
     is_last: bool,
+    room_has_pair: bool = False,
 ) -> str:
     """The compound move this shot will actually be generated with.
 
@@ -339,6 +348,17 @@ def _effective_move_label(
 
     axes = axes_of(_shot_move_label(shot).lower())
 
+    # Apply the same evidence policy to persisted timelines as to newly built
+    # plans. Existing rows can carry an older random pan/tilt label, but a
+    # threshold single still has no evidence for that path.
+    if getattr(shot, "kind", "single_image") != "pair_keyframes":
+        room = (getattr(shot, "room_type", None) or "").strip().lower()
+        if room in STRAIGHT_SINGLE_ROOM_TYPES:
+            axes["pan"] = None
+            axes["tilt"] = None
+        elif room_has_pair:
+            axes["tilt"] = None
+
     if getattr(shot, "move_locked", False):
         return compose_label(axes)
 
@@ -353,7 +373,8 @@ def _effective_move_label(
 
 
 def effective_move_label(shot, *, is_first: bool = False,
-                         is_last: bool = False) -> str:
+                         is_last: bool = False,
+                         room_has_pair: bool = False) -> str:
     """The move this shot's prompt will actually ask the provider for.
 
     The editor must show this, not the raw stored label: a control that
@@ -365,11 +386,18 @@ def effective_move_label(shot, *, is_first: bool = False,
         act=getattr(shot, "act", None),
         is_last=is_last,
     )
-    return _effective_move_label(shot, cls, is_first=is_first, is_last=is_last)
+    return _effective_move_label(
+        shot,
+        cls,
+        is_first=is_first,
+        is_last=is_last,
+        room_has_pair=room_has_pair,
+    )
 
 
 def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
-                      is_first: bool = False, is_last: bool = False) -> str:
+                      is_first: bool = False, is_last: bool = False,
+                      room_has_pair: bool = False) -> str:
     """Write the motion direction for one generated clip.
 
     `shot` needs `room_type`, `kind`, `is_close_up`, `act` and `move`; both the
@@ -400,7 +428,13 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
         )
     else:
         motion = _motion_sentence(
-            _effective_move_label(shot, cls, is_first=is_first, is_last=is_last))
+            _effective_move_label(
+                shot,
+                cls,
+                is_first=is_first,
+                is_last=is_last,
+                room_has_pair=room_has_pair,
+            ))
 
     subject = getattr(shot, "detail_subject", None)
     if cls == "detail" and subject:
