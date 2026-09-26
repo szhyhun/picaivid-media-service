@@ -47,8 +47,9 @@ class VideoTaskTests(unittest.TestCase):
         self.assertEqual(task["outputQuality"], 95)
         self.assertEqual(task["deliveryMethod"], "async")
 
-    def test_it_does_not_request_provider_cost_by_default(self):
-        self.assertIs(self.task()["includeCost"], False)
+    def test_it_records_provider_cost_by_default(self):
+        # An unrecorded spend is one nobody can audit afterwards.
+        self.assertIs(self.task()["includeCost"], True)
 
     def test_it_uses_explicit_ray_keyframe_objects(self):
         self.assertEqual(
@@ -73,9 +74,21 @@ class VideoTaskTests(unittest.TestCase):
         with self.assertRaises(rw.RunwareError):
             self.task(resolution="540p")
 
-    def test_frame_generation_requires_five_seconds(self):
+    def test_a_duration_this_deployment_does_not_buy_is_rejected(self):
+        # Five for a pair, three for a single. Anything else is a typo, and a
+        # typo must not reach a paid endpoint.
         with self.assertRaises(rw.RunwareError):
-            self.task(duration=3)
+            self.task(duration=4)
+        with self.assertRaises(rw.RunwareError):
+            self.task(duration=9)
+
+    def test_both_real_durations_are_accepted(self):
+        self.assertEqual(self.task(duration=5)["duration"], 5)
+        self.assertEqual(self.task(duration=3)["duration"], 3)
+
+    def test_duration_follows_the_shot_kind(self):
+        self.assertEqual(rw.duration_for_kind("pair_keyframes"), 5)
+        self.assertEqual(rw.duration_for_kind("single_image"), 3)
 
     def test_wrong_model_is_rejected_before_submission(self):
         with self.assertRaises(rw.RunwareError):

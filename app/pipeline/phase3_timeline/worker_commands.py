@@ -128,9 +128,22 @@ def run_timeline_assembly(db: Session, project_id: str, *, timeline_id: int | No
     clips = timeline.ordered_clips()
     if not clips:
         raise RuntimeError("The timeline is empty.")
-    outstanding = [clip.shot_uid for clip in clips if clip.state != "ready"]
-    if outstanding:
-        raise RuntimeError(f"{len(outstanding)} shot(s) have no video yet.")
+    # A shot still in flight has to be waited for -- its video is coming and
+    # cutting without it would be assembling the wrong film.
+    unfinished = [c.shot_uid for c in clips if c.state in {"planned", "generating"}]
+    if unfinished:
+        raise RuntimeError(f"{len(unfinished)} shot(s) have no video yet.")
+
+    # A shot that has *failed* is a different case. Waiting for it achieves
+    # nothing, and holding the whole film hostage to one bad generation is
+    # worse than delivering the rest. It is skipped, and said out loud.
+    usable = [c for c in clips if c.state == "ready"]
+    skipped = [c.shot_uid for c in clips if c.state == "failed"]
+    if not usable:
+        raise RuntimeError("Every shot failed to generate; there is nothing to assemble.")
+    if skipped:
+        logger.warning("ASSEMBLY_SKIPPING_FAILED count=%s shots=%s",
+                       len(skipped), ", ".join(skipped))
 
     grid = timeline.grid_seconds
     plan = [
@@ -139,8 +152,9 @@ def run_timeline_assembly(db: Session, project_id: str, *, timeline_id: int | No
             "s3_uri": clip.clip.s3_uri,
             "trim_start": clip.trim_start or 0.0,
             "duration": clip.duration_for(grid),
+            "source_seconds": clip.source_seconds(),
         }
-        for clip in clips
+        for clip in usable
     ]
     job.status = "assembling"
     job.error_message = None

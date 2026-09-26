@@ -82,12 +82,17 @@ class Settings(BaseSettings):
     RUNWARE_API_KEY: str | None = None
     RUNWARE_API_URL: str = "https://api.runware.ai/v1"
     RUNWARE_MODEL: str = "luma:ray@3.2"
-    RUNWARE_DURATION_SECONDS: int = 5
+    # A pair pins both ends, so the longer buy is interpolation we can use.
+    # A single invents everything after frame one, and the longer it runs the
+    # more it invents -- so we buy three seconds of it, not five.
+    RUNWARE_DURATION_SECONDS: int = 5              # pair_keyframes
+    RUNWARE_DURATION_SECONDS_SINGLE: int = 3       # single_image
     RUNWARE_RESOLUTION: str = "720p"
     RUNWARE_HDR: bool = True
     RUNWARE_EXR_EXPORT: bool = False
     RUNWARE_OUTPUT_QUALITY: int = 95
-    RUNWARE_INCLUDE_COST: bool = False
+    # On by default: an unrecorded spend is one nobody can audit.
+    RUNWARE_INCLUDE_COST: bool = True
     # `url` passes a presigned S3 URL. `data_uri` sends the image with the
     # request. `auto` uses URLs in production but switches to data URIs for
     # a private local MinIO endpoint that Runware cannot reach.
@@ -99,6 +104,9 @@ class Settings(BaseSettings):
     # A provider task may take 1-20 minutes. The wall-clock limit is the real
     # safety valve; attempts remain a second guard if the poll interval changes.
     RUNWARE_MAX_WAIT_SECONDS: int = 1800
+    # A per-shot cap is not a cap on the run. Without this, enough slow shots
+    # in sequence keep a worker and its SQS message alive for hours.
+    RUNWARE_BATCH_DEADLINE_SECONDS: int = 3000
     RUNWARE_MAX_POLL_ATTEMPTS: int = 360
     RUNWARE_SUBMIT_URL_EXPIRY_SECONDS: int = 21600   # 6h: a queued job fetches late
 

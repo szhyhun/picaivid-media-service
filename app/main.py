@@ -34,7 +34,10 @@ from app.schemas.job_progress import (
     JobProgressResponse,
     ProjectPurgeResponse,
 )
-from app.db.models.timeline import SOURCE_SECONDS as TL_SOURCE_SECONDS
+from app.db.models.timeline import (
+    SOURCE_SECONDS as TL_SOURCE_SECONDS,
+    source_seconds_for,
+)
 from app.db.models.timeline import Timeline, TimelineClip
 from app.pipeline.phase1_analyze.camera_move import (
     axes_of,
@@ -843,6 +846,20 @@ def _timeline_summary(timeline) -> TimelineSummary:
     )
 
 
+def _clip_error(clip: TimelineClip) -> str | None:
+    """The stored failure reason, surfaced only while the shot is failed."""
+    if clip.clip is None or clip.state != "failed":
+        return None
+    reason = (clip.clip.render_metadata or {}).get("error")
+    return str(reason)[:500] if reason else None
+
+
+def _clip_cost(clip: TimelineClip) -> float | None:
+    if clip.clip is None:
+        return None
+    return _safe_float((clip.clip.render_metadata or {}).get("provider_cost_usd"))
+
+
 def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineResponse:
     """Serialise a stored timeline. Timing is recomputed here, never trusted."""
     if timeline is None:
@@ -915,6 +932,8 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             move_locked=bool(c.move_locked),
             generation_prompt=generation_prompt,
             video_url=_signed_url(c.clip.s3_uri) if c.clip else None,
+            error=_clip_error(c),
+            cost_usd=_clip_cost(c),
             photos=[photo(pid) for pid in (c.photo_ids or [])],
         ))
     return TimelineResponse(
@@ -1096,9 +1115,10 @@ def _valid_music_uri(uri: str) -> bool:
 
 def _center_trim_for(clip: TimelineClip, grid_seconds: float) -> float:
     """Return the stable middle start for the current beat-length window."""
+    source = source_seconds_for(clip.kind)
     wanted = float(clip.duration_override or grid_seconds)
-    wanted = max(0.1, min(wanted, TL_SOURCE_SECONDS))
-    return max(0.0, (TL_SOURCE_SECONDS - wanted) / 2.0)
+    wanted = max(0.1, min(wanted, source))
+    return max(0.0, (source - wanted) / 2.0)
 
 
 @app.put("/api/projects/{project_id}/timeline/music", response_model=TimelineResponse)

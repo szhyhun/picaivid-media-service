@@ -1,6 +1,7 @@
 """SQS consumer for processing job messages."""
 import json
 import logging
+import threading
 import time
 from typing import Callable, Optional
 
@@ -111,10 +112,49 @@ class SQSConsumer:
         for message in messages:
             self._process_message(message)
 
+    def _extend_visibility(self, receipt_handle: str, message_id: str,
+                           stop: threading.Event) -> None:
+        """Keep one in-flight message invisible for as long as work continues.
+
+        A fixed visibility timeout is a bet that the work finishes inside it.
+        Generation does not honour that bet: shots are capped individually, so
+        a run of slow ones outlives any constant. When the bet is lost SQS
+        hands the same message to a second worker, which then repeats work the
+        first is still doing.
+
+        Renewing on a timer removes the bet. The heartbeat stops when the
+        handler returns, so a worker that dies still releases its message and
+        the job is genuinely retried rather than lost.
+        """
+        interval = max(10.0, self.visibility_timeout / 3.0)
+        while not stop.wait(interval):
+            try:
+                self.client.change_message_visibility(
+                    QueueUrl=self.queue_url,
+                    ReceiptHandle=receipt_handle,
+                    VisibilityTimeout=self.visibility_timeout,
+                )
+            except Exception as error:
+                # Losing the extension is not fatal on its own: the billing
+                # guard still stops a redelivered message from buying anything
+                # twice. Log it and let the work finish.
+                logger.warning("VISIBILITY_EXTEND_FAILED message=%s error=%s",
+                               message_id, error)
+                return
+
     def _process_message(self, message: dict) -> None:
         """Process a single SQS message."""
         receipt_handle = message['ReceiptHandle']
         message_id = message['MessageId']
+
+        stop = threading.Event()
+        keepalive = threading.Thread(
+            target=self._extend_visibility,
+            args=(receipt_handle, message_id, stop),
+            name=f"sqs-visibility-{message_id[:8]}",
+            daemon=True,
+        )
+        keepalive.start()
 
         try:
             body = json.loads(message['Body'])
@@ -133,6 +173,9 @@ class SQSConsumer:
             logger.error(f"Error processing message {message_id}: {e}")
             # Message will become visible again after visibility timeout
             raise
+        finally:
+            stop.set()
+            keepalive.join(timeout=5.0)
 
 
 def send_message(message: dict, queue_url: Optional[str] = None) -> str:

@@ -7,7 +7,13 @@ exist, and what lets a change of music retime a whole film for free.
 import unittest
 
 from app.db.models import Clip
-from app.db.models.timeline import SOURCE_SECONDS, Timeline, TimelineClip
+from app.db.models.timeline import (
+    PAIR_SOURCE_SECONDS,
+    SINGLE_SOURCE_SECONDS,
+    SOURCE_SECONDS,
+    Timeline,
+    TimelineClip,
+)
 
 
 def a_timeline(bpm=100.0, shots=4):
@@ -56,20 +62,40 @@ class RetimeTests(unittest.TestCase):
 
 
 class TrimTests(unittest.TestCase):
-    def test_a_five_second_source_has_headroom_for_a_central_two_beat_window(self):
-        trim_start = (SOURCE_SECONDS - 1.2) / 2.0
+    def test_a_five_second_pair_has_headroom_for_a_central_two_beat_window(self):
+        trim_start = (PAIR_SOURCE_SECONDS - 1.2) / 2.0
         self.assertAlmostEqual(trim_start, 1.9)
-        clip = TimelineClip(order_index=0, trim_start=trim_start)
+        clip = TimelineClip(order_index=0, kind="pair_keyframes",
+                            trim_start=trim_start)
         self.assertAlmostEqual(clip.duration_for(1.2), 1.2)
 
     def test_duration_is_clamped_to_the_source_we_actually_bought(self):
-        clip = TimelineClip(order_index=0, trim_start=4.5)
+        clip = TimelineClip(order_index=0, kind="pair_keyframes", trim_start=4.5)
         self.assertAlmostEqual(clip.max_duration(), 0.5)
         self.assertAlmostEqual(clip.duration_for(1.2), 0.5)
 
     def test_an_untrimmed_shot_has_the_whole_source_available(self):
-        self.assertAlmostEqual(TimelineClip(order_index=0, trim_start=0.0).max_duration(),
-                               SOURCE_SECONDS)
+        self.assertAlmostEqual(
+            TimelineClip(order_index=0, kind="pair_keyframes",
+                         trim_start=0.0).max_duration(),
+            PAIR_SOURCE_SECONDS)
+
+    def test_a_single_is_bought_shorter_than_a_pair(self):
+        # A single invents everything after its one frame, so we buy less of
+        # it. Its trim ceiling has to follow, or the editor would offer a
+        # window that runs off the end of the clip.
+        single = TimelineClip(order_index=0, kind="single_image", trim_start=0.0)
+        pair = TimelineClip(order_index=1, kind="pair_keyframes", trim_start=0.0)
+        self.assertAlmostEqual(single.max_duration(), SINGLE_SOURCE_SECONDS)
+        self.assertAlmostEqual(pair.max_duration(), PAIR_SOURCE_SECONDS)
+        self.assertLess(single.max_duration(), pair.max_duration())
+
+    def test_every_usable_tempo_still_fits_inside_a_single(self):
+        # The shorter buy is only safe while a two-beat window still fits in
+        # it; below ~40 BPM it would not, and retiming would need new video.
+        for bpm in (60, 80, 90, 100, 113, 128, 140):
+            self.assertLessEqual(a_timeline(bpm=bpm).grid_seconds,
+                                 SINGLE_SOURCE_SECONDS)
 
 
 class StateTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Clip model for rendered video clips."""
-from sqlalchemy import BigInteger, Boolean, Column, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (BigInteger, Boolean, Column, DateTime, Float, ForeignKey,
+                        Integer, String, Text)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
@@ -38,6 +39,11 @@ class Clip(Base):
     # Written before we await the provider, so a worker restart resumes an
     # in-flight generation rather than paying for it a second time.
     provider_task_uuid = Column(String(64), index=True)
+    # Set once, atomically, immediately before the submit request. Billing
+    # starts at submission, so this -- not `status` -- is what says whether
+    # this clip has already been paid for. A worker killed mid-generation
+    # leaves `status` untouched; it cannot leave this unset.
+    provider_submitted_at = Column(DateTime)
     source_photo_ids = Column(JSONB)  # Array of photo IDs
     motion_type = Column(String(50))
     model_used = Column(String(100))  # LTX-2 single/interp/parallax/multi-view, SEVA

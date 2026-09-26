@@ -74,6 +74,26 @@ class VideoOptions:
 
 RAY_MODEL_ID = "luma:ray@3.2"
 RAY_FRAME_DURATION_SECONDS = 5
+
+
+def allowed_durations() -> frozenset[int]:
+    """The durations this deployment is configured to buy.
+
+    Validated as a set rather than a single constant so a typo is still caught
+    before a paid submission, while the two real lengths -- five seconds for a
+    pair, three for a single -- both pass.
+    """
+    return frozenset({
+        int(settings.RUNWARE_DURATION_SECONDS),
+        int(settings.RUNWARE_DURATION_SECONDS_SINGLE),
+    })
+
+
+def duration_for_kind(kind: str | None) -> int:
+    """Seconds of video to buy for one shot kind."""
+    return int(settings.RUNWARE_DURATION_SECONDS
+               if kind == "pair_keyframes"
+               else settings.RUNWARE_DURATION_SECONDS_SINGLE)
 HDR_RESOLUTIONS = frozenset({"720p", "1080p"})
 
 
@@ -113,10 +133,11 @@ def resolve_video_options(*, model: str | None = None,
         settings.RUNWARE_OUTPUT_QUALITY
         if output_quality is None else output_quality)
 
-    if duration_seconds != RAY_FRAME_DURATION_SECONDS:
+    permitted = allowed_durations()
+    if duration_seconds not in permitted:
         raise RunwareError(
-            f"Ray3.2 frameImages generation requires duration={RAY_FRAME_DURATION_SECONDS}; "
-            f"got {duration_seconds}")
+            f"Duration {duration_seconds}s is not one this deployment buys "
+            f"({sorted(permitted)}).")
     if hdr_enabled and resolution_name not in HDR_RESOLUTIONS:
         raise RunwareError(
             "Ray3.2 HDR requires resolution=720p or resolution=1080p.")
@@ -305,8 +326,23 @@ async def poll_video(client: httpx.AsyncClient, task_uuid: str, *,
 
 async def generate_video(client: httpx.AsyncClient, *, prompt: str,
                          photo_urls: list[str], task_uuid: str,
-                         on_tick=None, **kwargs) -> VideoResult:
-    """Submit one shot and wait for it."""
+                         on_tick=None, claim=None, **kwargs) -> VideoResult:
+    """Submit one shot and wait for it.
+
+    `claim` is called immediately before the submit and must return True for
+    the submit to happen. It is how "this clip has not been paid for yet" is
+    established atomically; returning False means another worker already owns
+    this task, so we poll its result instead of ordering a second one.
+
+    The claim is taken *before* the network call and never after. A submit that
+    is not preceded by a successful claim cannot happen -- that is the whole
+    guarantee, and it is why this is the only function that submits.
+    """
+    if claim is not None and not claim():
+        logger.info("RUNWARE_ALREADY_CLAIMED task=%s -- polling instead of submitting",
+                    task_uuid)
+        return await poll_video(client, task_uuid, on_tick=on_tick)
+
     task = build_video_task(prompt=prompt, photo_urls=photo_urls,
                             task_uuid=task_uuid, **kwargs)
     await submit_video(client, task)

@@ -58,6 +58,11 @@ class TimelineShot(BaseModel):
     generation_prompt: Optional[str] = None
 
     video_url: Optional[str] = None
+    # Why this shot failed, in the provider's own words. A bare "failed" makes
+    # every retry a guess: a timeout and a rejected key need different actions.
+    error: Optional[str] = None
+    # What this shot has actually cost so far, when the provider reports it.
+    cost_usd: Optional[float] = None
     photos: list[TimelinePhoto] = []
 
 

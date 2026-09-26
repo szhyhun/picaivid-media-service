@@ -144,7 +144,12 @@ def assemble_film(shots: list[dict], dest: str | Path, *,
         parts = []
         for index, shot in enumerate(shots):
             part = Path(work) / f"{index:04d}.mp4"
-            render_shot(shot["path"], part, source_seconds=source_seconds,
+            # Pairs and singles are bought at different lengths, so the
+            # squeeze factor is per shot. One film-wide value would stretch
+            # every single by 5/3 and wreck the beat grid.
+            render_shot(shot["path"], part,
+                        source_seconds=float(
+                            shot.get("source_seconds") or source_seconds),
                         trim_start=float(shot.get("trim_start") or 0.0),
                         duration=float(shot["duration"]), blend=blend, fps=fps)
             parts.append(part)

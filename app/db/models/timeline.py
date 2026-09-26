@@ -18,6 +18,17 @@ from app.db.base import Base
 # What we buy from the video provider per shot. Bigger than any beat length we
 # will ever cut, which is what makes trimming and retiming free.
 SOURCE_SECONDS = 5.0
+# A pair pins both ends of the move, so the provider has more to interpolate
+# and the longer buy is worth it. A single invents everything after the first
+# frame, and the further it runs the more it invents -- so we buy less of it.
+PAIR_SOURCE_SECONDS = 5.0
+SINGLE_SOURCE_SECONDS = 3.0
+
+
+def source_seconds_for(kind: str | None) -> float:
+    """How many seconds of video this shot kind is generated with."""
+    return PAIR_SOURCE_SECONDS if kind == "pair_keyframes" else SINGLE_SOURCE_SECONDS
+
 
 
 class Timeline(Base):
@@ -148,15 +159,19 @@ class TimelineClip(Base):
             return "failed"
         return "generating"
 
+    def source_seconds(self) -> float:
+        """Length of the generated source behind this shot, by kind."""
+        return source_seconds_for(self.kind)
+
     def duration_for(self, grid_seconds: float) -> float:
         """How long this shot holds on screen, clamped to what we actually bought."""
         wanted = self.duration_override if self.duration_override else grid_seconds
         start = self.trim_start or 0.0
-        return max(0.1, min(float(wanted), SOURCE_SECONDS - start))
+        return max(0.1, min(float(wanted), self.source_seconds() - start))
 
     def max_duration(self) -> float:
         """The trim ceiling. Passing it means paying to regenerate."""
-        return SOURCE_SECONDS - (self.trim_start or 0.0)
+        return max(0.1, self.source_seconds() - (self.trim_start or 0.0))
 
     def __repr__(self) -> str:
         return f"<TimelineClip id={self.id} order={self.order_index} state={self.state}>"

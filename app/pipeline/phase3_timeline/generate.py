@@ -32,10 +32,22 @@ from app.db.models import Clip, JobPhoto
 from app.db.models.timeline import SOURCE_SECONDS, Timeline, TimelineClip
 from app.pipeline.phase1_analyze.directorial_prompt import build_shot_prompt
 from app.pipeline.progress import NullProgress
-from app.services.runware.client import RunwareError, generate_video, resolve_video_options
+from app.services.runware.billing_guard import already_submitted, claim_for_submit
+from app.services.runware.client import (
+    RunwareError,
+    duration_for_kind,
+    generate_video,
+    poll_video,
+    resolve_video_options,
+)
 from app.services.storage.s3_client import s3_client
 
 logger = logging.getLogger(__name__)
+
+
+class BatchDeadlineExceeded(RunwareError):
+    """The whole run ran out of time, not just one shot."""
+
 
 
 def _uses_inline_media() -> bool:
@@ -143,10 +155,15 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
 
     clip.shot_uid = shot.shot_uid
     clip.provider = "runware"
+    # A fresh task id is a fresh purchase, so the submission mark has to go
+    # with it. This is the one place a clip becomes buyable again, and it is
+    # only reached for a shot that is planned or has already failed -- never
+    # for one still in flight.
     clip.provider_task_uuid = str(uuid.uuid4())
+    clip.provider_submitted_at = None
     clip.model_used = options.model
     clip.prompt_used = prompt
-    clip.duration = float(options.duration)
+    clip.duration = float(duration_for_kind(shot.kind))
     clip.source_photo_ids = list(shot.photo_ids or [])
     clip.motion_type = shot.move_label
     # Queued is visible to the studio before the HTTP response returns. The
@@ -158,21 +175,44 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
 
 async def _run_one(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
                    *, prompt: str, inputs: list[str], task_uuid: str,
-                   resolution: str | None, on_tick):
+                   resolution: str | None, duration: int, clip_id: int,
+                   resume: bool, on_tick):
     async with semaphore:
-        return await generate_video(client, prompt=prompt, photo_urls=inputs,
-                                    task_uuid=task_uuid, resolution=resolution,
-                                    on_tick=on_tick)
+        if resume:
+            # This clip carries a submission timestamp, so it has already been
+            # charged for. Collect it; never buy it twice.
+            logger.info("RUNWARE_RESUME task=%s -- already submitted, polling only",
+                        task_uuid)
+            return await poll_video(client, task_uuid, on_tick=on_tick)
+        return await generate_video(
+            client, prompt=prompt, photo_urls=inputs, task_uuid=task_uuid,
+            resolution=resolution, duration=duration, on_tick=on_tick,
+            claim=lambda: claim_for_submit(clip_id))
 
 
-async def _generate_all(jobs: list[dict], resolution: str | None, on_tick) -> dict[str, object]:
+async def _generate_all(jobs: list[dict], resolution: str | None, on_tick,
+                        *, deadline_seconds: float | None = None) -> dict[str, object]:
     semaphore = asyncio.Semaphore(max(1, settings.RUNWARE_MAX_CONCURRENCY))
     async with httpx.AsyncClient(timeout=60.0) as client:
-        results = await asyncio.gather(*[
+        pending = asyncio.gather(*[
             _run_one(client, semaphore, prompt=j["prompt"], inputs=j["inputs"],
-                     task_uuid=j["task_uuid"], resolution=resolution, on_tick=on_tick)
+                     task_uuid=j["task_uuid"], resolution=resolution,
+                     duration=j["duration"], clip_id=j["clip_id"],
+                     resume=j["resume"], on_tick=on_tick)
             for j in jobs
         ], return_exceptions=True)
+        if not deadline_seconds:
+            results = await pending
+        else:
+            try:
+                # A per-shot cap is not a cap on the run: enough slow shots in
+                # sequence keep a worker (and its SQS message) alive for hours.
+                results = await asyncio.wait_for(pending, timeout=deadline_seconds)
+            except asyncio.TimeoutError:
+                pending.cancel()
+                results = [BatchDeadlineExceeded(
+                    f"The run exceeded its {deadline_seconds:g}s budget.")
+                    for _ in jobs]
     return {j["task_uuid"]: r for j, r in zip(jobs, results)}
 
 
@@ -232,7 +272,12 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
             clip = _prepare(db, timeline, shot)
             jobs.append({"prompt": clip.prompt_used,
                          "inputs": _photo_inputs(db, list(shot.photo_ids or [])),
-                         "task_uuid": clip.provider_task_uuid})
+                         "task_uuid": clip.provider_task_uuid,
+                         "duration": duration_for_kind(shot.kind),
+                         "clip_id": int(clip.id),
+                         # Already submitted means already billed. Such a clip
+                         # is only ever collected, never ordered again.
+                         "resume": already_submitted(clip)})
             by_task[clip.provider_task_uuid] = clip
         except RunwareError as exc:
             logger.warning("SHOT_PREPARE_FAILED shot=%s error=%s", shot.shot_uid, exc)
@@ -255,7 +300,9 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
                 len(jobs), settings.RUNWARE_MAX_CONCURRENCY,
                 options.duration, options.resolution, options.hdr)
     try:
-        results = asyncio.run(_generate_all(jobs, options.resolution, progress.heartbeat))
+        results = asyncio.run(_generate_all(
+            jobs, options.resolution, progress.heartbeat,
+            deadline_seconds=settings.RUNWARE_BATCH_DEADLINE_SECONDS))
     except Exception as exc:  # noqa: BLE001 - persist every shot as failed
         reason = f"generation batch failed: {exc}"
         logger.exception("RUNWARE_BATCH_FAILED count=%s", len(jobs))

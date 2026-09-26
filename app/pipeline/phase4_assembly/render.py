@@ -31,7 +31,8 @@ def assemble_timeline_film(db: Session, job_id: int, plan: list[dict],
             local = Path(work) / f"src{index:04d}.mp4"
             local.write_bytes(s3_client.download_bytes(item["s3_uri"]))
             shots.append({"path": str(local), "trim_start": item["trim_start"],
-                          "duration": item["duration"]})
+                          "duration": item["duration"],
+                          "source_seconds": item.get("source_seconds")})
 
         music_path = None
         if music_uri:
