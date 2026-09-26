@@ -93,6 +93,8 @@ class TimelineMusicRequest(BaseModel):
 class TimelineResponse(BaseModel):
     project_id: str
     timeline_id: Optional[int] = None
+    analysis_status: Optional[str] = None
+    analysis_ready: bool = False
     version: int = 0
     status: str = "draft"
     bpm: float = 100.0

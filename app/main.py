@@ -937,7 +937,9 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             photos=[photo(pid) for pid in (c.photo_ids or [])],
         ))
     return TimelineResponse(
-        project_id=project_id, timeline_id=timeline.id, version=timeline.version,
+        project_id=project_id, timeline_id=timeline.id,
+        analysis_status=timeline.job.status if timeline.job else None,
+        analysis_ready=True, version=timeline.version,
         status=timeline.status or "draft", bpm=timeline.bpm,
         beats_per_shot=timeline.beats_per_shot, shot_seconds=grid,
         source_seconds=TL_SOURCE_SECONDS, duration=timeline.total_duration or 0.0,
@@ -965,7 +967,27 @@ async def get_timeline(project_id: str, timeline_id: int | None = None,
     """The stored, editable timeline. Empty until one is materialised."""
     timeline = _timeline_for_project(db, project_id, timeline_id)
     if timeline is None:
-        return TimelineResponse(project_id=project_id, detail="No job for this project.")
+        job_id = _latest_job_id(db, project_id)
+        if job_id is None:
+            return TimelineResponse(
+                project_id=project_id,
+                detail="No analysis job for this listing. Run analysis first.",
+            )
+
+        job = db.get(Job, job_id)
+        status = str(job.status) if job and job.status else None
+        ready = status == "analysis_complete"
+        detail = (
+            "Analysis is ready. Create a video to build its timeline."
+            if ready
+            else f"Analysis is not ready yet ({status or 'unknown'})."
+        )
+        return TimelineResponse(
+            project_id=project_id,
+            analysis_status=status,
+            analysis_ready=ready,
+            detail=detail,
+        )
     return _timeline_payload(db, project_id, timeline)
 
 
