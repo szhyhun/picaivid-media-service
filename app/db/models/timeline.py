@@ -18,11 +18,12 @@ from app.db.base import Base
 # What we buy from the video provider per shot. Bigger than any beat length we
 # will ever cut, which is what makes trimming and retiming free.
 SOURCE_SECONDS = 5.0
-# A pair pins both ends of the move, so the provider has more to interpolate
-# and the longer buy is worth it. A single invents everything after the first
-# frame, and the further it runs the more it invents -- so we buy less of it.
+# Both kinds are bought at five seconds, because Ray 3.2 sells no other
+# length that keeps start/end keyframes. Kept as two names so the trim budget
+# follows the purchase automatically if a single ever moves to a model with
+# finer duration control.
 PAIR_SOURCE_SECONDS = 5.0
-SINGLE_SOURCE_SECONDS = 3.0
+SINGLE_SOURCE_SECONDS = 5.0
 
 
 def source_seconds_for(kind: str | None) -> float:

@@ -82,11 +82,10 @@ class Settings(BaseSettings):
     RUNWARE_API_KEY: str | None = None
     RUNWARE_API_URL: str = "https://api.runware.ai/v1"
     RUNWARE_MODEL: str = "luma:ray@3.2"
-    # A pair pins both ends, so the longer buy is interpolation we can use.
-    # A single invents everything after frame one, and the longer it runs the
-    # more it invents -- so we buy three seconds of it, not five.
-    RUNWARE_DURATION_SECONDS: int = 5              # pair_keyframes
-    RUNWARE_DURATION_SECONDS_SINGLE: int = 3       # single_image
+    # Every source clip is five seconds. Ray 3.2 permits 10s only without the
+    # HDR/keyframe combination used here, so there is deliberately no separate
+    # single-shot duration setting that could drift from the provider contract.
+    RUNWARE_DURATION_SECONDS: int = 5
     RUNWARE_RESOLUTION: str = "720p"
     RUNWARE_HDR: bool = True
     RUNWARE_EXR_EXPORT: bool = False
