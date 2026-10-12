@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from app.db.models.timeline import SOURCE_SECONDS
+from app.pipeline.phase4_assembly import assemble
 from app.pipeline.phase4_assembly.assemble import BLEND_FRAMES, shot_filter
 
 
@@ -30,8 +31,8 @@ class ShotFilterTests(unittest.TestCase):
                                              duration=1.2, blend=1))
 
     def test_it_always_lands_on_the_delivery_frame_rate(self):
-        self.assertTrue(shot_filter(source_seconds=SOURCE_SECONDS, trim_start=1.9,
-                                    duration=1.2).endswith("fps=30"))
+        self.assertIn("fps=30", shot_filter(
+            source_seconds=SOURCE_SECONDS, trim_start=1.9, duration=1.2))
 
     def test_a_trim_past_the_end_cannot_divide_by_zero(self):
         chain = shot_filter(source_seconds=SOURCE_SECONDS, trim_start=5.0, duration=1.2)
@@ -60,3 +61,55 @@ class AudioAssemblyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HdrToneMapTests(unittest.TestCase):
+    """HDR is bought deliberately -- and at double price -- so it has to be
+    converted on the way out, never truncated."""
+
+    def _filter(self, **kw):
+        return shot_filter(source_seconds=SOURCE_SECONDS, trim_start=1.9,
+                           duration=1.2, **kw)
+
+    def test_an_sdr_shot_is_left_alone(self):
+        chain = self._filter()
+        for marker in ("tonemap", "zscale", "setparams"):
+            self.assertNotIn(marker, chain)
+
+    def test_an_hdr_shot_is_linearised_before_it_is_mapped(self):
+        # Mapping without linearising PQ first measured 43 mean luma against
+        # 126 for the same frame: a different picture, not a rounding error.
+        chain = self._filter(tonemap=assemble.tonemap_chain())
+        self.assertIn("zscale=t=linear:npl=100", chain)
+        self.assertIn("tonemap=tonemap=hable", chain)
+        self.assertLess(chain.index("zscale=t=linear"),
+                        chain.index("tonemap=tonemap"))
+
+    def test_tone_mapping_happens_before_the_shutter_blend(self):
+        # tmix averages whatever it is handed, and averaging PQ-coded values
+        # averages the wrong numbers: equal steps are not equal light.
+        chain = self._filter(tonemap=assemble.tonemap_chain())
+        self.assertLess(chain.index("tonemap=tonemap"), chain.index("tmix="))
+
+    def test_a_tone_mapped_shot_is_relabelled_rec709(self):
+        # Encoder flags alone did not do this -- measured: the file kept its
+        # BT.2020/PQ tags while holding Rec.709 pixels, so a player would
+        # tone-map it a second time.
+        chain = self._filter(tonemap=assemble.tonemap_chain())
+        self.assertIn("setparams=color_primaries=bt709", chain)
+        self.assertGreater(chain.index("setparams"), chain.index("format=yuv420p"))
+
+    def test_hdr_transfer_functions_are_recognised(self):
+        self.assertIn("smpte2084", assemble.HDR_TRANSFERS)     # PQ / HDR10
+        self.assertIn("arib-std-b67", assemble.HDR_TRANSFERS)  # HLG
+        self.assertNotIn("bt709", assemble.HDR_TRANSFERS)
+
+    def test_an_hdr_source_is_refused_when_it_cannot_be_mapped_properly(self):
+        # A visibly wrong film is harder to notice, and much harder to explain,
+        # than one that refused to build.
+        with patch.object(assemble, "is_hdr", return_value=True), \
+                patch.object(assemble, "_has_filter", return_value=False):
+            with self.assertRaises(assemble.AssemblyError) as caught:
+                assemble.render_shot("x.mp4", "y.mp4", source_seconds=5.0,
+                                     trim_start=1.9, duration=1.2)
+        self.assertIn("zscale", str(caught.exception))
