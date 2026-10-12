@@ -60,6 +60,7 @@ from app.pipeline.phase3_timeline.materialize import (
 from app.schemas.timeline import (
     CandidateListResponse,
     CandidatePhoto,
+    CandidateVideo,
     TimelinePhoto,
     TimelineMusic,
     TimelineMusicRequest,
@@ -945,6 +946,7 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
             move_locked=bool(c.move_locked),
             generation_prompt=generation_prompt,
             video_url=_signed_url(c.clip.s3_uri) if c.clip else None,
+            source_clip_id=int(c.clip_id) if c.clip_id is not None else None,
             error=_clip_error(c),
             cost_usd=_clip_cost(c),
             photos=[photo(pid) for pid in (c.photo_ids or [])],
@@ -1112,13 +1114,27 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
 
     for index, incoming in enumerate(payload.shots):
         row = existing.get(incoming.shot_uid) if incoming.shot_uid else None
+        source_clip = None
+        if incoming.source_clip_id is not None:
+            allowed_statuses = ["complete", "rendered"] if row is not None else ["complete"]
+            source_clip = (db.query(Clip)
+                           .filter(Clip.id == int(incoming.source_clip_id),
+                                   Clip.job_id == job_id,
+                                   Clip.status.in_(allowed_statuses),
+                                   Clip.s3_uri.isnot(None))
+                           .first())
+            if source_clip is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="source_clip_id must be a completed video from this listing.",
+                )
         if row is None:
             # A photo dropped onto the timeline. It is a real row immediately --
             # duration comes from the beat grid, not from a video that does not
             # exist yet, so the schedule is correct before generation finishes.
-            restored_clip = None
+            restored_clip = source_clip
             shot_uid = incoming.shot_uid or str(uuid.uuid4())
-            if incoming.shot_uid:
+            if restored_clip is None and incoming.shot_uid:
                 # Undo can send back a shot_uid whose TimelineClip row was
                 # removed. Keep the identity stable and reuse the rendered
                 # Clip row when one exists, instead of turning the undo into a
@@ -1134,9 +1150,15 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
             row.room_id = incoming.room_id
             row.room_type = incoming.room_type
             row.act = incoming.act
-            row.move_label = incoming.move or "push in + pan right"
+            row.move_label = incoming.move or (
+                source_clip.motion_type if source_clip is not None else None
+            ) or "push in + pan right"
             if restored_clip is not None:
                 row.clip_id = restored_clip.id
+        elif source_clip is not None:
+            row.clip_id = source_clip.id
+            if not incoming.move:
+                row.move_label = source_clip.motion_type or row.move_label
         row.order_index = index
         incoming_ids = list(incoming.photo_ids)
         # Reversing the frames reverses the move. Detected here rather than
@@ -1278,7 +1300,7 @@ async def update_timeline_music(project_id: str, payload: TimelineMusicRequest,
          response_model=CandidateListResponse)
 async def get_timeline_candidates(project_id: str, timeline_id: int | None = None,
                                   db: Session = Depends(get_db)):
-    """Photos with no shot on the timeline, for the add-shot rail.
+    """Unused photos and reusable generated videos for the source-media rail.
 
     Each carries the verified partner it could form a pair shot with, when one
     exists and is also unused -- two real endpoints beat one, so the UI should
@@ -1291,6 +1313,8 @@ async def get_timeline_candidates(project_id: str, timeline_id: int | None = Non
     timeline = _timeline_for_project(db, project_id, timeline_id)
     used = {int(pid) for c in (timeline.timeline_clips if timeline else [])
             for pid in (c.photo_ids or [])}
+    used_clip_ids = {int(c.clip_id) for c in (timeline.timeline_clips if timeline else [])
+                     if c.clip_id is not None}
 
     photos = (db.query(JobPhoto)
               .filter(JobPhoto.job_id == job_id)
@@ -1314,12 +1338,44 @@ async def get_timeline_candidates(project_id: str, timeline_id: int | None = Non
                 partner[a] = b
                 partner[b] = a
 
+    video_clips = (db.query(Clip)
+                   .filter(Clip.job_id == job_id,
+                           Clip.status == "complete",
+                           Clip.s3_uri.isnot(None))
+                   .order_by(Clip.id.asc()).all())
+    video_clips = [clip for clip in video_clips if int(clip.id) not in used_clip_ids]
+    video_photo_ids = {
+        int(photo_id)
+        for clip in video_clips
+        for photo_id in (clip.source_photo_ids or [])
+    }
+    video_photo_rows = (db.query(JobPhoto)
+                        .filter(JobPhoto.id.in_(video_photo_ids)).all()
+                        if video_photo_ids else [])
+    video_photo_map = {int(photo.id): photo for photo in video_photo_rows}
+    videos = []
+    for clip in video_clips:
+        source_ids = [int(photo_id) for photo_id in (clip.source_photo_ids or [])]
+        first_photo = video_photo_map.get(source_ids[0]) if source_ids else None
+        videos.append(CandidateVideo(
+            id=int(clip.id),
+            video_url=_signed_url(clip.s3_uri),
+            thumbnail_url=_signed_url(first_photo.s3_uri) if first_photo else None,
+            duration=float(clip.duration or TL_SOURCE_SECONDS),
+            kind="pair_keyframes" if len(source_ids) == 2 else "single_image",
+            room_label=first_photo.room_label if first_photo else None,
+            room_id=None,
+            source_photo_ids=source_ids,
+            motion_type=clip.motion_type,
+        ))
+
     return CandidateListResponse(
         project_id=project_id,
         photos=[CandidatePhoto(id=int(p.id), thumbnail_url=_signed_url(p.s3_uri),
                                position=p.position, room_label=p.room_label,
                                pair_with=partner.get(int(p.id)))
                 for p in free],
+        videos=videos,
     )
 
 

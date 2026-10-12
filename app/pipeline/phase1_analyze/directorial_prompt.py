@@ -216,15 +216,30 @@ _OUTDOOR_TYPES = frozenset({"patio", "pool", "backyard", "exterior back"})
 # Applies to every shot. The reference pixels are the source of truth; the
 # camera path is the only intentional change. Keep this positive and concrete
 # rather than using a negative prompt, which some providers interpret poorly.
-_INVARIANTS = (
-    "Treat the supplied reference frame or frames as the complete visual source "
-    "of truth. Preserve the same scene identity and exact architecture, geometry, "
-    "proportions, object placement, lighting, and every visible furnishing, "
-    "fixture, surface, opening, reflection, shadow, and empty area exactly as "
-    "shown. Photorealistic. Perfectly stabilized motorized camera rig with a "
-    "level frame and straight verticals. The camera path is the only intentional "
-    "change; use one continuous, controlled move at constant speed."
-)
+def _invariants(kind: str | None = None) -> str:
+    """The constraints every shot carries, in the frame count it actually has.
+
+    Luma documents a 2-4 sentence target and warns that vague wording costs
+    precision, so this says each thing once: "use only what is visible" and
+    "treat it as the source of truth" were the same instruction twice over.
+    "Frame or frames" is resolved rather than hedged -- a single shot has one
+    reference and reads as nonsense when offered the choice.
+    """
+    if kind == "pair_keyframes":
+        source = ("the supplied reference frames, which are the complete "
+                  "visual source of truth for this shot")
+    else:
+        source = ("the supplied reference frame, which is the complete "
+                  "visual source of truth for this shot")
+    return (
+        f"Use only visual details visible in {source}. Preserve "
+        "the same scene identity and exact architecture, geometry, proportions, "
+        "object placement, lighting, and every visible furnishing, fixture, surface, "
+        "opening, reflection, shadow, and empty area exactly as shown. "
+        "Perfectly stabilized motorized camera rig with a level frame and straight "
+        "verticals. The camera path is the only intentional change; use one continuous, "
+        "controlled move at constant speed."
+    )
 
 
 def shot_class(room_type: str | None, *, is_close_up: bool = False,
@@ -403,15 +418,16 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     `shot` needs `room_type`, `kind`, `is_close_up`, `act` and `move`; both the
     in-memory `Shot` and a stored `TimelineClip` satisfy that.
     """
+    kind = getattr(shot, "kind", "single_image")
+
     override = getattr(shot, "prompt_override", None)
     if override and override.strip():
         # Custom motion text may replace the default direction, but never the
         # provider-safety contract shared by every shot.
-        return _with_note(shot, f"{override.strip()} {_INVARIANTS}")
+        return _with_note(shot, f"{override.strip()} {_invariants(kind)}")
 
     room_type = getattr(shot, "room_type", None)
     is_close_up = bool(getattr(shot, "is_close_up", False))
-    kind = getattr(shot, "kind", "single_image")
     act = getattr(shot, "act", None)
 
     cls = shot_class(room_type, is_close_up=is_close_up, act=act, is_last=is_last)
@@ -424,7 +440,9 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
         motion = (
             f"{speed}, smooth camera movement from the first reference frame "
             "to the second reference frame. "
-            "Follow the spatial path and framing change between those two views."
+            "Follow the spatial path and framing change between those two views. "
+            "Preserve both supplied endpoint compositions and interpolate only the "
+            "physical camera transition between them."
         )
     else:
         motion = _motion_sentence(
@@ -440,4 +458,4 @@ def build_shot_prompt(shot, *, squeeze_factor: float = 1.0,
     if cls == "detail" and subject:
         motion = f"Slow, straight push in toward the {subject.lower()}."
 
-    return _with_note(shot, f"{motion} {_INVARIANTS}")
+    return _with_note(shot, f"{motion} {_invariants(kind)}")

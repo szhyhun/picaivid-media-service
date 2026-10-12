@@ -77,23 +77,18 @@ RAY_FRAME_DURATION_SECONDS = 5
 
 
 def allowed_durations() -> frozenset[int]:
-    """The durations this deployment is configured to buy.
-
-    Validated as a set rather than a single constant so a typo is still caught
-    before a paid submission, while the two real lengths -- five seconds for a
-    pair, three for a single -- both pass.
-    """
-    return frozenset({
-        int(settings.RUNWARE_DURATION_SECONDS),
-        int(settings.RUNWARE_DURATION_SECONDS_SINGLE),
-    })
+    """The only duration this deployment is allowed to buy."""
+    return frozenset({RAY_FRAME_DURATION_SECONDS})
 
 
 def duration_for_kind(kind: str | None) -> int:
-    """Seconds of video to buy for one shot kind."""
-    return int(settings.RUNWARE_DURATION_SECONDS
-               if kind == "pair_keyframes"
-               else settings.RUNWARE_DURATION_SECONDS_SINGLE)
+    """Seconds of source video to buy for any shot kind."""
+    duration = int(settings.RUNWARE_DURATION_SECONDS)
+    if duration != RAY_FRAME_DURATION_SECONDS:
+        raise RunwareError(
+            f"Ray3.2 generation must use duration={RAY_FRAME_DURATION_SECONDS}; "
+            f"got {duration}.")
+    return duration
 HDR_RESOLUTIONS = frozenset({"720p", "1080p"})
 
 
@@ -133,11 +128,12 @@ def resolve_video_options(*, model: str | None = None,
         settings.RUNWARE_OUTPUT_QUALITY
         if output_quality is None else output_quality)
 
-    permitted = allowed_durations()
-    if duration_seconds not in permitted:
+    if duration_seconds not in allowed_durations():
         raise RunwareError(
-            f"Duration {duration_seconds}s is not one this deployment buys "
-            f"({sorted(permitted)}).")
+            f"Ray3.2 generation must use duration={RAY_FRAME_DURATION_SECONDS}; "
+            f"got {duration_seconds}.")
+    if not hdr_enabled:
+        raise RunwareError("This deployment requires HDR to be enabled for Ray3.2.")
     if hdr_enabled and resolution_name not in HDR_RESOLUTIONS:
         raise RunwareError(
             "Ray3.2 HDR requires resolution=720p or resolution=1080p.")

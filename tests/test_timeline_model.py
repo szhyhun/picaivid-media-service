@@ -80,15 +80,15 @@ class TrimTests(unittest.TestCase):
                          trim_start=0.0).max_duration(),
             PAIR_SOURCE_SECONDS)
 
-    def test_a_single_is_bought_shorter_than_a_pair(self):
-        # A single invents everything after its one frame, so we buy less of
-        # it. Its trim ceiling has to follow, or the editor would offer a
-        # window that runs off the end of the clip.
+    def test_single_and_pair_have_the_same_five_second_source(self):
+        # Both shot kinds use the same five-second Ray3.2 source. The editor
+        # cuts a shorter beat-length window from it rather than buying a
+        # different provider duration for singles.
         single = TimelineClip(order_index=0, kind="single_image", trim_start=0.0)
         pair = TimelineClip(order_index=1, kind="pair_keyframes", trim_start=0.0)
         self.assertAlmostEqual(single.max_duration(), SINGLE_SOURCE_SECONDS)
         self.assertAlmostEqual(pair.max_duration(), PAIR_SOURCE_SECONDS)
-        self.assertLess(single.max_duration(), pair.max_duration())
+        self.assertAlmostEqual(single.max_duration(), pair.max_duration())
 
     def test_every_usable_tempo_still_fits_inside_a_single(self):
         # The shorter buy is only safe while a two-beat window still fits in

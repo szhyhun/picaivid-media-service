@@ -122,9 +122,53 @@ def queued_shots(timeline: Timeline) -> list[TimelineClip]:
     ]
 
 
-def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
+def _clip_matches_request(clip: Clip, shot: TimelineClip, *, prompt: str,
+                          options) -> bool:
+    """Return whether a completed clip is byte-for-byte reusable for a shot.
+
+    A generated result is reusable only when the source photos, exact prompt,
+    model, and paid output settings all match. Position-dependent prompt rules
+    are included in ``prompt``, so moving a shot to a different editorial role
+    will correctly require a new generation.
+    """
+    metadata = clip.render_metadata or {}
+    return (
+        clip.status == "complete"
+        and bool(clip.s3_uri)
+        and clip.model_used == options.model
+        and clip.prompt_used == prompt
+        and list(clip.source_photo_ids or []) == list(shot.photo_ids or [])
+        and abs(float(clip.duration or 0.0) - float(options.duration)) < 1e-6
+        and metadata.get("resolution") == options.resolution
+        and bool(metadata.get("hdr")) == bool(options.hdr)
+        and bool(metadata.get("exr_export")) == bool(options.exr_export)
+        and int(metadata.get("output_quality", options.output_quality))
+        == int(options.output_quality)
+    )
+
+
+def _find_reusable_clip(db: Session, timeline: Timeline, shot: TimelineClip,
+                        *, prompt: str, options) -> Clip | None:
+    """Find an identical completed result from another video cut."""
+    candidates = (
+        db.query(Clip)
+        .filter(Clip.job_id == timeline.job_id,
+                Clip.status == "complete",
+                Clip.model_used == options.model)
+        .order_by(Clip.id.asc())
+        .all()
+    )
+    return next(
+        (candidate for candidate in candidates
+         if _clip_matches_request(candidate, shot, prompt=prompt, options=options)),
+        None,
+    )
+
+
+def _prepare(db: Session, timeline: Timeline, shot: TimelineClip, *,
+             resolution: str | None = None) -> Clip:
     """Create or reuse the Clip row, with its task id, before any network call."""
-    options = resolve_video_options()
+    options = resolve_video_options(resolution=resolution)
     if shot.clip_id and shot.clip and shot.clip.provider_task_uuid \
             and (shot.clip.status or "") not in {"failed"}:
         if shot.clip.model_used != options.model:
@@ -145,6 +189,15 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip) -> Clip:
         is_first=bool(first_uid) and shot.shot_uid == first_uid,
         is_last=bool(last_uid) and shot.shot_uid == last_uid,
         room_has_pair=shot.room_id in paired_room_ids)
+
+    reusable = _find_reusable_clip(
+        db, timeline, shot, prompt=prompt, options=options)
+    if reusable is not None:
+        shot.clip_id = reusable.id
+        db.flush()
+        logger.info("RUNWARE_REUSE clip=%s shot=%s source_shot=%s",
+                    reusable.id, shot.shot_uid, reusable.shot_uid)
+        return reusable
 
     clip = shot.clip if shot.clip_id else None
     if clip is None:
@@ -231,8 +284,14 @@ def queue_timeline_clips(db: Session, timeline: Timeline, *,
         shot for shot in pending_shots(timeline)
         if not wanted or shot.shot_uid in wanted
     ]
+    queued_uids = []
     for shot in shots:
-        clip = _prepare(db, timeline, shot)
+        clip = _prepare(db, timeline, shot, resolution=resolution)
+        # A matching result may already be complete and shared by another
+        # studio. Never move that shared Clip back to queued; doing so would
+        # make the other studio look like it needs generation again.
+        if clip.status == "complete" and clip.s3_uri:
+            continue
         clip.render_metadata = {
             **(clip.render_metadata or {}),
             "model": options.model,
@@ -240,11 +299,13 @@ def queue_timeline_clips(db: Session, timeline: Timeline, *,
             "resolution": options.resolution,
             "hdr": options.hdr,
             "exr_export": options.exr_export,
+            "output_quality": options.output_quality,
         }
         clip.status = "queued"
+        queued_uids.append(str(shot.shot_uid))
     if shots:
         db.commit()
-    return [str(shot.shot_uid) for shot in shots]
+    return queued_uids
 
 
 def generate_timeline_clips(db: Session, timeline: Timeline, *,
@@ -269,7 +330,7 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
     for shot in shots:
         progress.raise_if_cancelled()
         try:
-            clip = _prepare(db, timeline, shot)
+            clip = _prepare(db, timeline, shot, resolution=resolution)
             jobs.append({"prompt": clip.prompt_used,
                          "inputs": _photo_inputs(db, list(shot.photo_ids or [])),
                          "task_uuid": clip.provider_task_uuid,
@@ -340,6 +401,7 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
                     "resolution": options.resolution,
                     "hdr": options.hdr,
                     "exr_export": options.exr_export,
+                    "output_quality": options.output_quality,
                 }
                 done += 1
             except Exception as exc:               # noqa: BLE001 - store and move on

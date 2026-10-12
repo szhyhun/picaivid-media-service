@@ -58,6 +58,7 @@ class TimelineShot(BaseModel):
     generation_prompt: Optional[str] = None
 
     video_url: Optional[str] = None
+    source_clip_id: Optional[int] = None
     # Why this shot failed, in the provider's own words. A bare "failed" makes
     # every retry a guess: a timeout and a rejected key need different actions.
     error: Optional[str] = None
@@ -129,6 +130,7 @@ class TimelineShotUpdate(BaseModel):
     """One shot as the editor wants it. Unknown uids are created as planned."""
 
     shot_uid: Optional[str] = None
+    source_clip_id: Optional[int] = None
     photo_ids: list[int] = []
     kind: ShotKind = "single_image"
     room_id: Optional[str] = None
@@ -170,6 +172,21 @@ class CandidatePhoto(BaseModel):
     pair_with: Optional[int] = None
 
 
+class CandidateVideo(BaseModel):
+    """A completed generated clip reusable by another video cut."""
+
+    id: int
+    video_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    duration: float = 5.0
+    kind: ShotKind = "single_image"
+    room_label: Optional[str] = None
+    room_id: Optional[str] = None
+    source_photo_ids: list[int] = []
+    motion_type: Optional[str] = None
+
+
 class CandidateListResponse(BaseModel):
     project_id: str
     photos: list[CandidatePhoto] = []
+    videos: list[CandidateVideo] = []

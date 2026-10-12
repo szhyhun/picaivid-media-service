@@ -49,8 +49,44 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(second_clip.status, "queued")
         self.assertEqual(second_clip.render_metadata,
                          {"old": True, "model": "luma:ray@3.2", "duration": 5,
-                          "resolution": "1080p", "hdr": True, "exr_export": False})
+                          "resolution": "1080p", "hdr": True, "exr_export": False,
+                          "output_quality": 95})
         db.commit.assert_called_once()
+
+    def test_reused_complete_clip_is_not_queued_again(self):
+        shot = SimpleNamespace(shot_uid="second")
+        complete_clip = SimpleNamespace(status="complete", s3_uri="s3://bucket/clip.mp4")
+        db = MagicMock()
+
+        with patch.object(generate, "pending_shots", return_value=[shot]), \
+             patch.object(generate, "_prepare", return_value=complete_clip):
+            queued = generate.queue_timeline_clips(db, object())
+
+        self.assertEqual(queued, [])
+        self.assertEqual(complete_clip.status, "complete")
+        db.commit.assert_called_once()
+
+    def test_reuse_requires_the_exact_source_prompt_and_output_settings(self):
+        shot = SimpleNamespace(photo_ids=[1, 2])
+        options = SimpleNamespace(
+            model="luma:ray@3.2", duration=5, resolution="720p", hdr=True,
+            exr_export=False, output_quality=95,
+        )
+        clip = SimpleNamespace(
+            status="complete", s3_uri="s3://bucket/clip.mp4",
+            model_used="luma:ray@3.2", prompt_used="p",
+            source_photo_ids=[1, 2], duration=5,
+            render_metadata={
+                "resolution": "720p", "hdr": True, "exr_export": False,
+                "output_quality": 95,
+            },
+        )
+
+        self.assertTrue(generate._clip_matches_request(
+            clip, shot, prompt="p", options=options))
+        clip.prompt_used = "different"
+        self.assertFalse(generate._clip_matches_request(
+            clip, shot, prompt="p", options=options))
 
     def test_background_runner_only_claims_persisted_queue_entries(self):
         queued = SimpleNamespace(clip=SimpleNamespace(status="queued"))

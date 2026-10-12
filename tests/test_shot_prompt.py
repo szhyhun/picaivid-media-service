@@ -71,6 +71,7 @@ class PromptTests(unittest.TestCase):
     def test_every_prompt_uses_positive_stability_language(self):
         prompt = build_shot_prompt(_Shot())
         for rule in (
+            "Use only visual details visible in the supplied reference frame",
             "complete visual source of truth",
             "same scene identity and exact architecture",
             "every visible furnishing, fixture, surface, opening",
@@ -86,10 +87,14 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(prompt.count("architecture"), 1)
         self.assertEqual(prompt.count("object placement"), 1)
         self.assertNotIn("No ", prompt)
+        self.assertNotIn("Do not ", prompt)
+        self.assertNotIn("do not ", prompt)
+        self.assertNotIn("Photorealistic.", prompt)
 
     def test_pair_prompt_requests_stabilized_motion_without_changing_the_path(self):
         prompt = build_shot_prompt(_Shot(kind="pair_keyframes"))
         self.assertIn("from the first reference frame to the second reference frame", prompt)
+        self.assertIn("Preserve both supplied endpoint compositions", prompt)
         self.assertIn("constant speed", prompt)
         self.assertIn("Perfectly stabilized motorized camera rig", prompt)
         self.assertIn("object placement", prompt)
@@ -191,3 +196,34 @@ class PromptNoteTests(unittest.TestCase):
         # The safety contract survives an override, and the note still follows.
         self.assertIn('exact architecture', prompt)
         self.assertTrue(prompt.endswith('theirs'))
+
+
+class PromptEconomyTests(unittest.TestCase):
+    """Luma documents a 2-4 sentence target and penalises vague wording, so the
+    contract is said once and in the frame count the shot actually has."""
+
+    def test_the_source_of_truth_is_stated_once(self):
+        # "Use only what is visible" and "treat it as the source of truth" were
+        # the same instruction twice; repetition spends the sentence budget
+        # without adding a constraint.
+        prompt = build_shot_prompt(_Shot())
+        self.assertEqual(prompt.count("source of truth"), 1)
+        self.assertEqual(prompt.count("Use only visual details"), 1)
+
+    def test_a_single_shot_is_told_it_has_one_reference_frame(self):
+        prompt = build_shot_prompt(_Shot(kind="single_image"))
+        self.assertIn("the supplied reference frame, which is the complete", prompt)
+        self.assertNotIn("reference frame or frames", prompt)
+
+    def test_a_pair_is_told_it_has_two(self):
+        prompt = build_shot_prompt(_Shot(kind="pair_keyframes"))
+        self.assertIn("the supplied reference frames, which are the complete", prompt)
+        self.assertNotIn("reference frame or frames", prompt)
+
+    def test_an_overridden_prompt_still_carries_the_invariants(self):
+        # The override replaces the direction, never the safety contract -- and
+        # it needs the shot's own frame count like any other prompt.
+        prompt = build_shot_prompt(
+            _Shot(kind="pair_keyframes", prompt_override="Drift left past the window."))
+        self.assertTrue(prompt.startswith("Drift left past the window."))
+        self.assertIn("the supplied reference frames, which are", prompt)
