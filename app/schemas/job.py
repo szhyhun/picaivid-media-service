@@ -8,7 +8,7 @@ class JobMessage(BaseModel):
 
     Rails sends project_id. Python reads photos from Rails DB.
     """
-    action: str = "run"  # "run", "timeline_generate", or "timeline_assemble"
+    action: str = "run"  # "run", "timeline_generate", "timeline_film", or "timeline_assemble"
     project_id: str  # UUID from Rails projects table
     template_type: Optional[str] = None
     target_length: Optional[float] = None  # seconds

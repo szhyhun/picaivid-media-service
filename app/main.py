@@ -55,6 +55,7 @@ from app.pipeline.phase3_timeline.music import MusicAnalysisError, analyze_music
 from app.pipeline.phase3_timeline.materialize import (
     latest_timeline,
     materialize_timeline,
+    populate_timeline as populate_timeline_rows,
 )
 from app.schemas.timeline import (
     CandidateListResponse,
@@ -198,6 +199,17 @@ def _signed_url(s3_uri: str | None, expires_in: int = 3600) -> str | None:
     a Runware job can sit in a queue for minutes and then fetch the image."""
     key = _s3_key_from_uri(s3_uri)
     return s3_client.generate_presigned_url(key, expires_in=expires_in) if key else None
+
+
+def _music_preview_url(uri: str | None) -> str | None:
+    """Return a browser-readable, non-storage URI for the local editor."""
+    if not uri:
+        return None
+    if uri.startswith('s3://'):
+        return _signed_url(uri)
+    if uri.startswith(('https://', 'http://')):
+        return uri
+    return None
 
 
 def _photo_geometry_map(db: Session, job_id: int) -> dict[int, PhotoSceneGeometry]:
@@ -897,6 +909,7 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
                 bpm=timeline.bpm,
                 beat_offset=float((timeline.beat_grid or {}).get("beat_offset") or 0.0),
                 duration=_safe_float(music_meta.get("duration")),
+                preview_url=_music_preview_url(timeline.job.music_uri if timeline.job else None),
             )
     shots = []
     for index, c in enumerate(clips):
@@ -991,12 +1004,33 @@ async def get_timeline(project_id: str, timeline_id: int | None = None,
     return _timeline_payload(db, project_id, timeline)
 
 
+@app.delete("/api/projects/{project_id}/timeline")
+async def delete_timeline(project_id: str, timeline_id: int | None = None,
+                          db: Session = Depends(get_db)):
+    """Delete one saved studio timeline and its editable shot rows."""
+    timeline = _timeline_for_project(db, project_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+
+    deleted_id = int(timeline.id)
+    db.delete(timeline)
+    db.commit()
+    return {
+        "project_id": project_id,
+        "timeline_id": deleted_id,
+        "detail": "Timeline deleted.",
+    }
+
+
 @app.post("/api/projects/{project_id}/timeline", response_model=TimelineResponse)
 async def create_timeline(project_id: str, seconds: float = 45.0, bpm: float = 100.0,
                           force: bool = False, name: str | None = None,
+                          populate: bool = True,
                           db: Session = Depends(get_db)):
     """Materialise the computed shot line into an editable timeline.
 
+    The first video is populated from the analyzed rooms by default. Later
+    studio creation passes `populate=false` so the new cut starts blank.
     Returns the existing one unless `force` -- re-materialising discards manual
     arrangement, so it has to be asked for rather than happening on a refresh.
     """
@@ -1008,14 +1042,45 @@ async def create_timeline(project_id: str, seconds: float = 45.0, bpm: float = 1
     if existing is not None and not force:
         return _timeline_payload(db, project_id, existing)
 
+    rooms = []
+    if populate:
+        from scripts.build_shot_line import load_rooms
+        try:
+            rooms, _ = load_rooms(db, project_id)
+        except SystemExit as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    timeline = materialize_timeline(db, job_id, rooms,
+                                    target_seconds=seconds, bpm=bpm, name=name)
+    return _timeline_payload(db, project_id, timeline)
+
+
+@app.post("/api/projects/{project_id}/timeline/populate", response_model=TimelineResponse)
+async def populate_timeline(project_id: str, timeline_id: int | None = None,
+                            db: Session = Depends(get_db)):
+    """Fill one blank studio with the current analyzed shot plan."""
+    timeline = _timeline_for_project(db, project_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="No timeline to populate.")
+    if timeline.timeline_clips:
+        raise HTTPException(status_code=409,
+                            detail="Timeline already contains shots.")
+
     from scripts.build_shot_line import load_rooms
     try:
         rooms, _ = load_rooms(db, project_id)
     except SystemExit as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    timeline = materialize_timeline(db, job_id, rooms,
-                                    target_seconds=seconds, bpm=bpm, name=name)
+    grid = timeline.beat_grid or {}
+    target_seconds = _safe_float(grid.get("target_seconds")) or 45.0
+    timeline = populate_timeline_rows(
+        db,
+        timeline,
+        rooms,
+        target_seconds=target_seconds,
+        bpm=timeline.bpm,
+    )
     return _timeline_payload(db, project_id, timeline)
 
 

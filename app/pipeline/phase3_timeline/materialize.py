@@ -104,6 +104,32 @@ def materialize_timeline(db: Session, job_id: int, rooms, *,
     # session does not autoflush here.
     db.flush()
 
+    _write_line_clips(db, timeline, line)
+    db.commit()
+    db.refresh(timeline)
+    return timeline
+
+
+def populate_timeline(db: Session, timeline: Timeline, rooms, *,
+                      target_seconds: float, bpm: float) -> Timeline:
+    """Fill an existing blank timeline with the current automatic shot line.
+
+    Population is deliberately separate from materialisation. A later video
+    cut starts empty, and filling it must preserve that cut's timeline id so
+    Rails' studio record and all editor links remain stable.
+    """
+    if timeline.timeline_clips:
+        raise ValueError("Timeline already contains shots.")
+
+    line = build_line(db, rooms, target_seconds=target_seconds, bpm=bpm)
+    _write_line_clips(db, timeline, line)
+    db.commit()
+    db.refresh(timeline)
+    return timeline
+
+
+def _write_line_clips(db: Session, timeline: Timeline, line) -> None:
+    """Persist a computed line into a timeline and recalculate its timing."""
     for index, shot in enumerate(line.shots):
         db.add(TimelineClip(
             timeline_id=timeline.id,
@@ -136,6 +162,3 @@ def materialize_timeline(db: Session, job_id: int, rooms, *,
 
     db.flush()
     timeline.retime()
-    db.commit()
-    db.refresh(timeline)
-    return timeline

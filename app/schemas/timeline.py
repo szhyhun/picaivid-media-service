@@ -77,6 +77,9 @@ class TimelineMusic(BaseModel):
     bpm: float
     beat_offset: float = 0.0
     duration: Optional[float] = None
+    # Short-lived browser preview capability. The original storage URI stays
+    # internal, but the editor needs a playable source for local preview.
+    preview_url: Optional[str] = None
 
 
 class TimelineMusicRequest(BaseModel):

@@ -59,6 +59,7 @@ def run_timeline_generation(
     shot_uids: list[str] | None = None,
     resolution: str | None = None,
     timeline_id: int | None = None,
+    handoff_to_assembly: bool = False,
 ) -> dict:
     """Generate queued timeline shots without an HTTP/background-task path."""
     job, timeline = _job_and_timeline(db, project_id, timeline_id)
@@ -100,15 +101,18 @@ def run_timeline_generation(
         raise
 
     failed = int(result.get("failed", 0))
-    job.status = "failed" if failed else "timeline_complete"
+    job.status = "failed" if failed else (
+        "assembling" if handoff_to_assembly else "timeline_complete"
+    )
     job.error_message = "One or more shots failed." if failed else None
     db.commit()
-    notify_timeline_complete(
-        project_id,
-        requested=int(result.get("requested", 0)),
-        succeeded=int(result.get("succeeded", 0)),
-        failed=failed,
-    )
+    if not handoff_to_assembly:
+        notify_timeline_complete(
+            project_id,
+            requested=int(result.get("requested", 0)),
+            succeeded=int(result.get("succeeded", 0)),
+            failed=failed,
+        )
     logger.info(
         "TIMELINE_GENERATION_DONE project_id=%s requested=%s succeeded=%s failed=%s",
         project_id,
@@ -117,6 +121,36 @@ def run_timeline_generation(
         failed,
     )
     return result
+
+
+def run_timeline_film(
+    db: Session,
+    project_id: str,
+    *,
+    shot_uids: list[str] | None = None,
+    resolution: str | None = None,
+    timeline_id: int | None = None,
+) -> dict:
+    """Generate the requested shots and assemble the film in one CPU job."""
+    generation = run_timeline_generation(
+        db,
+        project_id,
+        shot_uids=shot_uids,
+        resolution=resolution,
+        timeline_id=timeline_id,
+        handoff_to_assembly=True,
+    )
+    if int(generation.get("failed", 0)):
+        return {"generation": generation, "assembled": False}
+
+    # A timeline with no pending shots still needs an explicit assembling
+    # status before the final render begins, so the single UI action has no
+    # misleading complete gap between its two internal phases.
+    job, _timeline = _job_and_timeline(db, project_id, timeline_id)
+    job.status = "assembling"
+    db.commit()
+    assembly = run_timeline_assembly(db, project_id, timeline_id=timeline_id)
+    return {"generation": generation, "assembly": assembly, "assembled": True}
 
 
 def run_timeline_assembly(db: Session, project_id: str, *, timeline_id: int | None = None) -> dict:

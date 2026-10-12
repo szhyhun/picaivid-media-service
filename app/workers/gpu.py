@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 def process_message(message: dict) -> None:
     """Process a GPU pipeline message from Rails."""
     action = message.get("action", "run")
-    if action in {"timeline_generate", "timeline_assemble"}:
+    if action in {"timeline_generate", "timeline_film", "timeline_assemble"}:
         raise RuntimeError(f"gpu worker cannot run timeline command {action}")
     if action != "run":
         logger.warning("Unknown GPU worker action: %s", action)

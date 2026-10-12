@@ -6,6 +6,7 @@ import logging
 from app.db.session import get_db_context
 from app.pipeline.phase3_timeline.worker_commands import (
     run_timeline_assembly,
+    run_timeline_film,
     run_timeline_generation,
 )
 from app.schemas.job import JobMessage
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 def process_message(message: dict) -> None:
     """Process a CPU queue command from Rails."""
     action = message.get("action", "run")
-    if action in {"timeline_generate", "timeline_assemble"}:
+    if action in {"timeline_generate", "timeline_film", "timeline_assemble"}:
         job_message = JobMessage(**message)
         with get_db_context() as db:
             if action == "timeline_generate":
@@ -28,6 +29,14 @@ def process_message(message: dict) -> None:
                 if job_message.timeline_id is not None:
                     kwargs["timeline_id"] = job_message.timeline_id
                 run_timeline_generation(db, job_message.project_id, **kwargs)
+            elif action == "timeline_film":
+                kwargs = {
+                    "shot_uids": job_message.shot_uids,
+                    "resolution": job_message.resolution,
+                }
+                if job_message.timeline_id is not None:
+                    kwargs["timeline_id"] = job_message.timeline_id
+                run_timeline_film(db, job_message.project_id, **kwargs)
             else:
                 if job_message.timeline_id is None:
                     run_timeline_assembly(db, job_message.project_id)

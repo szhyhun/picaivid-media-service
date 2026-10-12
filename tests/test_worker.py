@@ -44,6 +44,33 @@ class WorkerCommandTests(unittest.TestCase):
             resolution="720p",
         )
 
+    def test_timeline_film_command_runs_combined_cpu_workflow(self):
+        db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = db
+        context.__exit__.return_value = False
+
+        with patch.object(worker.settings, "WORKER_TYPE", "cpu"), patch.object(
+            cpu, "get_db_context", return_value=context
+        ), patch.object(cpu, "run_timeline_film") as run_film:
+            worker.process_message(
+                {
+                    "action": "timeline_film",
+                    "project_id": "project-1",
+                    "shot_uids": ["shot-1"],
+                    "resolution": "1080p",
+                    "timeline_id": 7,
+                }
+            )
+
+        run_film.assert_called_once_with(
+            db,
+            "project-1",
+            shot_uids=["shot-1"],
+            resolution="1080p",
+            timeline_id=7,
+        )
+
     def test_timeline_commands_are_not_run_by_gpu_worker(self):
         with patch.object(worker.settings, "WORKER_TYPE", "gpu"):
             with self.assertRaises(RuntimeError):
