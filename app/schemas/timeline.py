@@ -77,6 +77,11 @@ class TimelineMusic(BaseModel):
     title: str
     bpm: float
     beat_offset: float = 0.0
+    # Source position heard at film zero. Kept for older clients that only
+    # understand a left-shifted audio clip.
+    start_offset: Optional[float] = None
+    # Signed position of the full audio clip relative to film zero.
+    timeline_start: float = 0.0
     duration: Optional[float] = None
     # Short-lived browser preview capability. The original storage URI stays
     # internal, but the editor needs a playable source for local preview.
@@ -91,6 +96,7 @@ class TimelineMusicRequest(BaseModel):
     title: str = Field(default="Custom track", min_length=1, max_length=255)
     bpm: Optional[float] = Field(default=None, gt=20, lt=300)
     beat_offset: Optional[float] = Field(default=None, ge=0)
+    timeline_start: Optional[float] = None
     duration: Optional[float] = Field(default=None, gt=0)
 
 
@@ -156,6 +162,9 @@ class TimelineUpdateRequest(BaseModel):
     shots: list[TimelineShotUpdate]
     bpm: Optional[float] = None
     beats_per_shot: Optional[int] = None
+    # Signed audio clip position relative to film zero. It is intentionally
+    # part of the full timeline save so audio edits share Undo/Redo with shots.
+    music_timeline_start: Optional[float] = None
 
 
 class CandidatePhoto(BaseModel):

@@ -904,11 +904,14 @@ def _timeline_payload(db: Session, project_id: str, timeline) -> TimelineRespons
     if isinstance(music_meta, dict):
         source = music_meta.get("source")
         if source in {"catalog", "upload"}:
+            timeline_start = _safe_float(music_meta.get("timeline_start")) or 0.0
             music = TimelineMusic(
                 source=source,
                 title=str(music_meta.get("title") or "Custom track"),
                 bpm=timeline.bpm,
                 beat_offset=float((timeline.beat_grid or {}).get("beat_offset") or 0.0),
+                start_offset=max(0.0, -timeline_start),
+                timeline_start=timeline_start,
                 duration=_safe_float(music_meta.get("duration")),
                 preview_url=_music_preview_url(timeline.job.music_uri if timeline.job else None),
             )
@@ -1109,6 +1112,17 @@ async def update_timeline(project_id: str, payload: TimelineUpdateRequest,
             grid["beats_per_shot"] = payload.beats_per_shot
         timeline.beat_grid = grid
 
+    if payload.music_timeline_start is not None:
+        grid = dict(timeline.beat_grid or {})
+        music_meta = grid.get("music")
+        if isinstance(music_meta, dict):
+            music_meta = dict(music_meta)
+            timeline_start = float(payload.music_timeline_start)
+            music_meta["timeline_start"] = timeline_start
+            music_meta["start_offset"] = max(0.0, -timeline_start)
+            grid["music"] = music_meta
+            timeline.beat_grid = grid
+
     existing = {c.shot_uid: c for c in timeline.timeline_clips if c.shot_uid}
     keep: set[str] = set()
 
@@ -1276,6 +1290,7 @@ async def update_timeline_music(project_id: str, payload: TimelineMusicRequest,
             "source": payload.source,
             "title": title,
             "duration": duration,
+            "timeline_start": float(payload.timeline_start or 0.0),
         },
     })
     timeline.beat_grid = grid
