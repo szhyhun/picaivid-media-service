@@ -144,7 +144,8 @@ class ClipStorageTimingTests(unittest.TestCase):
                 patch.object(gen.s3_client, "upload_bytes", upload), \
                 patch.object(gen, "claim_for_submit", lambda *_a, **_k: True):
             return asyncio.run(gen._run_one(
-                None, asyncio.Semaphore(1), prompt="p", inputs=["a.jpg"],
+                None, asyncio.Semaphore(1), asyncio.Semaphore(1),
+                prompt="p", inputs=["a.jpg"],
                 task_uuid="t-1", resolution="720p", duration=5, clip_id=1,
                 s3_key="jobs/1/clips/s1.mp4", resume=False, on_tick=None))
 
@@ -168,3 +169,47 @@ class ClipStorageTimingTests(unittest.TestCase):
         self.assertIsNone(outcome.s3_uri)
         self.assertIn("404", outcome.store_error)
         self.assertTrue(outcome.result.ok)
+
+
+class SubmissionGateTests(unittest.TestCase):
+    """Waiting on a queued task must not hold a submission slot."""
+
+    def test_every_shot_is_submitted_before_any_of_them_finishes(self):
+        # The gate used to wrap submit *and* poll, so only four shots were ever
+        # queued at Runware at once and a 24-shot listing ran as six waves.
+        # Submission is a request; waiting is their GPU time, not our quota.
+        gen = importlib.import_module("app.pipeline.phase3_timeline.generate")
+        submitted, finished = [], []
+
+        async def fake_generate(_client, *, task_uuid, submit_gate=None, **_kw):
+            async with submit_gate:
+                submitted.append(task_uuid)
+            # Every shot waits until all of them have been submitted. With a
+            # gate around the wait this deadlocks; without one it completes.
+            while len(submitted) < 6:
+                await asyncio.sleep(0.01)
+            finished.append(task_uuid)
+            return SimpleNamespace(ok=True, video_url="u", seed=1,
+                                   video_uuid="v", cost=0.1, error=None)
+
+        async def drive():
+            submit_gate = asyncio.Semaphore(2)
+            store_gate = asyncio.Semaphore(2)
+            return await asyncio.gather(*[
+                gen._run_one(None, submit_gate, store_gate, prompt="p",
+                             inputs=["a.jpg"], task_uuid=f"t-{i}",
+                             resolution="720p", duration=5, clip_id=i,
+                             s3_key=f"k{i}.mp4", resume=False, on_tick=None)
+                for i in range(6)
+            ])
+
+        with patch.object(gen, "generate_video", fake_generate), \
+                patch.object(gen, "_download_video", lambda _u: b"x"), \
+                patch.object(gen.s3_client, "upload_bytes",
+                             lambda k, d, c: f"s3://b/{k}"), \
+                patch.object(gen, "claim_for_submit", lambda *_a, **_k: True):
+            outcomes = asyncio.run(asyncio.wait_for(drive(), timeout=5))
+
+        self.assertEqual(len(submitted), 6)
+        self.assertEqual(len(finished), 6)
+        self.assertTrue(all(o.s3_uri for o in outcomes))

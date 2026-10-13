@@ -54,6 +54,10 @@ class VideoResult:
     seed: int | None = None
     cost: float | None = None
     error: str | None = None
+    # True when we stopped waiting rather than the provider stopping work.
+    # The task may still be running, and it has already been charged for, so
+    # it must be polled again rather than bought again.
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
@@ -316,13 +320,15 @@ async def poll_video(client: httpx.AsyncClient, task_uuid: str, *,
         await asyncio.sleep(min(delay, remaining))
         delay = min(delay * 1.5, 20.0)
 
-    return VideoResult(task_uuid=task_uuid, video_url=None,
-                       error=(f"Timed out after {max_wait:g}s and {polls} polls."))
+    return VideoResult(
+        task_uuid=task_uuid, video_url=None, timed_out=True,
+        error=(f"Timed out after {max_wait:g}s and {polls} polls."))
 
 
 async def generate_video(client: httpx.AsyncClient, *, prompt: str,
                          photo_urls: list[str], task_uuid: str,
-                         on_tick=None, claim=None, **kwargs) -> VideoResult:
+                         on_tick=None, claim=None, submit_gate=None,
+                         **kwargs) -> VideoResult:
     """Submit one shot and wait for it.
 
     `claim` is called immediately before the submit and must return True for
@@ -341,5 +347,16 @@ async def generate_video(client: httpx.AsyncClient, *, prompt: str,
 
     task = build_video_task(prompt=prompt, photo_urls=photo_urls,
                             task_uuid=task_uuid, **kwargs)
-    await submit_video(client, task)
+    # The gate belongs around the submit alone. Runware's guidance of a few
+    # concurrent requests is about requests; with deliveryMethod async a submit
+    # returns as soon as the task is queued, and the generation then runs on
+    # their side. Holding the gate through the poll would cap how many of our
+    # shots are queued there at once -- which is us rationing their queue
+    # rather than our own, and it is the whole difference between one wave and
+    # six.
+    if submit_gate is not None:
+        async with submit_gate:
+            await submit_video(client, task)
+    else:
+        await submit_video(client, task)
     return await poll_video(client, task_uuid, on_tick=on_tick)

@@ -183,8 +183,18 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip, *,
              resolution: str | None = None) -> Clip:
     """Create or reuse the Clip row, with its task id, before any network call."""
     options = resolve_video_options(resolution=resolution)
+    # A failed clip is normally a fresh purchase. The exception is one whose
+    # provider task is still alive -- we timed out waiting, or we could not
+    # download what it produced. That task was paid for the moment it was
+    # submitted, so retrying it means polling it again, never buying a second
+    # one. Without this, the faster submission path below turns every slow
+    # shot into a second charge.
+    resumable = (shot.clip is not None
+                 and shot.clip.provider_task_uuid
+                 and already_submitted(shot.clip)
+                 and bool((shot.clip.render_metadata or {}).get("provider_task_alive")))
     if shot.clip_id and shot.clip and shot.clip.provider_task_uuid \
-            and (shot.clip.status or "") not in {"failed"}:
+            and ((shot.clip.status or "") not in {"failed"} or resumable):
         if shot.clip.model_used != options.model:
             raise RunwareError(
                 f"Cannot resume shot {shot.shot_uid} with model "
@@ -240,34 +250,44 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip, *,
     return clip
 
 
-async def _run_one(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
+async def _run_one(client: httpx.AsyncClient, submit_gate: asyncio.Semaphore,
+                   store_gate: asyncio.Semaphore,
                    *, prompt: str, inputs: list[str], task_uuid: str,
                    resolution: str | None, duration: int, clip_id: int,
                    s3_key: str, resume: bool, on_tick) -> ShotOutcome:
-    async with semaphore:
-        if resume:
-            # This clip carries a submission timestamp, so it has already been
-            # charged for. Collect it; never buy it twice.
-            logger.info("RUNWARE_RESUME task=%s -- already submitted, polling only",
-                        task_uuid)
-            result = await poll_video(client, task_uuid, on_tick=on_tick)
-        else:
-            result = await generate_video(
-                client, prompt=prompt, photo_urls=inputs, task_uuid=task_uuid,
-                resolution=resolution, duration=duration, on_tick=on_tick,
-                claim=lambda: claim_for_submit(clip_id))
+    """Submit, wait, and store one shot.
 
-        if not getattr(result, "ok", False):
-            return ShotOutcome(result=result)
+    Nothing here holds a gate while it waits. Submission is gated because that
+    is a request to Runware and their guidance is a few at a time; waiting is
+    not gated, because every shot that is waiting is a shot already queued on
+    their GPUs, and capping that caps *their* parallelism rather than ours.
+    """
+    if resume:
+        # This clip carries a submission timestamp, so it has already been
+        # charged for. Collect it; never buy it twice.
+        logger.info("RUNWARE_RESUME task=%s -- already submitted, polling only",
+                    task_uuid)
+        result = await poll_video(client, task_uuid, on_tick=on_tick)
+    else:
+        result = await generate_video(
+            client, prompt=prompt, photo_urls=inputs, task_uuid=task_uuid,
+            resolution=resolution, duration=duration, on_tick=on_tick,
+            submit_gate=submit_gate,
+            claim=lambda: claim_for_submit(clip_id))
 
-        # Fetch and store here, while the URL is minutes old rather than hours.
-        # Collecting every clip in a pass after the batch meant the first shot's
-        # provider URL sat unused for the length of the entire run, and a
-        # provider URL that expires before we reach it loses a clip we paid for.
-        #
-        # Both calls are blocking (httpx.get, then boto3), so they go to a
-        # worker thread: running them on the event loop would stall every other
-        # shot's polling for the length of a download.
+    if not getattr(result, "ok", False):
+        return ShotOutcome(result=result)
+
+    # Fetch and store here, while the URL is minutes old rather than hours.
+    # Collecting every clip in a pass after the batch meant the first shot's
+    # provider URL sat unused for the length of the entire run, and a provider
+    # URL that expires before we reach it loses a clip we paid for.
+    #
+    # Both calls are blocking (httpx.get, then boto3), so they go to a worker
+    # thread: on the event loop a single download would stall every other
+    # shot's polling. The gate keeps a finished batch from pulling two dozen
+    # videos down at once.
+    async with store_gate:
         try:
             data = await asyncio.to_thread(_download_video, result.video_url)
             uri = await asyncio.to_thread(
@@ -280,10 +300,15 @@ async def _run_one(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
 
 async def _generate_all(jobs: list[dict], resolution: str | None, on_tick,
                         *, deadline_seconds: float | None = None) -> dict[str, object]:
-    semaphore = asyncio.Semaphore(max(1, settings.RUNWARE_MAX_CONCURRENCY))
+    # Two separate limits. Submissions respect Runware's request guidance;
+    # downloads are bounded so a batch finishing together cannot pull two dozen
+    # videos at once. Waiting on a queued task is bounded by neither.
+    submit_gate = asyncio.Semaphore(max(1, settings.RUNWARE_MAX_CONCURRENCY))
+    store_gate = asyncio.Semaphore(max(1, settings.RUNWARE_MAX_DOWNLOADS))
     async with httpx.AsyncClient(timeout=60.0) as client:
         pending = asyncio.gather(*[
-            _run_one(client, semaphore, prompt=j["prompt"], inputs=j["inputs"],
+            _run_one(client, submit_gate, store_gate,
+                     prompt=j["prompt"], inputs=j["inputs"],
                      task_uuid=j["task_uuid"], resolution=resolution,
                      duration=j["duration"], clip_id=j["clip_id"],
                      s3_key=j["s3_key"], resume=j["resume"], on_tick=on_tick)
@@ -423,14 +448,21 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
             reason = (str(outcome) if isinstance(outcome, Exception)
                       else (getattr(result, "error", None) or "unknown"))
             clip.status = "failed"
-            clip.render_metadata = {**(clip.render_metadata or {}), "error": reason}
+            clip.render_metadata = {
+                **(clip.render_metadata or {}),
+                "error": reason,
+                # A timeout means we stopped waiting, not that the provider
+                # stopped working. That task is alive and already charged for.
+                "provider_task_alive": bool(getattr(result, "timed_out", False)),
+            }
             failed += 1
             logger.warning("SHOT_FAILED task=%s error=%s", task_uuid, reason)
         elif store_error:
             # The clip exists and was paid for; only our copy of it failed.
             clip.status = "failed"
             clip.render_metadata = {**(clip.render_metadata or {}),
-                                    "error": f"result download failed: {store_error}"}
+                                    "error": f"result download failed: {store_error}",
+                                    "provider_task_alive": True}
             failed += 1
         else:
             try:

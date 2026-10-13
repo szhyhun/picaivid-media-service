@@ -98,7 +98,13 @@ class Settings(BaseSettings):
     RUNWARE_INPUT_MODE: str = "auto"
     # Runware publishes no hard rate limit but queues dynamically; their own
     # guidance is 2-4 concurrent for best throughput.
+    # Concurrent *submissions*, per Runware's "2-4 concurrent requests"
+    # guidance. It does not cap how many shots wait on their queue at once:
+    # with deliveryMethod async a submit returns as soon as the task is
+    # queued, so every shot is generating on their side regardless.
     RUNWARE_MAX_CONCURRENCY: int = 4
+    # Concurrent downloads of finished clips. A batch tends to finish together.
+    RUNWARE_MAX_DOWNLOADS: int = 4
     RUNWARE_POLL_INTERVAL_SECONDS: float = 5.0
     # A provider task may take 1-20 minutes. The wall-clock limit is the real
     # safety valve; attempts remain a second guard if the poll interval changes.

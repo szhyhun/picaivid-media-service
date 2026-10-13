@@ -138,3 +138,45 @@ class SubmitGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimedOutRetryTests(unittest.TestCase):
+    """Giving up on the wait is not permission to buy the shot again."""
+
+    def _clip(self, **meta):
+        return SimpleNamespace(
+            id=1, provider_task_uuid="t-1", status="failed",
+            provider_submitted_at=datetime.utcnow(), model_used="luma:ray@3.2",
+            render_metadata=meta)
+
+    def _resumable(self, clip):
+        from app.services.runware.billing_guard import already_submitted
+        return bool(clip.provider_task_uuid
+                    and already_submitted(clip)
+                    and (clip.render_metadata or {}).get("provider_task_alive"))
+
+    def test_a_timed_out_shot_is_resumed_not_rebought(self):
+        # We stopped waiting; Runware did not stop working. The task is alive
+        # and was charged for at submission.
+        self.assertTrue(self._resumable(self._clip(provider_task_alive=True)))
+
+    def test_a_shot_whose_video_we_failed_to_download_is_resumed(self):
+        # It generated and was billed; only our copy is missing.
+        self.assertTrue(self._resumable(self._clip(provider_task_alive=True,
+                                                   error="result download failed: 404")))
+
+    def test_a_shot_the_provider_rejected_may_be_bought_again(self):
+        # A terminal provider error means that task is dead, so a retry is a
+        # genuine new purchase rather than a second charge for the same work.
+        self.assertFalse(self._resumable(self._clip(provider_task_alive=False,
+                                                    error="invalid input image")))
+
+    def test_timed_out_results_are_flagged_as_still_alive(self):
+        result = rw.VideoResult(task_uuid="t", video_url=None, timed_out=True,
+                                error="Timed out after 1800s and 90 polls.")
+        self.assertFalse(result.ok)
+        self.assertTrue(result.timed_out)
+        # A provider-side rejection is the opposite case.
+        rejected = rw.VideoResult(task_uuid="t", video_url=None,
+                                  error="Runware rejected the task.")
+        self.assertFalse(rejected.timed_out)
