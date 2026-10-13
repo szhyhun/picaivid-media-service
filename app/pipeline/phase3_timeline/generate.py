@@ -321,34 +321,86 @@ async def _run_one(client: httpx.AsyncClient, submit_gate: asyncio.Semaphore,
 
 
 async def _generate_all(jobs: list[dict], resolution: str | None, on_tick,
-                        *, deadline_seconds: float | None = None) -> dict[str, object]:
+                        *, deadline_seconds: float | None = None,
+                        on_result=None) -> dict[str, object]:
     # Two separate limits. Submissions respect Runware's request guidance;
     # downloads are bounded so a batch finishing together cannot pull two dozen
     # videos at once. Waiting on a queued task is bounded by neither.
-    submit_gate = asyncio.Semaphore(max(1, settings.RUNWARE_MAX_CONCURRENCY))
+    submit_gate = asyncio.Semaphore(max(1, settings.RUNWARE_SUBMIT_CONCURRENCY))
     store_gate = asyncio.Semaphore(max(1, settings.RUNWARE_MAX_DOWNLOADS))
     async with httpx.AsyncClient(timeout=60.0) as client:
-        pending = asyncio.gather(*[
-            _run_one(client, submit_gate, store_gate,
-                     prompt=j["prompt"], inputs=j["inputs"],
-                     task_uuid=j["task_uuid"], resolution=resolution,
-                     duration=j["duration"], clip_id=j["clip_id"],
-                     s3_key=j["s3_key"], resume=j["resume"], on_tick=on_tick)
-            for j in jobs
-        ], return_exceptions=True)
-        if not deadline_seconds:
-            results = await pending
-        else:
-            try:
+        tasks = {
+            asyncio.create_task(
+                _run_one(
+                    client,
+                    submit_gate,
+                    store_gate,
+                    prompt=job["prompt"],
+                    inputs=job["inputs"],
+                    task_uuid=job["task_uuid"],
+                    resolution=resolution,
+                    duration=job["duration"],
+                    clip_id=job["clip_id"],
+                    s3_key=job["s3_key"],
+                    resume=job["resume"],
+                    on_tick=on_tick,
+                )
+            ): job["task_uuid"]
+            for job in jobs
+        }
+        results: dict[str, object] = {}
+
+        async def collect() -> None:
+            while tasks:
+                finished, _ = await asyncio.wait(
+                    tuple(tasks), return_when=asyncio.FIRST_COMPLETED)
+                for task in finished:
+                    task_uuid = tasks.pop(task)
+                    try:
+                        outcome = task.result()
+                    except asyncio.CancelledError as exc:
+                        outcome = exc
+                    except Exception as exc:  # noqa: BLE001 - one shot must not cancel its peers
+                        outcome = exc
+                    results[task_uuid] = outcome
+                    if on_result is not None:
+                        try:
+                            on_result(task_uuid, outcome)
+                        except Exception:  # noqa: BLE001 - persistence is retried after collection
+                            logger.exception("SHOT_RESULT_CALLBACK_FAILED task=%s", task_uuid)
+
+        try:
+            if deadline_seconds:
                 # A per-shot cap is not a cap on the run: enough slow shots in
                 # sequence keep a worker (and its SQS message) alive for hours.
-                results = await asyncio.wait_for(pending, timeout=deadline_seconds)
-            except asyncio.TimeoutError:
-                pending.cancel()
-                results = [BatchDeadlineExceeded(
-                    f"The run exceeded its {deadline_seconds:g}s budget.")
-                    for _ in jobs]
-    return {j["task_uuid"]: r for j, r in zip(jobs, results)}
+                await asyncio.wait_for(collect(), timeout=deadline_seconds)
+            else:
+                await collect()
+        except asyncio.TimeoutError:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            deadline_error = BatchDeadlineExceeded(
+                f"The run exceeded its {deadline_seconds:g}s budget.")
+            for job in jobs:
+                task_uuid = job["task_uuid"]
+                if task_uuid in results:
+                    continue
+                results[task_uuid] = deadline_error
+                if on_result is not None:
+                    try:
+                        on_result(task_uuid, deadline_error)
+                    except Exception:  # noqa: BLE001 - persistence is retried after collection
+                        logger.exception("SHOT_RESULT_CALLBACK_FAILED task=%s", task_uuid)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    return {job["task_uuid"]: results[job["task_uuid"]] for job in jobs}
 
 
 def queue_timeline_clips(db: Session, timeline: Timeline, *,
@@ -441,59 +493,46 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
     logger.info("RUNWARE_BATCH_START model=%s count=%s concurrency=%s "
                 "duration=%ss resolution=%s hdr=%s",
                 options.model,
-                len(jobs), settings.RUNWARE_MAX_CONCURRENCY,
+                len(jobs), settings.RUNWARE_SUBMIT_CONCURRENCY,
                 options.duration, options.resolution, options.hdr)
-    try:
-        results = asyncio.run(_generate_all(
-            jobs, options.resolution, progress.heartbeat,
-            deadline_seconds=settings.RUNWARE_BATCH_DEADLINE_SECONDS))
-    except Exception as exc:  # noqa: BLE001 - persist every shot as failed
-        reason = f"generation batch failed: {exc}"
-        logger.exception("RUNWARE_BATCH_FAILED count=%s", len(jobs))
-        for clip in by_task.values():
-            clip.status = "failed"
-            # Nothing came back, so nothing says these tasks died. Several of
-            # them were submitted and billed before the batch fell over.
-            clip.render_metadata = {
-                **(clip.render_metadata or {}),
-                "error": reason,
-                "provider_task_alive": _task_may_still_exist(clip, None),
-            }
-        db.commit()
-        failed += len(jobs)
-        progress.update(failed, total_requested, "Generating clips")
-        return {"requested": total_requested, "succeeded": 0, "failed": failed}
-
     done = 0
-    # Nothing here touches the network any more: every clip was downloaded and
-    # stored by its own task. This loop only writes what happened, which is why
-    # it can safely hold the one database session.
-    for task_uuid, outcome in results.items():
-        clip = by_task[task_uuid]
+    persisted_tasks: set[str] = set()
+
+    def persist_outcome(task_uuid: str, outcome: object) -> None:
+        """Commit one shot immediately, while the rest keep running."""
+        nonlocal done, failed
+        if task_uuid in persisted_tasks:
+            return
+        clip = by_task.get(task_uuid)
+        if clip is None:
+            return
+
         result = getattr(outcome, "result", None)
         store_error = getattr(outcome, "store_error", None)
-        if isinstance(outcome, Exception) or not getattr(result, "ok", False):
-            reason = (str(outcome) if isinstance(outcome, Exception)
-                      else (getattr(result, "error", None) or "unknown"))
-            clip.status = "failed"
-            clip.render_metadata = {
-                **(clip.render_metadata or {}),
-                "error": reason,
-                "provider_task_alive": _task_may_still_exist(clip, result),
-            }
-            failed += 1
-            logger.warning("SHOT_FAILED task=%s error=%s", task_uuid, reason)
-        elif store_error:
-            # The clip exists and was paid for; only our copy of it failed.
-            clip.status = "failed"
-            clip.render_metadata = {
-                **(clip.render_metadata or {}),
-                "error": f"result download failed: {store_error}",
-                "provider_task_alive": _task_may_still_exist(clip, result),
-            }
-            failed += 1
-        else:
-            try:
+        completed = False
+        failed_one = False
+        try:
+            if isinstance(outcome, Exception) or not getattr(result, "ok", False):
+                reason = (str(outcome) if isinstance(outcome, Exception)
+                          else (getattr(result, "error", None) or "unknown"))
+                clip.status = "failed"
+                clip.render_metadata = {
+                    **(clip.render_metadata or {}),
+                    "error": reason,
+                    "provider_task_alive": _task_may_still_exist(clip, result),
+                }
+                failed_one = True
+                logger.warning("SHOT_FAILED task=%s error=%s", task_uuid, reason)
+            elif store_error:
+                # The clip exists and was paid for; only our copy of it failed.
+                clip.status = "failed"
+                clip.render_metadata = {
+                    **(clip.render_metadata or {}),
+                    "error": f"result download failed: {store_error}",
+                    "provider_task_alive": _task_may_still_exist(clip, result),
+                }
+                failed_one = True
+            else:
                 clip.s3_uri = outcome.s3_uri
                 clip.status = "complete"
                 clip.seed = result.seed
@@ -508,14 +547,49 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
                     "exr_export": options.exr_export,
                     "output_quality": options.output_quality,
                 }
-                done += 1
-            except Exception as exc:               # noqa: BLE001 - store and move on
-                clip.status = "failed"
-                clip.render_metadata = {**(clip.render_metadata or {}),
-                                        "error": f"result download failed: {exc}"}
-                failed += 1
-        db.commit()
+                completed = True
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - retry once collection ends
+            db.rollback()
+            logger.exception("SHOT_STATUS_WRITE_FAILED task=%s error=%s",
+                             task_uuid, exc)
+            return
+
+        persisted_tasks.add(task_uuid)
+        done += int(completed)
+        failed += int(failed_one)
         progress.update(done + failed, total_requested, "Generating clips")
+
+    try:
+        results = asyncio.run(_generate_all(
+            jobs, options.resolution, progress.heartbeat,
+            deadline_seconds=settings.RUNWARE_BATCH_DEADLINE_SECONDS,
+            on_result=persist_outcome))
+    except Exception as exc:  # noqa: BLE001 - persist every shot as failed
+        reason = f"generation batch failed: {exc}"
+        logger.exception("RUNWARE_BATCH_FAILED count=%s", len(jobs))
+        remaining = [
+            (task_uuid, clip) for task_uuid, clip in by_task.items()
+            if task_uuid not in persisted_tasks
+        ]
+        for _task_uuid, clip in remaining:
+            clip.status = "failed"
+            # Nothing came back, so nothing says these tasks died. Several of
+            # them were submitted and billed before the batch fell over.
+            clip.render_metadata = {
+                **(clip.render_metadata or {}),
+                "error": reason,
+                "provider_task_alive": _task_may_still_exist(clip, None),
+            }
+        db.commit()
+        failed += len(remaining)
+        progress.update(done + failed, total_requested, "Generating clips")
+        return {"requested": total_requested, "succeeded": done, "failed": failed}
+
+    # The callback normally handled every shot as it completed. This second
+    # pass is a recovery path for a database write that failed during polling.
+    for task_uuid, outcome in results.items():
+        persist_outcome(task_uuid, outcome)
 
     logger.info("RUNWARE_BATCH_DONE succeeded=%s failed=%s", done, failed)
     return {"requested": total_requested, "succeeded": done, "failed": failed}

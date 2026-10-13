@@ -1,5 +1,6 @@
 """Application configuration loaded from environment variables."""
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -96,13 +97,17 @@ class Settings(BaseSettings):
     # request. `auto` uses URLs in production but switches to data URIs for
     # a private local MinIO endpoint that Runware cannot reach.
     RUNWARE_INPUT_MODE: str = "auto"
-    # Runware publishes no hard rate limit but queues dynamically; their own
-    # guidance is 2-4 concurrent for best throughput.
-    # Concurrent *submissions*, per Runware's "2-4 concurrent requests"
-    # guidance. It does not cap how many shots wait on their queue at once:
-    # with deliveryMethod async a submit returns as soon as the task is
-    # queued, so every shot is generating on their side regardless.
-    RUNWARE_MAX_CONCURRENCY: int = 4
+    # Runware publishes no hard rate limit but queues dynamically. This limits
+    # only simultaneous submit HTTP requests; async generation and polling are
+    # not held behind this gate. Keep the old env name as a compatibility alias
+    # for already-deployed workers.
+    RUNWARE_SUBMIT_CONCURRENCY: int = Field(
+        default=4,
+        validation_alias=AliasChoices(
+            "RUNWARE_SUBMIT_CONCURRENCY",
+            "RUNWARE_MAX_CONCURRENCY",
+        ),
+    )
     # Concurrent downloads of finished clips. A batch tends to finish together.
     RUNWARE_MAX_DOWNLOADS: int = 4
     RUNWARE_POLL_INTERVAL_SECONDS: float = 5.0

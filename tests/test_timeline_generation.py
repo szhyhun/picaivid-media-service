@@ -213,3 +213,39 @@ class SubmissionGateTests(unittest.TestCase):
         self.assertEqual(len(submitted), 6)
         self.assertEqual(len(finished), 6)
         self.assertTrue(all(o.s3_uri for o in outcomes))
+
+
+class CompletionCallbackTests(unittest.TestCase):
+    """A completed shot is observable before slower peers finish."""
+
+    def test_result_callback_runs_for_each_shot_during_collection(self):
+        gen = importlib.import_module("app.pipeline.phase3_timeline.generate")
+        jobs = [
+            {
+                "prompt": "p",
+                "inputs": ["a.jpg"],
+                "task_uuid": f"t-{index}",
+                "duration": 5,
+                "clip_id": index,
+                "s3_key": f"k{index}.mp4",
+                "resume": False,
+            }
+            for index in range(6)
+        ]
+        callbacks = []
+
+        async def fake_run_one(_client, _submit_gate, _store_gate, *, task_uuid, **_kw):
+            await asyncio.sleep(0.001 * (6 - int(task_uuid[-1])))
+            return SimpleNamespace(ok=False, error=f"failed-{task_uuid}")
+
+        with patch.object(gen, "_run_one", fake_run_one):
+            results = asyncio.run(gen._generate_all(
+                jobs,
+                "720p",
+                None,
+                deadline_seconds=5,
+                on_result=lambda task_uuid, _outcome: callbacks.append(task_uuid),
+            ))
+
+        self.assertEqual(set(callbacks), {job["task_uuid"] for job in jobs})
+        self.assertEqual(set(results), set(callbacks))
