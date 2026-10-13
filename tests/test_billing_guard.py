@@ -180,3 +180,35 @@ class TimedOutRetryTests(unittest.TestCase):
         rejected = rw.VideoResult(task_uuid="t", video_url=None,
                                   error="Runware rejected the task.")
         self.assertFalse(rejected.timed_out)
+
+
+class BatchFailureBillingTests(unittest.TestCase):
+    """Whole-run failures must not make paid tasks buyable again."""
+
+    def _clip(self, submitted=True):
+        from datetime import datetime as _dt
+        return SimpleNamespace(
+            id=1, provider_task_uuid="t-1", status="queued",
+            provider_submitted_at=_dt.utcnow() if submitted else None,
+            render_metadata={})
+
+    def test_a_run_that_hit_its_deadline_leaves_tasks_alive(self):
+        # asyncio cancels the waiters; it does not cancel work already queued
+        # on Runware's GPUs, and that work is already charged for.
+        from app.pipeline.phase3_timeline.generate import _task_may_still_exist
+        self.assertTrue(_task_may_still_exist(self._clip(), None))
+
+    def test_a_batch_that_raised_leaves_tasks_alive(self):
+        from app.pipeline.phase3_timeline.generate import _task_may_still_exist
+        self.assertTrue(_task_may_still_exist(self._clip(), None))
+
+    def test_a_shot_that_never_reached_the_provider_is_not_alive(self):
+        # Input preparation failed before submission, so nothing was bought.
+        from app.pipeline.phase3_timeline.generate import _task_may_still_exist
+        self.assertFalse(_task_may_still_exist(self._clip(submitted=False), None))
+
+    def test_a_provider_rejection_is_the_only_thing_that_kills_a_task(self):
+        from app.pipeline.phase3_timeline.generate import _task_may_still_exist
+        rejected = rw.VideoResult(task_uuid="t", video_url=None,
+                                  error="invalid input image")
+        self.assertFalse(_task_may_still_exist(self._clip(), rejected))

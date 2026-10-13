@@ -50,6 +50,28 @@ class BatchDeadlineExceeded(RunwareError):
     """The whole run ran out of time, not just one shot."""
 
 
+def _task_may_still_exist(clip, result) -> bool:
+    """Whether the provider may still be holding work we have paid for.
+
+    Default-safe on purpose: a clip is presumed alive the moment it carries a
+    submission timestamp, because billing starts at submission and we cannot
+    see the provider's queue. Only the provider declaring the task dead makes
+    it buyable again.
+
+    The paths that matter are the ones that are easy to miss -- a run that hit
+    its deadline, or a batch that raised -- where tasks were submitted and
+    nothing came back. Marking those re-buyable charges for the same clip
+    twice.
+    """
+    if not already_submitted(clip):
+        return False
+    if result is None:
+        return True            # we never heard back; the task may be running
+    if getattr(result, "ok", False):
+        return True            # it generated; only our copy is missing
+    return bool(getattr(result, "timed_out", False))
+
+
 @dataclass(frozen=True)
 class ShotOutcome:
     """What one shot produced, and where it was stored.
@@ -430,7 +452,13 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
         logger.exception("RUNWARE_BATCH_FAILED count=%s", len(jobs))
         for clip in by_task.values():
             clip.status = "failed"
-            clip.render_metadata = {**(clip.render_metadata or {}), "error": reason}
+            # Nothing came back, so nothing says these tasks died. Several of
+            # them were submitted and billed before the batch fell over.
+            clip.render_metadata = {
+                **(clip.render_metadata or {}),
+                "error": reason,
+                "provider_task_alive": _task_may_still_exist(clip, None),
+            }
         db.commit()
         failed += len(jobs)
         progress.update(failed, total_requested, "Generating clips")
@@ -451,18 +479,18 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
             clip.render_metadata = {
                 **(clip.render_metadata or {}),
                 "error": reason,
-                # A timeout means we stopped waiting, not that the provider
-                # stopped working. That task is alive and already charged for.
-                "provider_task_alive": bool(getattr(result, "timed_out", False)),
+                "provider_task_alive": _task_may_still_exist(clip, result),
             }
             failed += 1
             logger.warning("SHOT_FAILED task=%s error=%s", task_uuid, reason)
         elif store_error:
             # The clip exists and was paid for; only our copy of it failed.
             clip.status = "failed"
-            clip.render_metadata = {**(clip.render_metadata or {}),
-                                    "error": f"result download failed: {store_error}",
-                                    "provider_task_alive": True}
+            clip.render_metadata = {
+                **(clip.render_metadata or {}),
+                "error": f"result download failed: {store_error}",
+                "provider_task_alive": _task_may_still_exist(clip, result),
+            }
             failed += 1
         else:
             try:
