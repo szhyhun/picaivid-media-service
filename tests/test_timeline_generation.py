@@ -1,4 +1,6 @@
 """Input transport rules for Runware timeline generation."""
+import asyncio
+import importlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -125,3 +127,44 @@ class QueueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClipStorageTimingTests(unittest.TestCase):
+    """A provider URL must be fetched while it is fresh."""
+
+    def _run(self, *, download, upload):
+        gen = importlib.import_module("app.pipeline.phase3_timeline.generate")
+
+        async def fake_generate(*_a, **kw):
+            return SimpleNamespace(ok=True, video_url="https://p.test/v.mp4",
+                                   seed=1, video_uuid="v", cost=0.5, error=None)
+
+        with patch.object(gen, "generate_video", fake_generate), \
+                patch.object(gen, "_download_video", download), \
+                patch.object(gen.s3_client, "upload_bytes", upload), \
+                patch.object(gen, "claim_for_submit", lambda *_a, **_k: True):
+            return asyncio.run(gen._run_one(
+                None, asyncio.Semaphore(1), prompt="p", inputs=["a.jpg"],
+                task_uuid="t-1", resolution="720p", duration=5, clip_id=1,
+                s3_key="jobs/1/clips/s1.mp4", resume=False, on_tick=None))
+
+    def test_the_clip_is_stored_by_its_own_task(self):
+        # Collecting clips in a pass after the batch left the first shot's URL
+        # unused for the length of the whole run.
+        outcome = self._run(download=lambda url: b"bytes",
+                            upload=lambda key, data, ct: f"s3://bucket/{key}")
+        self.assertEqual(outcome.s3_uri, "s3://bucket/jobs/1/clips/s1.mp4")
+        self.assertIsNone(outcome.store_error)
+        self.assertTrue(outcome.result.ok)
+
+    def test_a_failed_download_is_reported_without_losing_the_result(self):
+        # The clip was generated and paid for; only our copy of it failed, and
+        # the provider result has to survive so the cost is still recorded.
+        def explode(_url):
+            raise RuntimeError("404 from provider URL")
+
+        outcome = self._run(download=explode,
+                            upload=lambda *_a: "never")
+        self.assertIsNone(outcome.s3_uri)
+        self.assertIn("404", outcome.store_error)
+        self.assertTrue(outcome.result.ok)

@@ -22,6 +22,7 @@ import base64
 import logging
 import mimetypes
 import uuid
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
@@ -47,6 +48,19 @@ logger = logging.getLogger(__name__)
 
 class BatchDeadlineExceeded(RunwareError):
     """The whole run ran out of time, not just one shot."""
+
+
+@dataclass(frozen=True)
+class ShotOutcome:
+    """What one shot produced, and where it was stored.
+
+    Storage happens inside the task rather than in a pass afterwards, so the
+    result carries its own bucket URI by the time the batch is collected.
+    """
+
+    result: object
+    s3_uri: str | None = None
+    store_error: str | None = None
 
 
 
@@ -229,18 +243,39 @@ def _prepare(db: Session, timeline: Timeline, shot: TimelineClip, *,
 async def _run_one(client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
                    *, prompt: str, inputs: list[str], task_uuid: str,
                    resolution: str | None, duration: int, clip_id: int,
-                   resume: bool, on_tick):
+                   s3_key: str, resume: bool, on_tick) -> ShotOutcome:
     async with semaphore:
         if resume:
             # This clip carries a submission timestamp, so it has already been
             # charged for. Collect it; never buy it twice.
             logger.info("RUNWARE_RESUME task=%s -- already submitted, polling only",
                         task_uuid)
-            return await poll_video(client, task_uuid, on_tick=on_tick)
-        return await generate_video(
-            client, prompt=prompt, photo_urls=inputs, task_uuid=task_uuid,
-            resolution=resolution, duration=duration, on_tick=on_tick,
-            claim=lambda: claim_for_submit(clip_id))
+            result = await poll_video(client, task_uuid, on_tick=on_tick)
+        else:
+            result = await generate_video(
+                client, prompt=prompt, photo_urls=inputs, task_uuid=task_uuid,
+                resolution=resolution, duration=duration, on_tick=on_tick,
+                claim=lambda: claim_for_submit(clip_id))
+
+        if not getattr(result, "ok", False):
+            return ShotOutcome(result=result)
+
+        # Fetch and store here, while the URL is minutes old rather than hours.
+        # Collecting every clip in a pass after the batch meant the first shot's
+        # provider URL sat unused for the length of the entire run, and a
+        # provider URL that expires before we reach it loses a clip we paid for.
+        #
+        # Both calls are blocking (httpx.get, then boto3), so they go to a
+        # worker thread: running them on the event loop would stall every other
+        # shot's polling for the length of a download.
+        try:
+            data = await asyncio.to_thread(_download_video, result.video_url)
+            uri = await asyncio.to_thread(
+                s3_client.upload_bytes, s3_key, data, "video/mp4")
+            return ShotOutcome(result=result, s3_uri=uri)
+        except Exception as exc:   # noqa: BLE001 - reported per shot, never fatal
+            logger.warning("SHOT_STORE_FAILED task=%s error=%s", task_uuid, exc)
+            return ShotOutcome(result=result, store_error=str(exc))
 
 
 async def _generate_all(jobs: list[dict], resolution: str | None, on_tick,
@@ -251,7 +286,7 @@ async def _generate_all(jobs: list[dict], resolution: str | None, on_tick,
             _run_one(client, semaphore, prompt=j["prompt"], inputs=j["inputs"],
                      task_uuid=j["task_uuid"], resolution=resolution,
                      duration=j["duration"], clip_id=j["clip_id"],
-                     resume=j["resume"], on_tick=on_tick)
+                     s3_key=j["s3_key"], resume=j["resume"], on_tick=on_tick)
             for j in jobs
         ], return_exceptions=True)
         if not deadline_seconds:
@@ -336,6 +371,7 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
                          "task_uuid": clip.provider_task_uuid,
                          "duration": duration_for_kind(shot.kind),
                          "clip_id": int(clip.id),
+                         "s3_key": f"jobs/{timeline.job_id}/clips/{shot.shot_uid}.mp4",
                          # Already submitted means already billed. Such a clip
                          # is only ever collected, never ordered again.
                          "resume": already_submitted(clip)})
@@ -376,20 +412,29 @@ def generate_timeline_clips(db: Session, timeline: Timeline, *,
         return {"requested": total_requested, "succeeded": 0, "failed": failed}
 
     done = 0
-    for task_uuid, result in results.items():
+    # Nothing here touches the network any more: every clip was downloaded and
+    # stored by its own task. This loop only writes what happened, which is why
+    # it can safely hold the one database session.
+    for task_uuid, outcome in results.items():
         clip = by_task[task_uuid]
-        if isinstance(result, Exception) or not getattr(result, "ok", False):
-            reason = str(result) if isinstance(result, Exception) else (result.error or "unknown")
+        result = getattr(outcome, "result", None)
+        store_error = getattr(outcome, "store_error", None)
+        if isinstance(outcome, Exception) or not getattr(result, "ok", False):
+            reason = (str(outcome) if isinstance(outcome, Exception)
+                      else (getattr(result, "error", None) or "unknown"))
             clip.status = "failed"
             clip.render_metadata = {**(clip.render_metadata or {}), "error": reason}
             failed += 1
             logger.warning("SHOT_FAILED task=%s error=%s", task_uuid, reason)
+        elif store_error:
+            # The clip exists and was paid for; only our copy of it failed.
+            clip.status = "failed"
+            clip.render_metadata = {**(clip.render_metadata or {}),
+                                    "error": f"result download failed: {store_error}"}
+            failed += 1
         else:
             try:
-                # Runware's URLs expire; the clip has to live in our bucket.
-                data = _download_video(result.video_url)
-                key = f"jobs/{timeline.job_id}/clips/{clip.shot_uid}.mp4"
-                clip.s3_uri = s3_client.upload_bytes(key, data, "video/mp4")
+                clip.s3_uri = outcome.s3_uri
                 clip.status = "complete"
                 clip.seed = result.seed
                 clip.render_metadata = {
